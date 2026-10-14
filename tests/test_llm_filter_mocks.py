@@ -13,7 +13,7 @@ try:
 except ImportError:
     pytest = None  # type: ignore
 
-from newsbot.llm.client import DeepSeekClient, LLMError, BalanceInfo
+from newsbot.llm.client import DeepSeekClient, LLMError, BalanceInfo, UsageStats, _safe_int
 from newsbot.llm.filter import LLMFilter, FilterResult, route
 from newsbot.collector import NewsItem
 
@@ -118,7 +118,7 @@ def make_client(model_response: str, *, status_code: int = 200) -> DeepSeekClien
     client = DeepSeekClient(
         api_key="mock-key-not-logged",
         base_url="https://api.deepseek.com",
-        model="deepseek-v4-pro",
+        model="deepseek-flash",
     )
     return client
 
@@ -291,6 +291,284 @@ def test_chat_json_http_500_retry_then_fail():
 
 
 # ─────────────────────────────────────────────────────────────────
+# Tests: usage-логирование
+# ─────────────────────────────────────────────────────────────────
+
+def test_chat_json_usage_accumulated():
+    """
+    usage в ответе API → аккумулируется в client.usage_stats,
+    отсутствие usage не ломает вызов.
+    """
+    import httpx
+    import newsbot.llm.client as client_module
+
+    valid_json = '{"score":8,"summary":"ok","reason":"test"}'
+
+    # OpenAI-формат: prompt_tokens_details.cached_tokens
+    usage_data = {
+        "prompt_tokens": 1100,
+        "completion_tokens": 200,
+        "total_tokens": 1300,
+        "prompt_tokens_details": {
+            "cached_tokens": 900,
+        },
+    }
+
+    class _MockUsageClient:
+        is_closed = False
+
+        def __init__(s, **kw):
+            pass
+
+        def post(s, url, **kwargs):
+            return FakeResponse(
+                {
+                    "choices": [{"message": {"content": valid_json}}],
+                    "usage": usage_data,
+                },
+                status_code=200,
+            )
+
+        def __enter__(s):
+            return s
+
+        def __exit__(s, *args):
+            pass
+
+    client_module.httpx.Client = _MockUsageClient  # type: ignore
+
+    client = DeepSeekClient(
+        api_key="mock-key",
+        base_url="https://api.deepseek.com",
+        model="deepseek-flash",
+    )
+
+    try:
+        result = client.chat_json("sys", "user")
+        assert result["score"] == 8
+
+        stats = client.usage_stats
+        assert stats.calls == 1
+        assert stats.prompt_tokens == 1100
+        assert stats.completion_tokens == 200
+        assert stats.total_tokens == 1300
+        assert stats.prompt_cache_hit_tokens == 900
+        assert stats.prompt_cache_miss_tokens == 200
+    finally:
+        unmock()
+
+
+def test_chat_json_usage_absent_no_crash():
+    """
+    usage отсутствует в ответе → вызов завершается успешно,
+    usage_stats.calls == 1 (вызов прошёл), токены = 0 (fallback).
+    """
+    import httpx
+    import newsbot.llm.client as client_module
+
+    valid_json = '{"score":8,"summary":"ok","reason":"test"}'
+
+    class _MockNoUsageClient:
+        is_closed = False
+
+        def __init__(s, **kw):
+            pass
+
+        def post(s, url, **kwargs):
+            # ответ БЕЗ поля usage
+            return FakeResponse(
+                {"choices": [{"message": {"content": valid_json}}]},
+                status_code=200,
+            )
+
+        def __enter__(s):
+            return s
+
+        def __exit__(s, *args):
+            pass
+
+    client_module.httpx.Client = _MockNoUsageClient  # type: ignore
+
+    client = DeepSeekClient(
+        api_key="mock-key",
+        base_url="https://api.deepseek.com",
+        model="deepseek-flash",
+    )
+
+    try:
+        result = client.chat_json("sys", "user")
+        assert result["score"] == 8
+
+        stats = client.usage_stats
+        # вызов прошёл, но usage отсутствует → инкремент calls,
+        # но токены остаются 0 (безопасный fallback)
+        assert stats.calls == 1
+        assert stats.prompt_tokens == 0
+        assert stats.total_tokens == 0
+    finally:
+        unmock()
+
+
+def test_chat_json_usage_deepseek_top_level():
+    """
+    DeepSeek top-level формат (prompt_cache_hit_tokens / prompt_cache_miss_tokens)
+    корректно парсится: cached_hit=900, cached_miss=200.
+    """
+    import httpx
+    import newsbot.llm.client as client_module
+
+    valid_json = '{"score":8,"summary":"ok","reason":"test"}'
+
+    # DeepSeek top-level формат (НЕ prompt_tokens_details)
+    usage_data = {
+        "prompt_tokens": 1100,
+        "completion_tokens": 200,
+        "total_tokens": 1300,
+        "prompt_cache_hit_tokens": 900,
+        "prompt_cache_miss_tokens": 200,
+    }
+
+    class _MockUsageClient:
+        is_closed = False
+
+        def __init__(s, **kw):
+            pass
+
+        def post(s, url, **kwargs):
+            return FakeResponse(
+                {
+                    "choices": [{"message": {"content": valid_json}}],
+                    "usage": usage_data,
+                },
+                status_code=200,
+            )
+
+        def __enter__(s):
+            return s
+
+        def __exit__(s, *args):
+            pass
+
+    client_module.httpx.Client = _MockUsageClient  # type: ignore
+
+    client = DeepSeekClient(
+        api_key="mock-key",
+        base_url="https://api.deepseek.com",
+        model="deepseek-flash",
+    )
+
+    try:
+        result = client.chat_json("sys", "user")
+        assert result["score"] == 8
+
+        stats = client.usage_stats
+        assert stats.calls == 1
+        assert stats.prompt_tokens == 1100
+        assert stats.completion_tokens == 200
+        assert stats.total_tokens == 1300
+        assert stats.prompt_cache_hit_tokens == 900
+        assert stats.prompt_cache_miss_tokens == 200
+    finally:
+        unmock()
+
+
+def test_chat_json_usage_only_cached_hit():
+    """
+    Формат с одним cached_hit (без cached_miss): miss вычисляется
+    как prompt - cached_hit, неотрицательный.
+    """
+    import httpx
+    import newsbot.llm.client as client_module
+
+    valid_json = '{"score":8,"summary":"ok","reason":"test"}'
+
+    # Только cached_hit, cached_miss отсутствует
+    usage_data = {
+        "prompt_tokens": 1100,
+        "completion_tokens": 200,
+        "total_tokens": 1300,
+        "prompt_cache_hit_tokens": 700,
+    }
+
+    class _MockUsageClient:
+        is_closed = False
+
+        def __init__(s, **kw):
+            pass
+
+        def post(s, url, **kwargs):
+            return FakeResponse(
+                {
+                    "choices": [{"message": {"content": valid_json}}],
+                    "usage": usage_data,
+                },
+                status_code=200,
+            )
+
+        def __enter__(s):
+            return s
+
+        def __exit__(s, *args):
+            pass
+
+    client_module.httpx.Client = _MockUsageClient  # type: ignore
+
+    client = DeepSeekClient(
+        api_key="mock-key",
+        base_url="https://api.deepseek.com",
+        model="deepseek-flash",
+    )
+
+    try:
+        result = client.chat_json("sys", "user")
+        assert result["score"] == 8
+
+        stats = client.usage_stats
+        assert stats.prompt_cache_hit_tokens == 700
+        assert stats.prompt_cache_miss_tokens == 400  # 1100 - 700
+        assert stats.prompt_cache_miss_tokens >= 0
+    finally:
+        unmock()
+
+
+def test_usage_stats_reset_clears_counters():
+    """
+    reset() обнуляет все счётчики, model-имя сохраняется.
+    """
+    stats = UsageStats(model="deepseek-flash")
+    # накопим данные
+    stats.calls = 3
+    stats.prompt_tokens = 3300
+    stats.prompt_cache_hit_tokens = 2700
+    stats.prompt_cache_miss_tokens = 600
+    stats.completion_tokens = 600
+    stats.total_tokens = 3900
+
+    stats.reset()
+
+    assert stats.model == "deepseek-flash"
+    assert stats.calls == 0
+    assert stats.prompt_tokens == 0
+    assert stats.prompt_cache_hit_tokens == 0
+    assert stats.prompt_cache_miss_tokens == 0
+    assert stats.completion_tokens == 0
+    assert stats.total_tokens == 0
+
+
+def test_usage_stats_safe_int_non_numeric():
+    """
+    _safe_int: нечисловое значение → default, не падает.
+    """
+    from newsbot.llm.client import _safe_int
+
+    assert _safe_int("123", 0) == 123
+    assert _safe_int("abc", 0) == 0      # ValueError → default
+    assert _safe_int(None, 99) == 99      # None → default
+    assert _safe_int(["list"], 0) == 0   # TypeError → default
+    assert _safe_int(42.5, 0) == 42      # float → int
+
+
+# ─────────────────────────────────────────────────────────────────
 # Tests: DeepSeekClient.get_balance — парсинг balance_infos
 # ─────────────────────────────────────────────────────────────────
 
@@ -388,7 +666,7 @@ def make_item(title="Тестовая новость", summary="Краткое �
 def make_filter_config():
     return {
         "enabled": True,
-        "model": "deepseek-v4-pro",
+        "model": "deepseek-flash",
         "base_url": "https://api.deepseek.com",
         "api_key": "mock-key",
         "timeout_sec": 60,
@@ -642,6 +920,12 @@ if __name__ == "__main__":
         (lambda: test_filter_score_out_of_range_returns_ok_false(), "test_filter_score_out_of_range_returns_ok_false"),
         (lambda: test_filter_empty_summary_returns_ok_false(), "test_filter_empty_summary_returns_ok_false"),
         (lambda: test_filter_disabled_returns_high_score(), "test_filter_disabled_returns_high_score"),
+        (lambda: test_chat_json_usage_accumulated(), "test_chat_json_usage_accumulated"),
+        (lambda: test_chat_json_usage_absent_no_crash(), "test_chat_json_usage_absent_no_crash"),
+        (lambda: test_chat_json_usage_deepseek_top_level(), "test_chat_json_usage_deepseek_top_level"),
+        (lambda: test_chat_json_usage_only_cached_hit(), "test_chat_json_usage_only_cached_hit"),
+        (lambda: test_usage_stats_reset_clears_counters(), "test_usage_stats_reset_clears_counters"),
+        (lambda: test_usage_stats_safe_int_non_numeric(), "test_usage_stats_safe_int_non_numeric"),
     ]
 
     passed = 0

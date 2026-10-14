@@ -856,6 +856,247 @@ class TestCommandsText(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 15. n5: URL-кнопки сохраняются после 👍/👎 (багфикс)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCallbackKeyboardPreservation(unittest.TestCase):
+    """После нажатия 👍/👎 URL-кнопки сохраняются; удаляются только для нажатого target_id."""
+
+    def _make_cb_with_keyboard(
+        self,
+        target_id: int,
+        verdict: str = "u",
+        chat_id: str = "111222333",
+        message_id: int = 555,
+        extra_buttons: list = None,
+    ) -> dict:
+        """
+        callback_query с reply_markup в message.
+        Структура по умолчанию: URL + 👍 + 👎 для target_id.
+        """
+        buttons = [
+            {"text": "🔗 Открыть источник", "url": f"https://example.com/{target_id}"},
+            {"text": "👍", "callback_data": f"fb:{target_id}:u"},
+            {"text": "👎", "callback_data": f"fb:{target_id}:d"},
+        ]
+        if extra_buttons:
+            buttons.extend(extra_buttons)
+        return {
+            "callback_query": {
+                "id": "cb_test",
+                "data": f"fb:{target_id}:{verdict}",
+                "message": {
+                    "chat": {"id": chat_id},
+                    "message_id": message_id,
+                    "reply_markup": {"inline_keyboard": [buttons]},
+                },
+            },
+        }
+
+    # ── 15a: URL-кнопка остаётся после 👍 ─────────────────────────────────────
+
+    def test_url_button_preserved_after_like(self):
+        """После 👍 URL-кнопка ОСТАЁТСЯ, fb:42:u исчезает."""
+        poller = _build_poller()
+        upd = self._make_cb_with_keyboard(target_id=42, verdict="u")
+
+        poller._process_update(upd)
+
+        poller._client.answerCallbackQuery.assert_called_once()
+        poller._client.editMessageReplyMarkup.assert_called_once()
+        call_args = poller._client.editMessageReplyMarkup.call_args
+
+        new_kb = call_args.kwargs["reply_markup"]["inline_keyboard"]
+        # 1 ряд: только URL-кнопка
+        self.assertEqual(len(new_kb), 1)
+        self.assertEqual(new_kb[0][0]["url"], "https://example.com/42")
+        # 👍-кнопка удалена
+        self.assertFalse(
+            any(
+                btn.get("callback_data") == "fb:42:u"
+                for row in new_kb for btn in row
+            )
+        )
+
+    # ── 15b: URL-кнопка остаётся после 👎 ─────────────────────────────────────
+
+    def test_url_button_preserved_after_dislike(self):
+        """После 👎 URL-кнопка ОСТАЁТСЯ, fb:42:d исчезает."""
+        poller = _build_poller()
+        upd = self._make_cb_with_keyboard(target_id=42, verdict="d")
+
+        poller._process_update(upd)
+
+        poller._client.editMessageReplyMarkup.assert_called_once()
+        new_kb = poller._client.editMessageReplyMarkup.call_args.kwargs[
+            "reply_markup"
+        ]["inline_keyboard"]
+        # Только URL-кнопка
+        self.assertEqual(len(new_kb), 1)
+        self.assertIn("url", new_kb[0][0])
+        # 👎-кнопка удалена
+        self.assertFalse(
+            any(
+                btn.get("callback_data") == "fb:42:d"
+                for row in new_kb for btn in row
+            )
+        )
+
+    # ── 15c: чужие fb:-кнопки сохраняются (мульти-item) ─────────────────────
+
+    def test_other_targets_callback_data_preserved(self):
+        """
+        Мульти-item: после 👍 по target=1 кнопки fb:2:u/d сохраняются.
+        Клавиатура: [URL1, fb:1:u, fb:1:d], [URL2, fb:2:u, fb:2:d]
+        """
+        poller = _build_poller()
+        upd = {
+            "callback_query": {
+                "id": "cb_multi",
+                "data": "fb:1:u",
+                "message": {
+                    "chat": {"id": "111222333"},
+                    "message_id": 100,
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [
+                                {"text": "🔗 Item1", "url": "https://ex.com/1"},
+                                {"text": "👍", "callback_data": "fb:1:u"},
+                                {"text": "👎", "callback_data": "fb:1:d"},
+                            ],
+                            [
+                                {"text": "🔗 Item2", "url": "https://ex.com/2"},
+                                {"text": "👍", "callback_data": "fb:2:u"},
+                                {"text": "👎", "callback_data": "fb:2:d"},
+                            ],
+                        ],
+                    },
+                },
+            },
+        }
+
+        poller._process_update(upd)
+
+        poller._client.editMessageReplyMarkup.assert_called_once()
+        new_kb = poller._client.editMessageReplyMarkup.call_args.kwargs[
+            "reply_markup"
+        ]["inline_keyboard"]
+
+        # Ряд 1: только URL1 (👍/👎 для target=1 удалены)
+        self.assertEqual(len(new_kb[0]), 1)
+        self.assertEqual(new_kb[0][0]["url"], "https://ex.com/1")
+
+        # Ряд 2: полностью сохранён (URL2 + fb:2:u + fb:2:d)
+        self.assertEqual(len(new_kb[1]), 3)
+        self.assertEqual(new_kb[1][0]["url"], "https://ex.com/2")
+        cb_data = [btn.get("callback_data") for btn in new_kb[1]]
+        self.assertIn("fb:2:u", cb_data)
+        self.assertIn("fb:2:d", cb_data)
+
+    # ── 15d: reply_markup отсутствует → editMessageReplyMarkup НЕ вызывается ─
+
+    def test_no_reply_markup_no_edit(self):
+        """
+        Если message.reply_markup отсутствует — editMessageReplyMarkup НЕ вызывается,
+        чтобы не снести клавиатуру.
+        """
+        poller = _build_poller()
+        upd = {
+            "callback_query": {
+                "id": "cb_nomarkup",
+                "data": "fb:5:u",
+                "message": {
+                    "chat": {"id": "111222333"},
+                    "message_id": 200,
+                    # reply_markup отсутствует
+                },
+            },
+        }
+
+        poller._process_update(upd)
+
+        poller._client.answerCallbackQuery.assert_called_once()
+        poller._client.editMessageReplyMarkup.assert_not_called()
+
+    # ── 15e: reply_markup = None (не dict) → не падает ───────────────────────
+
+    def test_reply_markup_none_does_not_crash(self):
+        """reply_markup = None не вызывает падения."""
+        poller = _build_poller()
+        upd = {
+            "callback_query": {
+                "id": "cb_none",
+                "data": "fb:7:u",
+                "message": {
+                    "chat": {"id": "111222333"},
+                    "message_id": 300,
+                    "reply_markup": None,
+                },
+            },
+        }
+        # не падает
+        poller._process_update(upd)
+        poller._client.answerCallbackQuery.assert_called_once()
+        poller._client.editMessageReplyMarkup.assert_not_called()
+
+    # ── 15f: reply_markup без inline_keyboard → не падает ─────────────────────
+
+    def test_reply_markup_missing_inline_keyboard_does_not_crash(self):
+        """reply_markup без inline_keyboard не вызывает падения."""
+        poller = _build_poller()
+        upd = {
+            "callback_query": {
+                "id": "cb_nokeyboard",
+                "data": "fb:9:u",
+                "message": {
+                    "chat": {"id": "111222333"},
+                    "message_id": 400,
+                    "reply_markup": {"some": "other"},
+                },
+            },
+        }
+        # не падает
+        poller._process_update(upd)
+        poller._client.answerCallbackQuery.assert_called_once()
+        poller._client.editMessageReplyMarkup.assert_not_called()
+
+    # ── 15g: empty inline_keyboard → editMessageReplyMarkup с [] ─────────────
+
+    def test_empty_keyboard_after_removal_calls_edit_with_empty(self):
+        """
+        Клавиатура была только из 👍/👎 → после удаления new_kb пуст.
+        Допустимо вызвать editMessageReplyMarkup с {"inline_keyboard": []}.
+        """
+        poller = _build_poller()
+        upd = {
+            "callback_query": {
+                "id": "cb_empty",
+                "data": "fb:3:u",
+                "message": {
+                    "chat": {"id": "111222333"},
+                    "message_id": 500,
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [
+                                {"text": "👍", "callback_data": "fb:3:u"},
+                                {"text": "👎", "callback_data": "fb:3:d"},
+                            ],
+                        ],
+                    },
+                },
+            },
+        }
+
+        poller._process_update(upd)
+
+        poller._client.editMessageReplyMarkup.assert_called_once()
+        new_kb = poller._client.editMessageReplyMarkup.call_args.kwargs[
+            "reply_markup"
+        ]["inline_keyboard"]
+        self.assertEqual(new_kb, [])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 

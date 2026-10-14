@@ -420,11 +420,39 @@ class TelegramPoller:
 
         # n5: editMessageReplyMarkup уже best-effort внутри _call — внешний try/else не нужен
         if recorded and message_id:
-            self._client.editMessageReplyMarkup(
-                chat_id=chat_id,
-                message_id=message_id,
-                reply_markup={"inline_keyboard": []},
-            )
+            # Строим новую клавиатуру: сохраняем URL-кнопки, удаляем только 👍/👎
+            # для нажатого target_id. Чужие fb:-кнопки (другие target_id) сохраняются.
+            raw_markup = message.get("reply_markup")
+            if isinstance(raw_markup, dict) and "inline_keyboard" in raw_markup:
+                old_kb = raw_markup["inline_keyboard"]
+                if isinstance(old_kb, list):
+                    new_kb = []
+                    for row in old_kb:
+                        if not isinstance(row, list):
+                            continue
+                        new_row = [
+                            btn for btn in row
+                            if "callback_data" not in btn
+                            or not (
+                                btn.get("callback_data", "").startswith(f"fb:{target_id}:")
+                            )
+                        ]
+                        if new_row:
+                            new_kb.append(new_row)
+
+                    if new_kb:
+                        self._client.editMessageReplyMarkup(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            reply_markup={"inline_keyboard": new_kb},
+                        )
+                    else:
+                        # пустая клавиатура (URL-кнопок не было) — очищаем
+                        self._client.editMessageReplyMarkup(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            reply_markup={"inline_keyboard": []},
+                        )
 
         self._log.debug("feedback: target=%d verdict=%s recorded=%s",
                        target_id, verdict, recorded)

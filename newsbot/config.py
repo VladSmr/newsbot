@@ -82,7 +82,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
         "provider": "deepseek",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-pro",
+        "model": "deepseek-flash",
         "api_key": "",
         "temperature": 0,
         "timeout_sec": 60,

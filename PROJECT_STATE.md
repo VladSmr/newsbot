@@ -42,7 +42,7 @@
 
 ## Технологии
 Python 3.8+, feedparser, httpx, PyYAML, SQLite (stdlib).
-Отправка в ТГ: python-telegram-bot. LLM: DeepSeek (deepseek-v4-pro по умолч.),
+Отправка в ТГ: python-telegram-bot. LLM: DeepSeek (deepseek-flash по умолч., deepseek-v4-pro — альтернатива),
 ~1–2 $/мес. Запуск: `python -m newsbot --once` / `python -m newsbot` (демон).
 
 ## Архитектура
@@ -77,7 +77,7 @@ Retry: `get_stuck_pending()` — 'pending' старше retry_threshold_sec (60 
   ранний return при актуальной версии).
 
 **LLM-фильтр:**
-- DeepSeek, model=deepseek-v4-pro (⚠️ проверить id живым ключом).
+- DeepSeek, model=deepseek-flash (⚠️ проверить id живым ключом; deepseek-v4-pro — альтернатива).
 - system_prompt = SYSTEM_PROMPT из prompts.py (источник истины; поле
   llm.system_prompt в config.yaml пустое = штатный оверрайд).
 - Структурный JSON: {score:0-10, summary, reason}, temperature=0.
@@ -234,7 +234,7 @@ Retry: `get_stuck_pending()` — 'pending' старше retry_threshold_sec (60 
 | # | Что                          | Приоритет     | Комментарий                                       |
 |---|------------------------------|---------------|---------------------------------------------------|
 | 1 | URL-нормализация             | Средний       | utm_* + trailing slash; отложена (known limitation)|
-| 2 | Проверка модели DeepSeek     | Высокий       | `deepseek-v4-pro` — проверить id через `--check-llm` живым ключом |
+| 2 | Проверка модели DeepSeek     | Высокий       | `deepseek-flash` — проверить id через `--check-llm` живым ключом |
 | 3 | Deploy на VPS, этап 5        | ✅ Завершён    | DEPLOY.md, Dockerfile, docker-compose.yml готовы       |
 | 4 | Telegram-доставка живьём    | Высокий       | api.telegram.org недоступен с локальной машины      |
 | 5 | Этап 3 (RSSHub, USGS, Steam) | Низкий        | ТГ-каналы → RSSHub, землетрясения → USGS GeoJSON   |

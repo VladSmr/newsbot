@@ -25,7 +25,7 @@ if str(_ROOT) not in sys.path:
 
 from newsbot.collector import NewsItem
 from newsbot.llm.filter import FilterResult, LLMFilter, route
-from newsbot.llm.client import BalanceInfo
+from newsbot.llm.client import BalanceInfo, UsageStats
 from newsbot.storage import Storage
 from newsbot.pipeline import NewsPipeline
 
@@ -298,7 +298,7 @@ class TestPipelineLLMRouting:
             "llm": {
                 "enabled": llm_enabled,
                 "provider": "deepseek",
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-flash",
                 "api_key": api_key,
                 "base_url": "https://api.deepseek.com",
                 "temperature": 0,
@@ -618,7 +618,7 @@ class TestBalanceAlert:
             "llm": {
                 "enabled": True,
                 "provider": "deepseek",
-                "model": "deepseek-v4-pro",
+                "model": "deepseek-flash",
                 "api_key": "fake-key",
                 "base_url": "https://api.deepseek.com",
                 "temperature": 0,
@@ -918,6 +918,116 @@ class TestBalanceAlert:
 
 
 # ─────────────────────────────────────────────────────────────────
+# Тесты: UsageStats — накопление и логирование
+# ─────────────────────────────────────────────────────────────────
+
+class TestUsageStatsAccumulation:
+    """UsageStats: накопление между батчами, сброс, логирование."""
+
+    def test_accumulate_across_multiple_responses(self):
+        """Несколько add_response() → все поля суммируются."""
+        stats = UsageStats(model="deepseek-flash")
+
+        # батч 1: два вызова
+        stats.add_response({
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 100,
+                "total_tokens": 600,
+                "prompt_cache_hit_tokens": 400,
+                "prompt_cache_miss_tokens": 100,
+            }
+        })
+        stats.add_response({
+            "usage": {
+                "prompt_tokens": 700,
+                "completion_tokens": 150,
+                "total_tokens": 850,
+                "prompt_cache_hit_tokens": 600,
+                "prompt_cache_miss_tokens": 100,
+            }
+        })
+
+        assert stats.calls == 2
+        assert stats.prompt_tokens == 1200
+        assert stats.completion_tokens == 250
+        assert stats.total_tokens == 1450
+        assert stats.prompt_cache_hit_tokens == 1000
+        assert stats.prompt_cache_miss_tokens == 200
+
+    def test_accumulate_openai_cached_tokens_format(self):
+        """Формат OpenAI: prompt_tokens_details.cached_tokens → корректные cached/miss."""
+        stats = UsageStats(model="deepseek-flash")
+
+        stats.add_response({
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "total_tokens": 1200,
+                "prompt_tokens_details": {
+                    "cached_tokens": 800,
+                },
+            }
+        })
+
+        assert stats.calls == 1
+        assert stats.prompt_tokens == 1000
+        assert stats.prompt_cache_hit_tokens == 800
+        assert stats.prompt_cache_miss_tokens == 200  # 1000 - 800
+
+    def test_accumulate_deepseek_top_level_format(self):
+        """Формат DeepSeek top-level: cached_hit + cached_miss → берём напрямую."""
+        stats = UsageStats(model="deepseek-flash")
+
+        stats.add_response({
+            "usage": {
+                "prompt_tokens": 1100,
+                "completion_tokens": 200,
+                "total_tokens": 1300,
+                "prompt_cache_hit_tokens": 900,
+                "prompt_cache_miss_tokens": 200,
+            }
+        })
+
+        assert stats.calls == 1
+        assert stats.prompt_cache_hit_tokens == 900
+        assert stats.prompt_cache_miss_tokens == 200
+
+    def test_reset_clears_counters_preserves_model(self):
+        """reset() обнуляет всё кроме model."""
+        stats = UsageStats(model="deepseek-flash")
+        stats.calls = 5
+        stats.prompt_tokens = 5000
+        stats.prompt_cache_hit_tokens = 4000
+        stats.prompt_cache_miss_tokens = 1000
+        stats.completion_tokens = 1000
+        stats.total_tokens = 6000
+
+        stats.reset()
+
+        assert stats.model == "deepseek-flash"
+        assert stats.calls == 0
+        assert stats.prompt_tokens == 0
+        assert stats.prompt_cache_hit_tokens == 0
+        assert stats.prompt_cache_miss_tokens == 0
+        assert stats.completion_tokens == 0
+        assert stats.total_tokens == 0
+
+    def test_log_cycle_not_called_when_no_calls(self, caplog=None):
+        """log_cycle() при calls=0 не логирует (безопасный early return)."""
+        stats = UsageStats(model="deepseek-flash")
+        # вызов с caplog для проверки отсутствия логирования
+        import logging
+        if caplog is not None:
+            with caplog.at_level(logging.INFO, logger="newsbot.llm.client"):
+                stats.log_cycle()
+            assert len(caplog.records) == 0
+        else:
+            # standalone runner: просто вызываем без ошибок
+            stats.log_cycle()
+
+
+# ─────────────────────────────────────────────────────────────────
 # Main runner (standalone)
 # ─────────────────────────────────────────────────────────────────
 
@@ -949,6 +1059,12 @@ if __name__ == "__main__":
         (lambda: TestBalanceAlert().test_cooldown_works_when_last_check_expired_but_last_alert_fresh(), "cooldown_last_check_expired_last_alert_fresh"),
         (lambda: TestBalanceAlert().test_migration_v4_to_v5_meta_table(), "migration_v4_to_v5_meta_table"),
         (lambda: TestBalanceAlert().test_meta_get_set(), "meta_get_set"),
+        # usage stats
+        (lambda: TestUsageStatsAccumulation().test_accumulate_across_multiple_responses(), "usage_accumulate_multiple_responses"),
+        (lambda: TestUsageStatsAccumulation().test_accumulate_openai_cached_tokens_format(), "usage_accumulate_openai_cached"),
+        (lambda: TestUsageStatsAccumulation().test_accumulate_deepseek_top_level_format(), "usage_accumulate_deepseek_top_level"),
+        (lambda: TestUsageStatsAccumulation().test_reset_clears_counters_preserves_model(), "usage_reset_clears_counters"),
+        (lambda: TestUsageStatsAccumulation().test_log_cycle_not_called_when_no_calls(), "usage_log_cycle_no_calls"),
     ]
 
     passed = 0

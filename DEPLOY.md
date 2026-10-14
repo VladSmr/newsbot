@@ -40,10 +40,17 @@ cd /opt/newsbot
 # Создаём из примера и заполняем:
 cp .env.example .env
 nano .env   # ← TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DEEPSEEK_API_KEY
+chmod 600 .env
+# Владелец — uid 1000: контейнер (newsbot, uid 1000) должен дописать TELEGRAM_CHAT_ID
+sudo chown 1000:1000 .env
 ```
 
 > **Безопасность:** `.env` не попадает в образ (`dockerignore` + `env_file`).
-> Убедитесь, что `chmod 600 .env` на сервере.
+> Убедитесь, что `chmod 600 .env` и `chown 1000:1000 .env` на сервере.
+>
+> ⚠️ **Важно:** если `.env` принадлежит root, `--set-chat-id` упадёт с
+> `PermissionError: [Errno 13] Permission denied: '/app/.env'`. Лечится
+> `sudo chown 1000:1000 .env`.
 
 ---
 
@@ -75,12 +82,24 @@ id -u
 **Диагностика «unable to open database file»:**
 ```bash
 # Зайти в контейнер и проверить
-docker compose run --rm newsbot sh -c "ls -la /app/data/ && id"
+docker compose run --rm --entrypoint sh newsbot -c "ls -la /app/data/ && id"
 
 # Если ls показывает access denied — причина в правах на data/
 # Лечение:
 sudo chown -R 1000:1000 data
 ```
+
+> ℹ️ Образ имеет `ENTRYPOINT ["python", "-m", "newsbot"]`, поэтому в
+> `docker compose run ... newsbot <args>` команда `python -m newsbot` **не**
+> дублируется.
+>
+> Для **произвольного Python** используйте:
+> `docker compose run --rm --entrypoint python newsbot -c "..."`
+>
+> Для **НЕ-python команд** (`sh`, `env`, `ls` и т.п.) — **обязательно**
+> `--entrypoint <cmd>`, иначе команда будет дописана к ENTRYPOINT как аргумент
+> Python и вызовет ошибку. Пример:
+> `docker compose run --rm --entrypoint sh newsbot -c "ls -la /app/data/"`
 
 ## 5. Привязка chat_id
 
@@ -89,7 +108,7 @@ sudo chown -R 1000:1000 data
 ```bash
 # 1. Откройте чат с ботом в Telegram и нажмите /start
 # 2. На сервере:
-docker compose run --rm newsbot python -m newsbot --set-chat-id
+docker compose run --rm newsbot --set-chat-id
 # В .env на хосте автоматически запишется TELEGRAM_CHAT_ID=<ваш_id>
 ```
 
@@ -97,10 +116,10 @@ docker compose run --rm newsbot python -m newsbot --set-chat-id
 
 ```bash
 # Проверка доступа к Telegram API
-docker compose run --rm newsbot python -m newsbot --check-telegram
+docker compose run --rm newsbot --check-telegram
 
 # Проверка доступа к DeepSeek API (и баланс)
-docker compose run --rm newsbot python -m newsbot --check-llm
+docker compose run --rm newsbot --check-llm
 ```
 
 > ⚠️ **Не запускайте** эти команды, если демон уже работает
@@ -236,13 +255,13 @@ HTTPS_PROXY: "http://user:password@proxy.example.com"   # например, http
 
 ```bash
 # Проверить доступность Telegram через прокси
-docker compose run --rm newsbot python -m newsbot --check-telegram
+docker compose run --rm newsbot --check-telegram
 
 # Проверить доступность DeepSeek через прокси
-docker compose run --rm newsbot python -m newsbot --check-llm
+docker compose run --rm newsbot --check-llm
 
 # С боевым прокси в environment — запустить в foreground для отладки
-docker compose run --rm newsbot python -m newsbot --once
+docker compose run --rm newsbot --once
 ```
 
 Если проблема сохраняется — убедитесь, что прокси-сервер действительно
@@ -282,11 +301,11 @@ docker compose down
 docker compose down -v
 
 # Зайти в контейнер для отладки
-docker compose run --rm newsbot sh
+docker compose run --rm --entrypoint sh newsbot
 
 # Проверить конфиг без запуска
-docker compose run --rm newsbot python -c "from newsbot.config import load_config; print(load_config())"
+docker compose run --rm --entrypoint python newsbot -c "from newsbot.config import load_config; print(load_config())"
 
 # Проверить, какие переменные окружения видит контейнер
-docker compose run --rm newsbot env | grep -E "TELEGRAM|DEEPSEEK|HTTP_PROXY"
+docker compose run --rm --entrypoint env newsbot | grep -E "TELEGRAM|DEEPSEEK|HTTP_PROXY"
 ```

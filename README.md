@@ -152,7 +152,8 @@ python -m newsbot --check-llm            # баланс + тестовый chat_
 llm:
   enabled: true
   provider: deepseek
-  model: deepseek-v4-pro          # ⚠️ проверить id живым ключом через --check-llm
+  model: deepseek-flash           # ⚠️ проверить id живым ключом через --check-llm
+                                  #   deepseek-v4-pro — более способная/дорогая альтернатива (одной строкой)
   base_url: https://api.deepseek.com
   push_threshold: 7              # score >= 7 → пуш (delivered)
   digest_threshold: 5             # score 5–6 → deferred (дайджест); < 5 → skipped
@@ -295,7 +296,7 @@ digest:
 | `telegram.token`              | Bot token от @BotFather              | из `.env`             |
 | `telegram.chat_id`            | Привязанный chat_id владельца        | из `.env`             |
 | `telegram.poll_timeout`        | seconds для long-poll               | 25                    |
-| `llm.model`                   | Модель DeepSeek                      | `deepseek-v4-pro`     |
+| `llm.model`                   | Модель DeepSeek                      | `deepseek-flash` (pro — альтернатива) |
 | `digest.enabled`              | Автоматический дайджест              | true                  |
 | `digest.times`                | HH:MM в локальной tz                 | `["09:00","21:00"]`   |
 | `feedback.enabled`            | Приём обратной связи                 | true                  |
@@ -349,7 +350,7 @@ python -m pytest tests -q
 | Что                   | Когда          | Комментарий                                              |
 |-----------------------|----------------|----------------------------------------------------------|
 | Telegram-доставка     | Проверка на VPS | `api.telegram.org` недоступен с локальной машины         |
-| Проверка модели DeepSeek | Сейчас        | Требуется живой ключ + `--check-llm`                     |
+| Проверка модели DeepSeek | Сейчас        | deepseek-flash — проверить id живым ключом + `--check-llm` |
 | URL-нормализация      | Отложена       | UTM-параметры, trailing slash — не убираются             |
 | Этап 3 (RSSHub, USGS, Steam) | Не начат | ТГ-каналы через RSSHub; землетрясения через USGS GeoJSON |
 | Этап 5 (Docker / VPS) | ✅ Готово        | `Dockerfile`, `docker-compose.yml`, `DEPLOY.md`          |

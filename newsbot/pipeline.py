@@ -36,7 +36,7 @@ from .delivery import ConsoleDelivery, TelegramDelivery, Delivery
 from .digest import run_digest as _run_digest, build_digest_messages
 from .llm import LLMFilter
 from .llm.filter import FilterResult, route
-from .llm.client import BalanceInfo, LLMError
+from .llm.client import BalanceInfo, LLMError, UsageStats
 from .storage import Storage
 
 logger = logging.getLogger("newsbot.pipeline")
@@ -188,6 +188,14 @@ class NewsPipeline:
         """
         logger.info("=== Начало цикла ===")
 
+        # сброс usage-аккумулятора на начало цикла
+        if self.llm_filter is not None:
+            client = getattr(self.llm_filter, "client", None)
+            if client is not None:
+                usage_stats = getattr(client, "usage_stats", None)
+                if usage_stats is not None:
+                    usage_stats.reset()
+
         collector = FeedCollector(self.sources)
 
         # ── K1: подхватываем 'new'-items из прошлого цикла (recovery) ──
@@ -293,6 +301,9 @@ class NewsPipeline:
             )
             # N1: candidates теперь реально вставленные items
             self._process_batch(all_items, budget_override=remaining_budget)
+
+        # ── единое логирование LLM-usage за весь цикл (после обоих батчей) ──
+        self._log_llm_usage()
 
         # ── проверка баланса LLM (раз в check_interval_hours) ──
         self._maybe_check_balance()
@@ -565,6 +576,19 @@ class NewsPipeline:
                 )
         except Exception as e:
             logger.warning("_check_and_mark_failed: %s", e)
+
+    def _log_llm_usage(self) -> None:
+        """
+        Логирует агрегированный LLM-usage за цикл РОВНО ОДИН раз.
+        Безопасный getattr: fake-фильтры в тестах могут не иметь client/usage_stats.
+        """
+        if self.llm_filter is None:
+            return
+        stats = getattr(self.llm_filter, "client", None)
+        if stats is not None:
+            stats = getattr(stats, "usage_stats", None)
+        if stats is not None:
+            stats.log_cycle()
 
     def run_digest(self, force: bool = False) -> int:
         """

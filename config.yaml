@@ -161,9 +161,11 @@ llm:
   enabled: true
   provider: deepseek
   base_url: https://api.deepseek.com
-  model: deepseek-v4-pro          # ← проверить актуальность: deepseek-v4-pro, deepseek-chat-v3
-                                  #   Запустите: python -m newsbot --check-llm
-                                  #   Если модель невалидна — будет fallback (заливка всем подряд)
+  model: deepseek-flash          # ⚠️ проверить id живым ключом: python -m newsbot --check-llm
+                                  #   При 4xx/404 — fallback (все новости без фильтра).
+                                  #   Вернуть deepseek-v4-pro: одна строка выше.
+                                  #   deepseek-flash дешевле: input ×4, output ×3.3 vs pro.
+                                  #   deepseek-v4-pro: более способная альтернатива (одной строкой).
   api_key: ""                     # заполняется из .env DEEPSEEK_API_KEY
   temperature: 0
   timeout_sec: 60

@@ -6,11 +6,122 @@ DeepSeek API-клиент (OpenAI-compatible).
 import json
 import logging
 import time
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
 logger = logging.getLogger("newsbot.llm.client")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Usage accumulator
+# ─────────────────────────────────────────────────────────────────
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """Безопасное преобразование в int. При ошибке — default."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_cached_tokens(usage: Dict[str, Any]) -> Tuple[int, int]:
+    """
+    Извлекает cached_hit и cached_miss из usage-блока.
+
+    Поддерживает три формы ответа:
+      1) OpenAI-стиль: usage["prompt_tokens_details"]["cached_tokens"]
+         → cached_hit = cached_tokens,  cached_miss = prompt - cached_hit
+      2) DeepSeek top-level: usage["prompt_cache_hit_tokens"] /
+                              usage["prompt_cache_miss_tokens"]
+         → берём оба поля напрямую
+      3) Fallback: только cached_hit, cached_miss = prompt - cached_hit (не < 0)
+
+    Returns:
+        (cached_hit, cached_miss)
+    """
+    prompt_tokens = _safe_int(usage.get("prompt_tokens"), 0)
+
+    # 1) OpenAI-стиль: prompt_tokens_details.cached_tokens
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        cached_hit = _safe_int(details["cached_tokens"], 0)
+        cached_miss = max(0, prompt_tokens - cached_hit)
+        return cached_hit, cached_miss
+
+    # 2) DeepSeek top-level: оба поля
+    cached_hit_ds = _safe_int(usage.get("prompt_cache_hit_tokens"), None)
+    cached_miss_ds = _safe_int(usage.get("prompt_cache_miss_tokens"), None)
+
+    if cached_hit_ds is not None:
+        if cached_miss_ds is not None:
+            # оба DeepSeek-поля присутствуют
+            return cached_hit_ds, cached_miss_ds
+        else:
+            # есть только cached_hit → miss = остаток
+            return cached_hit_ds, max(0, prompt_tokens - cached_hit_ds)
+
+    # 3) ни один формат не обнаружен
+    return 0, max(0, prompt_tokens)
+
+
+@dataclass
+class UsageStats:
+    """
+    Аккумулятор LLM-usage за цикл. Потокобезопасность не требуется
+    (pipeline — однопоточный).
+    """
+
+    model: str = "unknown"
+    calls: int = 0
+    prompt_tokens: int = 0
+    prompt_cache_hit_tokens: int = 0
+    prompt_cache_miss_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add_response(self, data: Dict[str, Any]) -> None:
+        """Добавляет usage из ответа API (data — распарсенный JSON). Безопасно при отсутствии."""
+        self.calls += 1
+
+        usage: Any = data.get("usage")
+        if not isinstance(usage, dict):
+            return
+
+        self.total_tokens += max(0, _safe_int(usage.get("total_tokens"), 0))
+        self.completion_tokens += max(0, _safe_int(usage.get("completion_tokens"), 0))
+
+        prompt_tokens = _safe_int(usage.get("prompt_tokens"), 0)
+        self.prompt_tokens += prompt_tokens
+
+        cached_hit, cached_miss = _parse_cached_tokens(usage)
+        self.prompt_cache_hit_tokens += cached_hit
+        self.prompt_cache_miss_tokens += cached_miss
+
+    def log_cycle(self) -> None:
+        """Логирует одну агрегированную строку на уровне INFO."""
+        if self.calls == 0:
+            return
+        logger.info(
+            "LLM за цикл: calls=%d, prompt=%d (cached=%d, miss=%d), "
+            "completion=%d, total=%d",
+            self.calls, self.prompt_tokens,
+            self.prompt_cache_hit_tokens, self.prompt_cache_miss_tokens,
+            self.completion_tokens, self.total_tokens,
+        )
+
+    def reset(self) -> None:
+        """Сбрасывает счётчики (вызывается в начале нового цикла)."""
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.prompt_cache_hit_tokens = 0
+        self.prompt_cache_miss_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
 
 
 class LLMError(Exception):
@@ -49,7 +160,7 @@ class DeepSeekClient:
     ----------
     api_key : str
     base_url : str   — например https://api.deepseek.com
-    model : str      — имя модели, например deepseek-v4-pro
+    model : str      — имя модели, например deepseek-flash
     timeout : float — таймаут одного запроса, сек
     max_retries : int — максимум повторов при 429/5xx/транзиентных ошибках
     temperature : float — temperature для chat-запроса (default 0)
@@ -72,6 +183,7 @@ class DeepSeekClient:
         self.temperature = temperature
         # один HTTP-клиент на весь жизненный цикл — переиспользуем соединения
         self._http = httpx.Client(timeout=self.timeout, trust_env=True)  # подхватывает HTTP_PROXY / HTTPS_PROXY из окружения (Docker)
+        self.usage_stats = UsageStats(model=model)
 
     def close(self) -> None:
         """Закрывает HTTP-клиент. Идемпотентен."""
@@ -142,6 +254,9 @@ class DeepSeekClient:
                 content = message.get("content", "")
                 if not content:
                     raise LLMError("Пустой content в assistant message")
+
+                # ── usage-логирование (DEBUG, на каждый вызов) ──
+                self._log_usage_debug(data)
 
                 result: Any = json.loads(content)
                 # Модель может вернуть массив или примитив
@@ -322,6 +437,31 @@ class DeepSeekClient:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _log_usage_debug(self, data: Dict[str, Any]) -> None:
+        """
+        Логирует usage одной строкой на DEBUG. Безопасно при отсутствии полей.
+        Также аккумулирует в self.usage_stats.
+        """
+        self.usage_stats.add_response(data)
+
+        usage: Any = data.get("usage")
+        if not isinstance(usage, dict):
+            logger.debug(
+                "LLM usage | model=%s | (usage unavailable)", self.model
+            )
+            return
+
+        total = _safe_int(usage.get("total_tokens"), 0)
+        completion = _safe_int(usage.get("completion_tokens"), 0)
+        prompt = _safe_int(usage.get("prompt_tokens"), 0)
+
+        cached_hit, cached_miss = _parse_cached_tokens(usage)
+
+        logger.debug(
+            "LLM usage | model=%s | prompt=%d (cached=%d, miss=%d) | completion=%d | total=%d",
+            self.model, prompt, cached_hit, cached_miss, completion, total,
+        )
 
     def _post(self, path: str, payload: Dict[str, Any]) -> httpx.Response:
         """POST с правильным заголовком авторизации."""
