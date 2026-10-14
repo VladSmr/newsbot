@@ -20,8 +20,10 @@
 
 ```bash
 # Вариант A: git clone (рекомендуется)
-git clone https://your-repo-url/newsbot.git
+git clone https://github.com/VladSmr/newsbot.git
 cd newsbot
+# На GitHub основная ветка — main (не master):
+git checkout main
 
 # Вариант B: scp / rsync
 scp -r ./newsbot user@vps:/opt/newsbot/
@@ -212,7 +214,7 @@ environment:
 Если прокси с авторизацией:
 
 ```yaml
-HTTPS_PROXY: "http://user:password@proxy.example.com"
+HTTPS_PROXY: "http://user:password@proxy.example.com"   # например, http://user:pass@proxy.example.com:8080
 ```
 
 ### Как это работает

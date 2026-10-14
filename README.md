@@ -8,6 +8,12 @@
 ## Быстрый старт
 
 ```bash
+# 0. Клонирование репозитория
+git clone https://github.com/VladSmr/newsbot.git
+cd newsbot
+# На GitHub основная ветка — main (если git checkout не переключил автоматически):
+git checkout main
+
 # 1. Виртуальное окружение (Python 3.8+)
 python -m venv venv
 source venv/bin/activate      # Linux/macOS

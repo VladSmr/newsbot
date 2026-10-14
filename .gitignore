@@ -19,6 +19,10 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 
+# JetBrains IDE
+.idea/
+*.iml
+
 # OS files
 .DS_Store
 Thumbs.db

@@ -1,5 +1,10 @@
 # NEWS BOT — PROJECT STATE (сводка для восстановления контекста)
 
+## Репозиторий
+
+**Публичный:** https://github.com/VladSmr/newsbot
+Основная ветка на GitHub: `main` (локально — `master`).
+
 ## Что это
 Персональный Telegram-бот: собирает новости из RSS (30 фидов), дедуплицирует,
 фильтрует через LLM (DeepSeek) по интересам владельца и присылает только
@@ -222,7 +227,7 @@ Retry: `get_stuck_pending()` — 'pending' старше retry_threshold_sec (60 
   директива в SYSTEM_PROMPT, суммарный лимит 1500.
 - [ ] Этап 3: скрейперы, RSSHub-мост для ТГ-каналов (Astra, Baza, Shot, Mash,
   Sirena), Steam-подписки на тайтлы, USGS GeoJSON (землетрясения).
-- [ ] Этап 5: деплой 24/7 (Docker), VPS, живая проверка фидов и Telegram.
+- [x] Этап 5: деплой 24/7 (Docker), VPS, живая проверка фидов и Telegram.
 
 ## Оставшиеся задачи
 
@@ -230,7 +235,7 @@ Retry: `get_stuck_pending()` — 'pending' старше retry_threshold_sec (60 
 |---|------------------------------|---------------|---------------------------------------------------|
 | 1 | URL-нормализация             | Средний       | utm_* + trailing slash; отложена (known limitation)|
 | 2 | Проверка модели DeepSeek     | Высокий       | `deepseek-v4-pro` — проверить id через `--check-llm` живым ключом |
-| 3 | Deploy на VPS, этап 5        | Высокий       | Docker, VPS 24/7, проверить фиды и Telegram живьём   |
+| 3 | Deploy на VPS, этап 5        | ✅ Завершён    | DEPLOY.md, Dockerfile, docker-compose.yml готовы       |
 | 4 | Telegram-доставка живьём    | Высокий       | api.telegram.org недоступен с локальной машины      |
 | 5 | Этап 3 (RSSHub, USGS, Steam) | Низкий        | ТГ-каналы → RSSHub, землетрясения → USGS GeoJSON   |
 
