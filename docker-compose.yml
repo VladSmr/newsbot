@@ -1,0 +1,32 @@
+services:
+  newsbot:
+    build: .
+    # ── secrets ──────────────────────────────────────────────────────
+    env_file: .env
+    # ── restart policy ────────────────────────────────────────────────
+    restart: unless-stopped
+    # ── volumes: БД, конфиг, .env (для --set-chat-id) ────────────────
+    volumes:
+      # .env — секреты + chat_id. монтируется rw: --set-chat-id
+      # персистентен на хосте. env_file делает переменные доступными
+      # через os.environ, а mount нужен для записи из --set-chat-id.
+      - ./.env:/app/.env:rw
+      # папка data — снаружи; внутри контейнера /app/data
+      - ./data:/app/data
+      # config.yaml — только на чтение
+      - ./config.yaml:/app/config.yaml:ro
+    # ── timezone для дайджеста (digest.times — в локальной tz) ───────
+    environment:
+      # Europe/Moscow — пример; замените на свой часовой пояс
+      TZ: Europe/Moscow
+
+      # ── ПРОКСИ ДЛЯ TELEGRAM / DEEPSEEK (раскомментируйте при необходимости) ──
+      # Все HTTP-клиенты бота (collector, telegram_io, delivery, llm) создаются
+      # с trust_env=True — они автоматически читают HTTPS_PROXY / HTTP_PROXY.
+      # БЕЗОПАСНОСТЬ: если прокси требует авторизации — передавайте credentials
+      # ВНУТРИ URL:  HTTPS_PROXY=http://user:pass@proxy.example.com:8080
+      # На VPS с WireGuard / VPN-прокси — обычно без авторизации.
+      #
+      # HTTP_PROXY: "http://proxy.example.com:8080"
+      # HTTPS_PROXY: "http://proxy.example.com:8080"
+      # NO_PROXY: "localhost,127.0.0.1"

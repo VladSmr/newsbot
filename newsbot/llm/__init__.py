@@ -1,0 +1,7 @@
+"""
+newsbot/llm/ — LLM-фильтр новостей (DeepSeek, OpenAI-compatible API).
+"""
+from .filter import LLMFilter, FilterResult, route
+from .client import DeepSeekClient, LLMError, BalanceInfo
+
+__all__ = ["LLMFilter", "FilterResult", "DeepSeekClient", "LLMError", "BalanceInfo", "route"]

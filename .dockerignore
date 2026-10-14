@@ -1,0 +1,42 @@
+# ── secrets ─────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── database ──────────────────────────────────────────────────────────
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ── python artefacts ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ── tests & venv ──────────────────────────────────────────────────────
+tests/
+.venv/
+venv/
+.venv
+venv
+
+# ── git ───────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── docs & misc ──────────────────────────────────────────────────────
+*.md
+README.md
+PROJECT_STATE.md
+MANIFEST.in
+setup.py
+check_compose.py
+.pytest_cache/
+*.log
+logs/
+.DS_Store

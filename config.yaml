@@ -1,0 +1,180 @@
+# ============================================================
+# newsbot — конфигурация
+# ============================================================
+
+# --- Источники RSS ---
+sources:
+  # РФ
+  - name: Интерфакс
+    url: https://www.interfax.ru/rss.asp
+    lang: ru
+  - name: ТАСС
+    url: https://tass.ru/rss/v2.xml
+    lang: ru
+  - name: РИА
+    url: https://ria.ru/export/rss2/index.xml
+    lang: ru
+  - name: Lenta
+    url: https://lenta.ru/rss/
+    lang: ru
+  - name: REGNUM
+    url: https://www.regnum.ru/rss
+    lang: ru
+  - name: Коммерсантъ
+    url: https://www.kommersant.ru/rss/news.xml
+    lang: ru
+
+  # Кубань
+  - name: Югополис
+    url: https://yugopolis.ru/rss
+    lang: ru
+  - name: Кубанские новости
+    url: https://kubnews.ru/rss
+    lang: ru
+
+  # Мир
+  - name: Al Jazeera
+    url: https://www.aljazeera.com/xml/rss/all.xml
+    lang: en
+  - name: Guardian World
+    url: https://www.theguardian.com/world/rss
+    lang: en
+  - name: Sky News World
+    url: https://feeds.skynews.com/feeds/rss/world.xml
+    lang: en
+  - name: France 24 English
+    url: https://www.france24.com/en/rss
+    lang: en
+
+  # Авиа
+  - name: AeroTime
+    url: https://www.aerotime.aero/rss
+    lang: en
+
+  # Наука
+  - name: ScienceDaily
+    url: https://www.sciencedaily.com/rss/all.xml
+    lang: en
+  - name: Phys.org
+    url: https://phys.org/rss-feed/
+    lang: en
+  - name: STAT News
+    url: https://www.statnews.com/feed/
+    lang: en
+  - name: N+1
+    url: https://nplus1.ru/rss
+    lang: ru
+  - name: Naked Science
+    url: https://naked-science.ru/feed
+    lang: ru
+
+  # Кибер
+  - name: BleepingComputer
+    url: https://www.bleepingcomputer.com/feed/
+    lang: en
+  - name: KrebsOnSecurity
+    url: https://krebsonsecurity.com/feed/
+    lang: en
+  - name: Habr news
+    url: https://habr.com/ru/rss/news/
+    lang: ru
+
+  # Чипы
+  - name: Tom's Hardware
+    url: https://www.tomshardware.com/feeds/all
+    lang: en
+
+  # Космос
+  - name: SpaceNews
+    url: https://spacenews.com/feed/
+    lang: en
+  - name: NASA
+    url: https://www.nasa.gov/news-release/feed/
+    lang: en
+  - name: NASASpaceflight
+    url: https://www.nasaspaceflight.com/feed/
+    lang: en
+
+  # Игры
+  - name: IGN
+    url: https://www.ign.com/rss/articles/feed?tags=games
+    lang: en
+  - name: Eurogamer
+    url: https://www.eurogamer.net/feed
+    lang: en
+  - name: DTF
+    url: https://dtf.ru/rss
+    lang: ru
+
+  # Кино
+  - name: Deadline
+    url: https://deadline.com/feed/
+    lang: en
+  - name: Variety
+    url: https://variety.com/feed/
+    lang: en
+
+# --- Поведение ---
+poll_interval_minutes: 15
+
+# --- База данных ---
+database:
+  path: data/newsbot.db
+  retention_days: 90       # удалять delivered/skipped items старше N дней
+  retry_threshold_sec: 60 # pending считается зависшим через N секунд
+
+# --- Логирование ---
+logging:
+  level: INFO
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+
+# --- Telegram (заполняется на этапе 2) ---
+telegram:
+  token: ""
+  chat_id: ""
+  poll_timeout: 25       # seconds для long-poll getUpdates
+
+# --- Дайджест ---
+# Шлётся автоматически по расписанию (digest.times) и вручную --digest.
+# Управляет отложенными новостями (score 5-6): они собираются и отправляются
+# одним блоком. После успешной отправки получают state='digested'.
+digest:
+  enabled: true                       # вкл/выкл автоматический дайджест
+  times: ["09:00", "21:00"]         # HH:MM в ЛОКАЛЬНОЙ tz; совпадает с format_time_utc
+  max_items: 100                     # лимит новостей в одном дайджесте (сортировка: score DESC, fetched_at ASC)
+  max_items_per_message: 20         # новостей на одно Telegram-сообщение (не более 4096 символов)
+  on_empty: skip                    # "skip" — не слать пустой дайджест; другое — на будущее
+
+# --- Фаза 2: обратная связь (👍/👎 после доставки новости) ---
+# Кнопки обрабатываются в Фазе 2b, few-shot в промпте — Фазе 2c.
+# feedback_targets хранятся коротко (кнопки живут ~retention_days),
+# сама таблица feedback хранится практически вечно — это обучающие данные.
+feedback:
+  enabled: true                  # вкл/выкл приём фидбэка
+  max_examples: 10               # сколько последних вердиктов подмешивать в few-shot
+  retention_days: 180             # удалять feedback_targets старше N дней
+                                 # (сама таблица feedback не чистится —
+                                 #  это обучающие данные для Фазы 2c)
+
+# --- LLM-фильтр ---
+llm:
+  enabled: true
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-pro          # ← проверить актуальность: deepseek-v4-pro, deepseek-chat-v3
+                                  #   Запустите: python -m newsbot --check-llm
+                                  #   Если модель невалидна — будет fallback (заливка всем подряд)
+  api_key: ""                     # заполняется из .env DEEPSEEK_API_KEY
+  temperature: 0
+  timeout_sec: 60
+  max_retries: 3
+  push_threshold: 7               # score >= 7 → пуш
+  digest_threshold: 5             # 5..6 → дайджест; < 5 → skipped
+  balance:
+    enabled: true
+    threshold: 2.0
+    check_interval_hours: 24
+  max_per_cycle: 150
+  # B12: system_prompt очищен. Источник истины — newsbot/llm/prompts.py.
+  # Раскомментируйте и заполните только для override; иначе используется код.
+  # system_prompt: ""

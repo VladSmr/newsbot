@@ -1,0 +1,24 @@
+# Sensitive data
+.env
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+
+# Virtual environments
+venv/
+.venv/
+
+# Database files (per-user state)
+data/*.db
+# SQLite WAL (Write-Ahead Logging)
+data/*.db-wal
+data/*.db-shm
+
+# OS files
+.DS_Store
+Thumbs.db

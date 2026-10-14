@@ -1,0 +1,516 @@
+"""
+TelegramPoller — long-poll getUpdates для приёма callback_query и команд.
+
+Работает параллельно с основным циклом в отдельном daemon thread.
+on_digest передаётся как callable (вызывается ОСНОВНЫМ потоком через event).
+
+Важно: одновременно два getUpdates-потребителя (poller и --check-telegram)
+запускать НЕЛЬЗЯ — будет 409 Conflict.
+"""
+import json
+import logging
+import re
+import threading
+import time
+from typing import Callable, List, Optional
+
+import httpx
+
+logger = logging.getLogger("newsbot.telegram_io")
+
+# ── HTTP-статусы ──────────────────────────────────────────────────────────────
+_HTTP_CONFLICT = 409
+
+
+# ── Исключения ───────────────────────────────────────────────────────────────
+
+class TgApiError(Exception):
+    """
+    Безопасное исключение для HTTP-ошибок Telegram API (N4).
+    Не содержит URL с токеном в сообщении.
+    Поле `http_status` хранит числовой код для детекта 409.
+    """
+
+    def __init__(self, http_status: Optional[int], cause: Optional[Exception]):
+        self.http_status = http_status
+        self.cause = cause
+        if http_status is not None:
+            super().__init__(f"HTTP {http_status}")
+        else:
+            super().__init__(type(cause).__name__ if cause else "unknown")
+
+# ── Token sanitizer ─────────────────────────────────────────────────────────
+
+def _TokenSanitizer(token: str):
+    """Маскирует токен: показываем тип + последние 4 символа (N4)."""
+    def sanitize(*args, **kwargs) -> str:
+        if not token:
+            return "(empty)"
+        last4 = token[-4:] if len(token) >= 4 else token
+        return f"...{last4} (len={len(token)})"
+    return sanitize
+
+def _safe_status_log(resp: httpx.Response) -> str:
+    """Safe repr ответа без URL с токеном."""
+    return f"<Response [{resp.status_code}]>"
+
+
+# ── Telegram client ──────────────────────────────────────────────────────────
+
+class _TgClient:
+    """
+    Minimal HTTP-клиент для Telegram Bot API.
+    Ошибки логируют только тип (N4: без str(e) — содержит URL с токеном).
+    """
+
+    def __init__(self, token: str, timeout: float = 30.0):
+        self.token = token
+        self._base = f"https://api.telegram.org/bot{token}"
+        self._http = httpx.Client(timeout=timeout, trust_env=True)  # подхватывает HTTP_PROXY / HTTPS_PROXY из окружения (Docker)
+
+    def _call(self, method: str, payload: Optional[dict] = None) -> dict:
+        """
+        Вызывает Telegram Bot API.
+        Raises TgApiError на всех HTTP-ошибках (безопасное сообщение, без URL/токена).
+        Raises ValueError на ok=False.
+        """
+        url = f"{self._base}/{method}"
+        try:
+            resp = self._http.post(url, json=payload or {})
+            resp.raise_for_status()  # HTTPStatusError на 4xx/5xx
+        except httpx.HTTPStatusError as e:
+            # N4: НЕ ре-рейзим сырое исключение (str содержит URL с токеном).
+            # Сохраняем status_code для детекта 409 в _poll.
+            raise TgApiError(
+                http_status=e.response.status_code,
+                cause=e,
+            )
+        except httpx.HTTPError as e:
+            # прочие сетевые ошибки (Timeout, Connect…)
+            raise TgApiError(http_status=None, cause=e)
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise TgApiError(http_status=None, cause=None)
+
+        if not data.get("ok"):
+            logger.debug("TG %s → ok=false: %s", method, data.get("description", "?"))
+            raise ValueError(f"Telegram error: {data.get('description', '?')}")
+
+        return data.get("result", {})
+
+    def getUpdates(
+        self,
+        offset: Optional[int] = None,
+        timeout: int = 25,
+        allowed_updates: Optional[List[str]] = None,
+    ) -> List[dict]:
+        payload = {"timeout": timeout}
+        if offset is not None:
+            payload["offset"] = offset
+        if allowed_updates:
+            payload["allowed_updates"] = json.dumps(allowed_updates)
+        result = self._call("getUpdates", payload)
+        return result if isinstance(result, list) else []
+
+    def answerCallbackQuery(self, callback_query_id: str, text: str) -> None:
+        self._call("answerCallbackQuery", {
+            "callback_query_id": callback_query_id,
+            "text": text,
+            "show_alert": False,
+        })
+
+    def sendMessage(self, chat_id: str, text: str) -> None:
+        self._call("sendMessage", {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        })
+
+    def editMessageReplyMarkup(
+        self,
+        chat_id: str,
+        message_id: int,
+        reply_markup: Optional[dict] = None,
+    ) -> None:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": (
+                reply_markup if reply_markup is not None
+                else {"inline_keyboard": []}
+            ),
+        }
+        try:
+            self._call("editMessageReplyMarkup", payload)
+        except Exception:
+            pass  # best-effort
+
+    def close(self) -> None:
+        self._http.close()
+
+
+# ── Callbacks data parser ─────────────────────────────────────────────────────
+
+_CALLBACK_PATTERN = re.compile(r"^fb:(\d+):([ud])$")
+
+
+def parse_feedback_callback(data: str):
+    """
+    Парсит callback_data кнопки 👍/👎.
+    Returns (target_id: int, verdict: 'like'|'dislike') или None.
+    """
+    m = _CALLBACK_PATTERN.match(data)
+    if not m:
+        return None
+    return (int(m.group(1)), "like" if m.group(2) == "u" else "dislike")
+
+
+# ── Команды ───────────────────────────────────────────────────────────────────
+
+class _Commands:
+    KNOWN = {"/start", "/help", "/digest"}
+
+    @staticmethod
+    def is_owner_command(msg: dict, owner_chat_id: str) -> bool:
+        """True если сообщение — команда от владельца (C2: безопасный парсинг)."""
+        chat = msg.get("chat", {})
+        if str(chat.get("id", "")) != str(owner_chat_id):
+            return False
+        text = msg.get("text", "") or ""
+        parts = text.strip().split()
+        # C2: защита от IndexError (фото/стикер/service-message без текста)
+        return bool(parts) and parts[0] in _Commands.KNOWN
+
+    @staticmethod
+    def text(msg: dict) -> str:
+        """Текст сообщения (без leading / command)."""
+        return (msg.get("text", "") or "").strip()
+
+
+# ── TelegramPoller ────────────────────────────────────────────────────────────
+
+class TelegramPoller:
+    """
+    Long-poll поллер Telegram.
+
+    Обрабатывает:
+      — callback_query с data='fb:{id}:{u|d}' (только от владельца, M2)
+      — команды /digest, /start, /help от владельца
+
+    Не падает при сетевых ошибках, таймаутах, 409 Conflict.
+
+    Thread-safety: poller создаёт СОБСТВЕННОЕ соединение Storage в своём
+    потоке (C1: отдельный экземпляр, а не обёртка над main-connection).
+    """
+
+    def __init__(
+        self,
+        token: str,
+        chat_id: str,
+        db_path: str,
+        on_digest: Callable[[], None],
+        logger: logging.Logger = None,
+        poll_timeout: int = 25,
+    ):
+        if not logger:
+            logger = logging.getLogger("newsbot.telegram_io")
+        self._log = logger
+        self._client = _TgClient(token)
+        self._chat_id = str(chat_id)
+        self._db_path = db_path
+        # on_digest — callable для установки флага (НЕ выполнения в poller thread)
+        self._on_digest = on_digest
+        self._poll_timeout = poll_timeout
+
+        # Storage создаётся ЛЕНИВО в poller thread (C1)
+        self._storage = None
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        # m2: backoff как атрибут, чтобы _poll мог вызвать _sleep_backoff
+        self._backoff: float = 1.0
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._thread is not None:
+            self._log.warning("Poller already started")
+            return
+        self._stop_event.clear()
+        t = threading.Thread(target=self._run_loop, name="TelegramPoller", daemon=True)
+        t.start()
+        self._thread = t
+        self._log.info("TelegramPoller started (daemon thread)")
+
+    def stop(self) -> None:
+        self._log.info("Stopping TelegramPoller...")
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+        self._log.info("TelegramPoller stopped")
+
+    # ── poller thread ────────────────────────────────────────────────────────
+
+    def _run_loop(self) -> None:
+        """
+        Основной long-poll цикл (C1: Storage создаётся здесь, в poller thread).
+        m2: Storage.close() вызывается ВНУТРИ poller thread (finally).
+        """
+        # C1: создаём Storage в poller thread — своё соединение, не main.
+        try:
+            from newsbot.storage import Storage
+            self._storage = Storage(self._db_path)
+            self._log.debug("Poller Storage created in thread (db=%s)", self._db_path)
+        except Exception as e:
+            self._log.error("Failed to create Storage in poller thread: %s", e)
+            return  # не можем работать без storage
+
+        # m2: Storage.close() в finally — гарантированно в poller thread.
+        try:
+            self._backoff = 1.0
+            while not self._stop_event.is_set():
+                try:
+                    self._tick(self._backoff)
+                    self._backoff = 1.0  # сброс на успехе
+                except Exception as e:
+                    self._log.error(
+                        "Unexpected error in poller tick (%s), backoff %.1f s: %s",
+                        type(e).__name__, self._backoff, e,
+                    )
+                    self._sleep_backoff(self._backoff)
+                    self._backoff = min(self._backoff * 2, 60.0)
+        finally:
+            # m2: закрываем наше соединение в poller thread (не в main)
+            if self._storage is not None:
+                try:
+                    self._storage.close()
+                    self._log.debug("Poller Storage closed in poller thread")
+                except Exception:
+                    pass
+                self._storage = None
+
+    def _tick(self, backoff: float) -> None:
+        """Один виток: poll → process updates. Каждый шаг защищён."""
+        # C1: _load_offset может бросить (если storage ещё не создан)
+        try:
+            offset = self._load_offset()
+        except Exception as e:
+            self._log.warning("_load_offset failed: %s", e)
+            offset = None
+
+        try:
+            updates = self._poll(offset)
+        except TgApiError as e:
+            # N1: 409 проверяется по http_status через TgApiError
+            if e.http_status == _HTTP_CONFLICT:
+                self._log.error(
+                    "409 Conflict: another getUpdates consumer active. Pause 60 s."
+                )
+                self._sleep_backoff(60.0)
+                return
+            # прочие HTTP-ошибки
+            self._log.warning(
+                "Network error during poll (HTTP %s), backoff %.1f s",
+                e.http_status, backoff,
+            )
+            self._sleep_backoff(backoff)
+            return
+        except Exception as e:
+            self._log.error("Poll error: %s", e)
+            self._sleep_backoff(backoff)
+            return
+
+        if not updates:
+            return
+
+        for upd in updates:
+            # C2: каждый update защищён — ошибка не убивает поток
+            try:
+                self._process_update(upd)
+            except Exception as e:
+                self._log.warning(
+                    "Error processing update %s: %s",
+                    upd.get("update_id", "?"), e,
+                )
+
+        # сохраняем offset
+        max_id = max(u.get("update_id", 0) for u in updates)
+        self._save_offset(max_id + 1)
+
+    def _poll(self, offset: Optional[int]) -> List[dict]:
+        """
+        Один long-poll запрос.
+        TgApiError ловится — возвращает пустой список; вызывает backoff.
+        """
+        try:
+            updates = self._client.getUpdates(
+                offset=offset,
+                timeout=self._poll_timeout,
+                allowed_updates=["callback_query", "message"],
+            )
+        except TgApiError as e:
+            if e.http_status == _HTTP_CONFLICT:
+                self._sleep_backoff(60.0)
+            else:
+                self._sleep_backoff(self._backoff)
+            return []
+        return updates
+
+    # ── update dispatch ───────────────────────────────────────────────────────
+
+    def _process_update(self, upd: dict) -> None:
+        """Диспетчеризирует update: callback_query или message."""
+        if "callback_query" in upd:
+            self._handle_callback_query(upd["callback_query"])
+        elif "message" in upd:
+            self._handle_message(upd["message"])
+
+    # ── callback_query (M2: проверка владельца) ──────────────────────────────
+
+    def _handle_callback_query(self, cb: dict) -> None:
+        """
+        Обрабатывает нажатие кнопки 👍/👎.
+
+        Формат data: fb:{target_id}:{u|d}
+        C2: обёрнуто в try/except.
+        M2: проверяем chat_id (чужой чат — игнор).
+        """
+        query_id = cb.get("id", "")
+        data = cb.get("data", "")
+        message = cb.get("message", {})
+
+        # M2: проверка владельца
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        if chat_id != self._chat_id:
+            self._log.debug("Callback from wrong chat %s (owner=%s) — ignored",
+                           chat_id, self._chat_id)
+            return
+
+        parsed = parse_feedback_callback(data)
+        if parsed is None:
+            self._log.debug("Invalid callback data: %r", data)
+            return
+
+        target_id, verdict = parsed
+        message_id = message.get("message_id")
+
+        # C2: обёртка try/except для record_feedback
+        try:
+            recorded = self._storage.record_feedback(
+                target_id=target_id,
+                verdict=verdict,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        except Exception as e:
+            self._log.warning("record_feedback failed for target=%d: %s",
+                             target_id, e)
+            recorded = False
+
+        popup_text = "👍 Учту" if verdict == "like" else "👎 Понял, такое больше не присылать"
+
+        try:
+            self._client.answerCallbackQuery(query_id, text=popup_text)
+        except Exception as e:
+            self._log.warning("answerCallbackQuery failed for query=%s: %s",
+                             query_id[:20], type(e).__name__)
+
+        # n5: editMessageReplyMarkup уже best-effort внутри _call — внешний try/else не нужен
+        if recorded and message_id:
+            self._client.editMessageReplyMarkup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup={"inline_keyboard": []},
+            )
+
+        self._log.debug("feedback: target=%d verdict=%s recorded=%s",
+                       target_id, verdict, recorded)
+
+    # ── message commands ─────────────────────────────────────────────────────
+
+    def _handle_message(self, msg: dict) -> None:
+        """Обрабатывает команды /digest, /start, /help от владельца."""
+        if not _Commands.is_owner_command(msg, self._chat_id):
+            return
+
+        cmd, *_ = _Commands.text(msg).split(maxsplit=1)
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+
+        if cmd == "/digest":
+            self._log.info("Command /digest from owner — signaling main thread")
+            try:
+                self._on_digest()  # M1: только сигнал, НЕ run_digest в poller thread
+                self._client.sendMessage(
+                    chat_id,
+                    "📰 Команда принята, дайджест будет выполнен..."
+                )
+            except Exception as e:
+                self._log.error("/digest signal failed: %s", e)
+                try:
+                    self._client.sendMessage(chat_id, "❌ Ошибка при запуске дайджеста.")
+                except Exception:
+                    pass
+
+        elif cmd in ("/start", "/help"):
+            greeting = (
+                "👋 <b>newsbot</b> — персональный новостной агрегатор.\n\n"
+                "📬 Новости приходят автоматически по расписанию.\n"
+                "👍👎 Голосуйте за новости — это улучшает подборку.\n\n"
+                "📋 <b>Команды:</b>\n"
+                "/digest — запустить дайджест отложенных новостей\n"
+                "/help  — эта справка"
+            )
+            try:
+                self._client.sendMessage(chat_id, greeting)
+            except Exception as e:
+                self._log.warning("sendMessage (start/help) failed: %s", type(e).__name__)
+
+        else:
+            self._log.debug("Unknown command ignored: %s", cmd)
+
+    # ── offset persistence ────────────────────────────────────────────────────
+
+    META_OFFSET_KEY = "tg_updates_offset"
+
+    def _load_offset(self) -> Optional[int]:
+        if self._storage is None:
+            return None
+        try:
+            val = self._storage.get_meta(self.META_OFFSET_KEY)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+        except Exception as e:
+            self._log.warning("_load_offset failed: %s", e)
+        return None
+
+    def _save_offset(self, offset: int) -> None:
+        if self._storage is None:
+            return
+        try:
+            self._storage.set_meta(self.META_OFFSET_KEY, str(offset))
+        except Exception as e:
+            self._log.warning("_save_offset failed: %s", e)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _sleep_backoff(self, seconds: float) -> None:
+        """Спит seconds с проверкой stop_event."""
+        step = 1.0
+        slept = 0.0
+        while slept < seconds and not self._stop_event.is_set():
+            time.sleep(min(step, seconds - slept))
+            slept += step
+
+    def close(self) -> None:
+        """
+        Закрывает HTTP-клиент poller.
+        m2: НЕ закрывает Storage — это делает _run_loop в finally (в poller thread).
+        Вызывать только после stop() + join().
+        """
+        self._client.close()
