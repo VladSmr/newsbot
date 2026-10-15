@@ -309,3 +309,18 @@ docker compose run --rm --entrypoint python newsbot -c "from newsbot.config impo
 # Проверить, какие переменные окружения видит контейнер
 docker compose run --rm --entrypoint env newsbot | grep -E "TELEGRAM|DEEPSEEK|HTTP_PROXY"
 ```
+
+## 14. Команды бота (в чате Telegram)
+
+```
+/stop     — приостановить обработку и доставку
+           (сбор RSS продолжается, новости накопятся)
+/continue — возобновить после /stop
+/digest   — запустить дайджест отложенных новостей
+/help     — справка
+```
+
+**Пауза (`/stop`):** RSS-сбор работает, items сохраняются как `state='new'`.
+При `/continue` накопленные новости обработаются в ближайшем цикле
+(в рамках обычного бюджета `max_per_cycle`).
+Флаг хранится в БД — переживает рестарт контейнера.

@@ -215,7 +215,7 @@ def _build_poller(
         logger=logging.getLogger("test"),
         poll_timeout=1,
     )
-    # подменяем обёрнутый storage (C1: мокаем вместо _ThreadSafeStorage)
+    # подменяем storage на мок (C1: мокаем напрямую, обёртка убрана)
     poller._storage = storage_mock or MagicMock()
     poller._storage.record_feedback.return_value = True
     poller._client = client_mock or _make_mock_client()

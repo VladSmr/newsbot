@@ -128,14 +128,24 @@ def main():
             if _digest_requested.is_set():
                 _digest_requested.clear()
                 logger.info("/digest: выполняем по запросу от poller...")
+                # Minor #2: проверяем паузу перед force-digest.
+                # Безопасный getattr — _is_paused может быть приватным,
+                # а в отдельных окружениях pipeline может не иметь storage.
                 try:
-                    count = pipeline.run_digest(force=True)
-                    if count > 0:
-                        logger.info("/digest: отправлено %d новостей", count)
-                    else:
-                        logger.info("/digest: ничего не отправлено")
-                except Exception as e:
-                    logger.error("/digest: ошибка: %s", e, exc_info=True)
+                    is_paused = getattr(pipeline, "_is_paused", lambda: False)()
+                except Exception:
+                    is_paused = False
+                if is_paused:
+                    logger.info("/digest: пропущен — bot на паузе (paused=1)")
+                else:
+                    try:
+                        count = pipeline.run_digest(force=True)
+                        if count > 0:
+                            logger.info("/digest: отправлено %d новостей", count)
+                        else:
+                            logger.info("/digest: ничего не отправлено")
+                    except Exception as e:
+                        logger.error("/digest: ошибка: %s", e, exc_info=True)
 
             pipeline.run_cycle_with_delivery()
         except Exception as e:
@@ -186,20 +196,22 @@ def main():
 def _maybe_start_poller(config: dict, pipeline: NewsPipeline, logger) -> None:
     """
     Запускает TelegramPoller в демон-потоке, если:
-      — feedback.enabled == True  (n3: согласованный дефолт из config, не hardcoded False)
       — telegram.token задан
       — telegram.chat_id задан
-    Иначе — предупреждение и без поллера.
+
+    Поллер работает НЕЗАВИСИМО от feedback.enabled — он обрабатывает
+    /stop, /continue, /digest и (если feedback.enabled=true) callbacks.
+    Фидбэк-обработка гейтится внутри TelegramPoller._handle_callback_query
+    по feedback_enabled (параметр).
+
+    Если feedback.enabled=false — поллер всё равно нужен для /stop|/continue|/digest.
     """
     global _poller, _digest_requested
 
-    fb_cfg = config.get("feedback", {})
     tg_cfg = config.get("telegram", {})
-
-    # n3: дефолт из config — feedback.enabled (default True в DEFAULT_CONFIG)
-    if not fb_cfg.get("enabled", True):
-        logger.info("TelegramPoller: feedback.enabled=false — not starting")
-        return
+    fb_cfg = config.get("feedback", {})
+    # n3: дефолт из config (default True в DEFAULT_CONFIG)
+    feedback_enabled = fb_cfg.get("enabled", True)
 
     token = tg_cfg.get("token", "") or ""
     chat_id = tg_cfg.get("chat_id", "") or ""
@@ -228,6 +240,7 @@ def _maybe_start_poller(config: dict, pipeline: NewsPipeline, logger) -> None:
         on_digest=_signal_digest,
         logger=logger,
         poll_timeout=poll_timeout,
+        feedback_enabled=feedback_enabled,
     )
     _poller.start()
 
@@ -361,6 +374,9 @@ def _run_digest_once() -> None:
     Выполняет дайджест один раз (--digest) и выходит.
     Инициализирует pipeline, запускает run_digest(force=True), закрывает.
     Exit code 0 — всегда успех (даже если deferred пуст или ошибка log-only).
+
+    Minor: при paused=1 CLI --digest тоже пропускает отправку и логирует
+    (консистентность с daemon-путём и /digest в чате).
     """
     config = load_config()
     setup_logging(config["logging"])
@@ -369,11 +385,20 @@ def _run_digest_once() -> None:
     logger.info("=== Дайджест по запросу (--digest) ===")
     pipeline = NewsPipeline(config)
     try:
-        count = pipeline.run_digest(force=True)
-        if count > 0:
-            logger.info("Дайджест: отправлено %d новостей", count)
+        # Minor #2: проверяем паузу — ручной CLI --digest уважает паузу
+        # (консистентно с /digest в чате и daemon-run_cycle).
+        try:
+            is_paused = pipeline._is_paused()
+        except Exception:
+            is_paused = False
+        if is_paused:
+            logger.info("Дайджест (--digest): пропущен — bot на паузе (paused=1)")
         else:
-            logger.info("Дайджест: ничего не отправлено (нет отложенных новостей)")
+            count = pipeline.run_digest(force=True)
+            if count > 0:
+                logger.info("Дайджест: отправлено %d новостей", count)
+            else:
+                logger.info("Дайджест: ничего не отправлено (нет отложенных новостей)")
     except Exception as e:
         logger.error("Дайджест: ошибка: %s", e, exc_info=True)
         sys.exit(1)

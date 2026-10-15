@@ -347,10 +347,10 @@ class TestPipelineCreatesFeedbackTarget:
                 published_parsed=None,
             )
 
-            # эмулируем оценку с score=8 (push)
+            # эмулируем оценку с score=8 (push; urgent=True т.к. push_urgent_only=True)
             with patch.object(
                 pipeline.llm_filter, "evaluate",
-                return_value=FilterResult(ok=True, score=8, summary="ok", reason="good")
+                return_value=FilterResult(ok=True, score=8, summary="ok", reason="good", urgent=True)
             ):
                 pipeline._process_batch([item])
 
@@ -380,6 +380,7 @@ class TestPipelineCreatesFeedbackTarget:
                 "digest_threshold": 5,
                 "temperature": 0,
                 "timeout_sec": 10,
+                "push_urgent_only": False,  # M2: legacy — fallback доставляется как push
             },
             "feedback": {"enabled": True},
         }

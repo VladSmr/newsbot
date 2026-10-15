@@ -65,7 +65,8 @@ _set_env_project_root(_PROJECT_ROOT)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_minutes": 15,
-    "database": {"path": "data/newsbot.db", "retention_days": 90, "retry_threshold_sec": 60},
+    "database": {"path": "data/newsbot.db", "retention_days": 90, "retry_threshold_sec": 60,
+                   "deferred_retention_days": 14, "recovery_new_limit": 500},
     "logging": {
         "level": "INFO",
         "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -74,7 +75,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "digest": {
         "enabled": True,
         "times": ["09:00", "21:00"],
-        "max_items": 100,
+        "max_items": 30,
         "max_items_per_message": 20,
         "on_empty": "skip",
     },
@@ -96,12 +97,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "check_interval_hours": 24,
         },
         "max_per_cycle": 150,
+        "off_peak_only": False,
+        "batch_size": 10,
+        "max_tokens": 4096,
     },
     # Фаза 2: обратная связь (кнопки 👍/👎)
     "feedback": {
         "enabled": True,
         "max_examples": 10,     # примеров в few-shot промпте
         "retention_days": 180,   # хранение feedback_targets (feedback хранится дольше)
+    },
+    # Кросс-источниковая дедупликация
+    "dedup": {
+        "cross_source": True,   # уровень 1: глобальный точный дедуп по title_hash (без source)
+        "fuzzy": True,          # уровень 2: нечёткое сравнение (SequenceMatcher), только при cross_source=true
+        "threshold": 0.95,      # порог SequenceMatcher ratio (0..1, clamp автоматический)
+        "token_threshold": 0.8,  # порог Jaccard значащих токенов (0..1, clamp автоматический)
+        "window_days": 3,       # окно сравнения для fuzzy и cross_source
     },
 }
 

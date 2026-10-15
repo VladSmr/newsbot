@@ -171,7 +171,7 @@ def parse_feedback_callback(data: str):
 # ── Команды ───────────────────────────────────────────────────────────────────
 
 class _Commands:
-    KNOWN = {"/start", "/help", "/digest"}
+    KNOWN = {"/start", "/help", "/digest", "/stop", "/continue"}
 
     @staticmethod
     def is_owner_command(msg: dict, owner_chat_id: str) -> bool:
@@ -198,7 +198,8 @@ class TelegramPoller:
 
     Обрабатывает:
       — callback_query с data='fb:{id}:{u|d}' (только от владельца, M2)
-      — команды /digest, /start, /help от владельца
+      — команды /stop, /continue, /digest, /start, /help от владельца
+      — /stop и /continue пишут флаг 'paused' в meta (shared с pipeline)
 
     Не падает при сетевых ошибках, таймаутах, 409 Conflict.
 
@@ -214,6 +215,7 @@ class TelegramPoller:
         on_digest: Callable[[], None],
         logger: logging.Logger = None,
         poll_timeout: int = 25,
+        feedback_enabled: bool = True,
     ):
         if not logger:
             logger = logging.getLogger("newsbot.telegram_io")
@@ -224,6 +226,7 @@ class TelegramPoller:
         # on_digest — callable для установки флага (НЕ выполнения в poller thread)
         self._on_digest = on_digest
         self._poll_timeout = poll_timeout
+        self._feedback_enabled = feedback_enabled
 
         # Storage создаётся ЛЕНИВО в poller thread (C1)
         self._storage = None
@@ -398,17 +401,20 @@ class TelegramPoller:
         message_id = message.get("message_id")
 
         # C2: обёртка try/except для record_feedback
-        try:
-            recorded = self._storage.record_feedback(
-                target_id=target_id,
-                verdict=verdict,
-                chat_id=chat_id,
-                message_id=message_id,
-            )
-        except Exception as e:
-            self._log.warning("record_feedback failed for target=%d: %s",
-                             target_id, e)
-            recorded = False
+        # n3: гейтится по feedback_enabled (параметр из __main__), независимо от
+        # feedback.enabled в конфиге — поллер стартует без feedback.enabled.
+        recorded = False
+        if self._feedback_enabled:
+            try:
+                recorded = self._storage.record_feedback(
+                    target_id=target_id,
+                    verdict=verdict,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+            except Exception as e:
+                self._log.warning("record_feedback failed for target=%d: %s",
+                                 target_id, e)
 
         popup_text = "👍 Учту" if verdict == "like" else "👎 Понял, такое больше не присылать"
 
@@ -460,14 +466,56 @@ class TelegramPoller:
     # ── message commands ─────────────────────────────────────────────────────
 
     def _handle_message(self, msg: dict) -> None:
-        """Обрабатывает команды /digest, /start, /help от владельца."""
+        """Обрабатывает команды от владельца."""
         if not _Commands.is_owner_command(msg, self._chat_id):
             return
 
         cmd, *_ = _Commands.text(msg).split(maxsplit=1)
         chat_id = str(msg.get("chat", {}).get("id", ""))
 
-        if cmd == "/digest":
+        if cmd == "/stop":
+            self._log.info("Command /stop — pausing processing")
+            try:
+                if self._storage is not None:
+                    self._storage.set_meta("paused", "1")
+                self._client.sendMessage(
+                    chat_id,
+                    "⏸ Приостановлено: новые новости собираются, но не "
+                    "обрабатываются и не присылаются. /continue — возобновить."
+                )
+            except Exception as e:
+                self._log.warning("/stop failed: %s", type(e).__name__)
+
+        elif cmd == "/continue":
+            self._log.info("Command /continue — resuming processing")
+            try:
+                if self._storage is not None:
+                    self._storage.set_meta("paused", "0")
+                self._client.sendMessage(chat_id, "▶️ Возобновлено.")
+            except Exception as e:
+                self._log.warning("/continue failed: %s", type(e).__name__)
+
+        elif cmd == "/digest":
+            # ── проверка паузы: /digest не выполняется при паузе ──
+            is_paused = False
+            try:
+                if self._storage is not None:
+                    val = self._storage.get_meta("paused")
+                    is_paused = val == "1"
+            except Exception as e:
+                self._log.warning("_check_paused failed: %s", e)
+
+            if is_paused:
+                self._log.debug("/digest ignored — bot is paused")
+                try:
+                    self._client.sendMessage(
+                        chat_id,
+                        "⏸ Бот на паузе, /continue чтобы возобновить."
+                    )
+                except Exception:
+                    pass
+                return  # M1: НЕ дёргаем _on_digest
+
             self._log.info("Command /digest from owner — signaling main thread")
             try:
                 self._on_digest()  # M1: только сигнал, НЕ run_digest в poller thread
@@ -488,8 +536,10 @@ class TelegramPoller:
                 "📬 Новости приходят автоматически по расписанию.\n"
                 "👍👎 Голосуйте за новости — это улучшает подборку.\n\n"
                 "📋 <b>Команды:</b>\n"
-                "/digest — запустить дайджест отложенных новостей\n"
-                "/help  — эта справка"
+                "/stop     — приостановить обработку и доставку\n"
+                "/continue — возобновить после /stop\n"
+                "/digest   — запустить дайджест отложенных новостей\n"
+                "/help     — эта справка"
             )
             try:
                 self._client.sendMessage(chat_id, greeting)

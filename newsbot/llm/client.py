@@ -174,6 +174,7 @@ class DeepSeekClient:
         timeout: float = 60.0,
         max_retries: int = 3,
         temperature: float = 0.0,
+        max_tokens: int = 4096,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -181,6 +182,13 @@ class DeepSeekClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.temperature = temperature
+        # max_tokens: лимит на completion. Батч (≤10 items, ~100-200 токенов/item)
+        # требует больше, чем одиночная оценка (~150-300 токенов).
+        # Major #2-фикс: дефолт 4096 (ранее 2048).
+        # При batch_size=10: ≈400-600 токенов/item × 10 = 4000-6000 токенов ответ,
+        # модель обычно укладывается в 4000, запас до 4096 покрывает типичный
+        # батч 10 items + погрешность модели. Конфиг позволяет переопределить.
+        self.max_tokens = max_tokens
         # один HTTP-клиент на весь жизненный цикл — переиспользуем соединения
         self._http = httpx.Client(timeout=self.timeout, trust_env=True)  # подхватывает HTTP_PROXY / HTTPS_PROXY из окружения (Docker)
         self.usage_stats = UsageStats(model=model)
@@ -222,10 +230,16 @@ class DeepSeekClient:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
         }
 
         last_exc: Optional[Exception] = None
+        # Minor #3-фикс: ровно 1 retry на JSONDecodeError (не бесконечный цикл).
+        # Флаг _json_retry_done устанавливается при первом JSONDecodeError и
+        # блокирует второй retry; не сбрасывается между попытками — сброс
+        # после успешного ответа невозможен (return выходит из функции).
+        _json_retry_done = False
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -254,6 +268,22 @@ class DeepSeekClient:
                 content = message.get("content", "")
                 if not content:
                     raise LLMError("Пустой content в assistant message")
+
+                # Major #2-фикс: проверяем finish_reason на усечение.
+                # При length → JSON может быть обрезан → json.loads упадёт.
+                # Поднимаем LLMError, чтобы вызывающий получил fallback per-item
+                # (а не парсил битый JSON молча).
+                finish_reason: Any = first_choice.get("finish_reason")
+                if finish_reason == "length":
+                    logger.warning(
+                        "LLM ответ усечён (finish_reason=length, max_tokens=%d) — "
+                        "fallback для батча: шлём непрофильтрованными",
+                        self.max_tokens,
+                    )
+                    raise LLMError(
+                        f"LLM-ответ усечён (finish_reason=length, max_tokens={self.max_tokens}). "
+                        f"JSON может быть неполным — fallback (ok=False для всех items батча)."
+                    )
 
                 # ── usage-логирование (DEBUG, на каждый вызов) ──
                 self._log_usage_debug(data)
@@ -324,15 +354,21 @@ class DeepSeekClient:
 
             except json.JSONDecodeError as e:
                 last_exc = e
-                # T2-10-фикс: JSONDecodeError — бессмысленно ретраить (модель
-                # вернула битый JSON — в следующий раз та же модель даст тот же
-                # ответ). Ретраим только 1 раз.
-                if attempt < self.max_retries:
+                # Minor #3-фикс: ровно 1 retry на JSONDecodeError.
+                # Флаг _json_retry_done блокирует второй retry:
+                #   - первая ошибка + ещё есть попытки → backoff 1 сек + ретраим 1 раз
+                #   - уже был retry ИЛИ последняя попытка → break, отдаём last_exc
+                if not _json_retry_done and attempt < self.max_retries:
+                    _json_retry_done = True
                     logger.warning(
-                        "Попытка %d/%d: невалидный JSON в ответе (осталось %d) — повтор",
-                        attempt, self.max_retries, self.max_retries - attempt,
+                        "Попытка %d/%d: невалидный JSON в ответе — повтор (1 из 2)",
+                        attempt,
+                        self.max_retries,
                     )
-                break  # выходим из цикла, отдаём last_exc
+                    time.sleep(1)  # backoff перед retry (аналогично сетевым ошибкам)
+                    continue
+                # Второй JSONDecodeError или последняя попытка — выходим
+                break
 
             # ── LLMError и прочие ошибки — без ретрая, сразу наружу ──
             except LLMError:

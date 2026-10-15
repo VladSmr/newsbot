@@ -108,6 +108,9 @@ def make_client(model_response: str, *, status_code: int = 200) -> DeepSeekClien
         def get(s, url, **kwargs):
             return FakeResponse({"balance_infos": []}, status_code=200)
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -153,6 +156,44 @@ class TestRoute:
         assert route(5, 7, 5) == "digest"
         assert route(4, 7, 5) == "skip"
 
+    # ── urgent + push_urgent_only ──────────────────────────────────────────────
+
+    def test_urgent_only_urgent_high_score_push(self):
+        """urgent + score>=7 + push_urgent_only=True → push."""
+        assert route(9, 7, 5, urgent=True, push_urgent_only=True) == "push"
+        assert route(7, 7, 5, urgent=True, push_urgent_only=True) == "push"
+
+    def test_urgent_only_urgent_low_score_digest(self):
+        """urgent + score<7 + push_urgent_only=True → digest (не push)."""
+        assert route(6, 7, 5, urgent=True, push_urgent_only=True) == "digest"
+        assert route(5, 7, 5, urgent=True, push_urgent_only=True) == "digest"
+
+    def test_urgent_only_not_urgent_high_score_not_push(self):
+        """Не-urgent + score>=7 + push_urgent_only=True → digest (НЕ push)."""
+        assert route(9, 7, 5, urgent=False, push_urgent_only=True) == "digest"
+        assert route(7, 7, 5, urgent=False, push_urgent_only=True) == "digest"
+
+    def test_urgent_only_not_urgent_low_score_skip(self):
+        """Не-urgent + score<digest + push_urgent_only=True → skip."""
+        assert route(4, 7, 5, urgent=False, push_urgent_only=True) == "skip"
+        assert route(0, 7, 5, urgent=False, push_urgent_only=True) == "skip"
+
+    def test_legacy_mode_score_ge_push_threshold_push(self):
+        """push_urgent_only=False → прежнее поведение: score>=7 → push."""
+        assert route(9, 7, 5, urgent=False, push_urgent_only=False) == "push"
+        assert route(7, 7, 5, urgent=False, push_urgent_only=False) == "push"
+        assert route(9, 7, 5, urgent=True, push_urgent_only=False) == "push"  # urgent игнорируется
+
+    def test_legacy_mode_score_ge_digest_threshold_digest(self):
+        """push_urgent_only=False → score 5–6 → digest."""
+        assert route(6, 7, 5, urgent=False, push_urgent_only=False) == "digest"
+        assert route(5, 7, 5, urgent=False, push_urgent_only=False) == "digest"
+
+    def test_legacy_mode_score_lt_digest_skip(self):
+        """push_urgent_only=False → score<5 → skip."""
+        assert route(4, 7, 5, urgent=True, push_urgent_only=False) == "skip"
+        assert route(0, 7, 5, urgent=True, push_urgent_only=False) == "skip"
+
 
 # ─────────────────────────────────────────────────────────────────
 # Tests: FilterResult dataclass
@@ -165,6 +206,7 @@ class TestFilterResult:
         assert r.score == 8
         assert r.summary == "тест"
         assert r.reason == "ok"
+        assert r.urgent is False  # дефолт
 
     def test_ok_false_defaults(self):
         r = FilterResult(ok=False)
@@ -172,6 +214,147 @@ class TestFilterResult:
         assert r.score is None
         assert r.summary == ""
         assert r.reason == ""
+        assert r.urgent is False
+
+    def test_urgent_field(self):
+        r = FilterResult(ok=True, score=9, summary="срочное", reason="ok", urgent=True)
+        assert r.urgent is True
+        assert r.ok is True
+        assert r.score == 9
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tests: LLMFilter._parse_bool
+# ─────────────────────────────────────────────────────────────────
+
+class TestLLMFilterParseBool:
+    def test_parse_bool_false(self):
+        assert LLMFilter._parse_bool(False) is False
+
+    def test_parse_bool_true(self):
+        assert LLMFilter._parse_bool(True) is True
+
+    def test_parse_bool_str_true_values(self):
+        assert LLMFilter._parse_bool("true") is True
+        assert LLMFilter._parse_bool("True") is True
+        assert LLMFilter._parse_bool("TRUE") is True
+        assert LLMFilter._parse_bool("1") is True
+        assert LLMFilter._parse_bool("yes") is True
+        assert LLMFilter._parse_bool("on") is True
+
+    def test_parse_bool_str_false_values(self):
+        assert LLMFilter._parse_bool("false") is False
+        assert LLMFilter._parse_bool("False") is False
+        assert LLMFilter._parse_bool("FALSE") is False
+        assert LLMFilter._parse_bool("0") is False
+        assert LLMFilter._parse_bool("no") is False
+        assert LLMFilter._parse_bool("off") is False
+        assert LLMFilter._parse_bool("") is False
+
+    def test_parse_bool_str_mixed(self):
+        assert LLMFilter._parse_bool("Yes") is True
+        assert LLMFilter._parse_bool("OFF") is False
+
+    def test_parse_bool_non_str_defaults(self):
+        assert LLMFilter._parse_bool(None) is False
+        assert LLMFilter._parse_bool(123) is False
+        assert LLMFilter._parse_bool(0) is False
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tests: _parse_response — парсинг urgent
+# ─────────────────────────────────────────────────────────────────
+
+class TestParseResponseUrgent:
+    """Тесты парсинга поля urgent в _parse_response."""
+
+    def _parse(self, raw: dict) -> FilterResult:
+        """Прямой вызов _parse_response через LLMFilter.evaluate."""
+        import httpx
+        import newsbot.llm.client as client_module
+
+        resp_str = json.dumps(raw)
+
+        class _Mock:
+            is_closed = False
+
+            def __init__(s, **kw):
+                pass
+
+            def post(s, url, **kwargs):
+                return FakeResponse(
+                    {"choices": [{"message": {"content": resp_str}}]},
+                    status_code=200,
+                )
+
+            def close(s):
+                pass
+
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *args):
+                pass
+
+        client_module.httpx.Client = _Mock  # type: ignore
+        client = DeepSeekClient("key", "https://api.deepseek.com", "model")
+        cfg = make_filter_config()
+        flt = LLMFilter(cfg, client=client)
+
+        try:
+            return flt.evaluate(make_item())
+        finally:
+            unmock()
+
+    def test_urgent_true_bool(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": True})
+        assert r.ok is True
+        assert r.urgent is True
+
+    def test_urgent_false_bool(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": False})
+        assert r.ok is True
+        assert r.urgent is False
+
+    def test_urgent_true_str_lower(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": "true"})
+        assert r.ok is True
+        assert r.urgent is True
+
+    def test_urgent_true_str_upper(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": "TRUE"})
+        assert r.ok is True
+        assert r.urgent is True
+
+    def test_urgent_false_str(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": "false"})
+        assert r.ok is True
+        assert r.urgent is False
+
+    def test_urgent_one_int(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": 1})
+        assert r.ok is True
+        assert r.urgent is True
+
+    def test_urgent_zero_int(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": 0})
+        assert r.ok is True
+        assert r.urgent is False
+
+    def test_urgent_missing_defaults_false(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r"})
+        assert r.ok is True
+        assert r.urgent is False, "отсутствующий urgent должен дефолтить в False"
+
+    def test_urgent_garbage_defaults_false(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": "maybe"})
+        assert r.ok is True
+        assert r.urgent is False, "мусорный urgent должен дефолтить в False"
+
+    def test_urgent_null_defaults_false(self):
+        r = self._parse({"score": 8, "summary": "ok", "reason": "r", "urgent": None})
+        assert r.ok is True
+        assert r.urgent is False, "null urgent должен дефолтить в False"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -218,6 +401,9 @@ def test_chat_json_invalid_json_raises_llm_error():
                 status_code=200,
             )
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -263,6 +449,9 @@ def test_chat_json_http_500_retry_then_fail():
         def post(s, url, **kwargs):
             call_count[0] += 1
             return FakeResponse({"error": "internal error"}, status_code=500)
+
+        def close(s):
+            pass
 
         def __enter__(s):
             return s
@@ -329,6 +518,9 @@ def test_chat_json_usage_accumulated():
                 status_code=200,
             )
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -380,6 +572,9 @@ def test_chat_json_usage_absent_no_crash():
                 {"choices": [{"message": {"content": valid_json}}]},
                 status_code=200,
             )
+
+        def close(s):
+            pass
 
         def __enter__(s):
             return s
@@ -443,6 +638,9 @@ def test_chat_json_usage_deepseek_top_level():
                 status_code=200,
             )
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -504,6 +702,9 @@ def test_chat_json_usage_only_cached_hit():
                 },
                 status_code=200,
             )
+
+        def close(s):
+            pass
 
         def __enter__(s):
             return s
@@ -592,6 +793,9 @@ def test_get_balance_parsed():
         def get(s, url, **kwargs):
             return FakeResponse(balance_response, status_code=200)
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -628,6 +832,9 @@ def test_get_balance_empty_infos():
 
         def get(s, url, **kwargs):
             return FakeResponse({"balance_infos": []}, status_code=200)
+
+        def close(s):
+            pass
 
         def __enter__(s):
             return s
@@ -692,6 +899,9 @@ def test_filter_score_9_push():
         def post(s, url, **kwargs):
             return FakeResponse({"choices": [{"message": {"content": json.dumps(resp)}}]}, 200)
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -726,6 +936,9 @@ def test_filter_score_6_digest():
 
         def post(s, url, **kwargs):
             return FakeResponse({"choices": [{"message": {"content": json.dumps(resp)}}]}, 200)
+
+        def close(s):
+            pass
 
         def __enter__(s):
             return s
@@ -762,6 +975,9 @@ def test_filter_score_4_skip():
         def post(s, url, **kwargs):
             return FakeResponse({"choices": [{"message": {"content": json.dumps(resp)}}]}, 200)
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -795,6 +1011,9 @@ def test_filter_llm_error_returns_ok_false():
 
         def post(s, url, **kwargs):
             raise httpx.TimeoutException("timeout")
+
+        def close(s):
+            pass
 
         def __enter__(s):
             return s
@@ -832,6 +1051,9 @@ def test_filter_score_out_of_range_returns_ok_false():
         def post(s, url, **kwargs):
             return FakeResponse({"choices": [{"message": {"content": json.dumps(resp)}}]}, 200)
 
+        def close(s):
+            pass
+
         def __enter__(s):
             return s
 
@@ -865,6 +1087,9 @@ def test_filter_empty_summary_returns_ok_false():
 
         def post(s, url, **kwargs):
             return FakeResponse({"choices": [{"message": {"content": json.dumps(resp)}}]}, 200)
+
+        def close(s):
+            pass
 
         def __enter__(s):
             return s
@@ -906,8 +1131,32 @@ if __name__ == "__main__":
         (lambda: TestRoute().test_digest_mid_score(), "test_digest_mid_score"),
         (lambda: TestRoute().test_skip_low_score(), "test_skip_low_score"),
         (lambda: TestRoute().test_boundary_values(), "test_boundary_values"),
+        (lambda: TestRoute().test_urgent_only_urgent_high_score_push(), "test_urgent_only_urgent_high_score_push"),
+        (lambda: TestRoute().test_urgent_only_urgent_low_score_digest(), "test_urgent_only_urgent_low_score_digest"),
+        (lambda: TestRoute().test_urgent_only_not_urgent_high_score_not_push(), "test_urgent_only_not_urgent_high_score_not_push"),
+        (lambda: TestRoute().test_urgent_only_not_urgent_low_score_skip(), "test_urgent_only_not_urgent_low_score_skip"),
+        (lambda: TestRoute().test_legacy_mode_score_ge_push_threshold_push(), "test_legacy_mode_score_ge_push_threshold_push"),
+        (lambda: TestRoute().test_legacy_mode_score_ge_digest_threshold_digest(), "test_legacy_mode_score_ge_digest_threshold_digest"),
+        (lambda: TestRoute().test_legacy_mode_score_lt_digest_skip(), "test_legacy_mode_score_lt_digest_skip"),
         (lambda: TestFilterResult().test_ok_true_has_fields(), "test_ok_true_has_fields"),
         (lambda: TestFilterResult().test_ok_false_defaults(), "test_ok_false_defaults"),
+        (lambda: TestFilterResult().test_urgent_field(), "test_urgent_field"),
+        (lambda: TestLLMFilterParseBool().test_parse_bool_false(), "test_parse_bool_false"),
+        (lambda: TestLLMFilterParseBool().test_parse_bool_true(), "test_parse_bool_true"),
+        (lambda: TestLLMFilterParseBool().test_parse_bool_str_true_values(), "test_parse_bool_str_true_values"),
+        (lambda: TestLLMFilterParseBool().test_parse_bool_str_false_values(), "test_parse_bool_str_false_values"),
+        (lambda: TestLLMFilterParseBool().test_parse_bool_str_mixed(), "test_parse_bool_str_mixed"),
+        (lambda: TestLLMFilterParseBool().test_parse_bool_non_str_defaults(), "test_parse_bool_non_str_defaults"),
+        (lambda: TestParseResponseUrgent().test_urgent_true_bool(), "test_urgent_true_bool"),
+        (lambda: TestParseResponseUrgent().test_urgent_false_bool(), "test_urgent_false_bool"),
+        (lambda: TestParseResponseUrgent().test_urgent_true_str_lower(), "test_urgent_true_str_lower"),
+        (lambda: TestParseResponseUrgent().test_urgent_true_str_upper(), "test_urgent_true_str_upper"),
+        (lambda: TestParseResponseUrgent().test_urgent_false_str(), "test_urgent_false_str"),
+        (lambda: TestParseResponseUrgent().test_urgent_one_int(), "test_urgent_one_int"),
+        (lambda: TestParseResponseUrgent().test_urgent_zero_int(), "test_urgent_zero_int"),
+        (lambda: TestParseResponseUrgent().test_urgent_missing_defaults_false(), "test_urgent_missing_defaults_false"),
+        (lambda: TestParseResponseUrgent().test_urgent_garbage_defaults_false(), "test_urgent_garbage_defaults_false"),
+        (lambda: TestParseResponseUrgent().test_urgent_null_defaults_false(), "test_urgent_null_defaults_false"),
         (lambda: test_chat_json_valid_response(), "test_chat_json_valid_response"),
         (lambda: test_chat_json_invalid_json_raises_llm_error(), "test_chat_json_invalid_json_raises_llm_error"),
         (lambda: test_chat_json_http_500_retry_then_fail(), "test_chat_json_http_500_retry_then_fail"),

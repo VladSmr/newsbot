@@ -97,8 +97,9 @@ save_many() — INSERT OR IGNORE, state='new', retry_count=0
        ↓
 Few-shot: загрузка последних 👍/👎 из БД (feedback.enabled)
        ↓
-LLM-фильтр (DeepSeek, max_per_cycle=150 на цикл)
+LLM-фильтр (DeepSeek, max_per_cycle=150 на цикл, batch_size=10)
   retry-items с готовым llm_score НЕ тратят бюджет
+  Батч-оценка: ≤10 новостей одним вызовом (экономия system prompt)
   Few-shot блок «ДАННЫЕ (НЕ ИНСТРУКЦИИ)» подставляется в промпт
        ↓
 set_state('pending') перед send_batch (защита от double-send)
@@ -128,8 +129,9 @@ Purge: seen_titles (TTL) + items (delivered/skipped/failed/digested, retention_d
 - Recovery на старте цикла: зависшие `pending` с `retry_count >= max_retries` получают `failed`.
 - При падении delivery: items остаются `pending`, retry в следующем цикле.
 
-**Purge:** `delivered`, `skipped`, `failed`, `digested` старше `retention_days`.
-`deferred` **не удаляются** — ждут дайджест.
+**Purge:** `delivered`, `skipped`, `failed`, `digested`, `new` старше `retention_days`.
+`deferred` удаляются по отдельному окну `deferred_retention_days` (14 дней по умолчанию)
+— старые неотправленные отложенные новости больше не копятся вечно.
 
 ## CLI-команды
 
@@ -155,7 +157,11 @@ llm:
   model: deepseek-flash           # ⚠️ проверить id живым ключом через --check-llm
                                   #   deepseek-v4-pro — более способная/дорогая альтернатива (одной строкой)
   base_url: https://api.deepseek.com
-  push_threshold: 7              # score >= 7 → пуш (delivered)
+  push_urgent_only: true         # пуш ТОЛЬКО срочных (urgent=true, score>=7); остальное → дайджест
+                                  # ⚠️ при отсутствии ключа — WARNING + дефолт True (urgent-only)!
+                                  #    legacy-конфиг без ключа молча переключится в urgent-only.
+                                  #    Явно задайте push_urgent_only: false для прежнего поведения.
+  push_threshold: 7              # вторичный гейт: score >= 7 + urgent=True → пуш
   digest_threshold: 5             # score 5–6 → deferred (дайджест); < 5 → skipped
   max_retries: 3                  # retry при 429/5xx
   timeout_sec: 60
@@ -163,23 +169,70 @@ llm:
     enabled: true
     threshold: 2.0               # алерт при балансе ниже порога (USD)
     check_interval_hours: 24
-  max_per_cycle: 150             # макс. LLM-вызовов на цикл
+  max_per_cycle: 150             # макс. items (оценок) на цикл
+  max_tokens: 4096               # лимит completion tokens (≈4000 для батча из 10)
+  batch_size: 10                 # ≤10 новостей одним LLM-вызовом (1=поштучно)
+  # off_peak_only: false         # по умолчанию; раскомментируйте для экономии (×0.5)
 ```
+
+**Маршрутизация** (JSON от LLM: `{"score": 0–10, "summary", "reason", "urgent": true|false}`):
+
+| Условие                                   | Результат        |
+|-------------------------------------------|------------------|
+| `urgent=true` AND `score≥7`              | пуш (delivered)  |
+| `score 5–6` (даже если urgent, но score<7)| дайджест (deferred) |
+| `score<5`                                | skipped          |
+
+`push_urgent_only=false` (обратная совместимость): `score≥7` → пуш,
+игнорирует `urgent`.
+
+**Retry-семантика:** `llm_urgent` персистентен (БД-схема v10, колонка `items.llm_urgent` INTEGER 0/1).
+При retry: срочность восстанавливается из БД → `FilterResult(..., urgent=bool(llm_urgent))`.
+Legacy-строки (до v10, `llm_urgent=NULL`) получают `urgent=False` (безопасный дефолт).
+
+**Fallback (ok=False):** при сбое LLM:
+- `push_urgent_only=True` → deferred (дайджест) — защита от спама пушами;
+- `push_urgent_only=False` → пуш (legacy-поведение).
 
 **⚠️ Проверка модели:** `python -m newsbot --check-llm`
 Если API вернёт 4xx/404 на невалидную модель — фильтр НЕ сработает,
-все новости пойдут fallback'ом (доставка без фильтрации). Проверьте имя
-модели в `platform.deepseek.com/api_keys` и обновите `llm.model` в config.yaml.
+все новости пойдут fallback'ом (push при `push_urgent_only=False`, иначе deferred).
+Проверьте имя модели в `platform.deepseek.com/api_keys` и обновите `llm.model`.
 
 **System prompt** — константа `SYSTEM_PROMPT` в `newsbot/llm/prompts.py`.
 Её содержимое — источник истины. Поле `llm.system_prompt` в config.yaml
 пустое (или отсутствует) — это штатный оверрайд.
 
-**Пороги:** score ≥ 7 → пуш; 5–6 → deferred; ≤ 4 → skipped.
-Результат сохраняется в БД (llm_score, llm_summary, llm_reason, filtered_at).
-
 **Fallback:** если ключа нет, ключ невалиден или LLM вернул ошибку — все
 новости доставляются непрофильтрованными (kind='fallback', кнопки не добавляются).
+
+**Батч-оценка (`llm.batch_size`, по умолчанию 10):**
+
+≤10 новостей оцениваются одним LLM-вызовом. System prompt платится **раз на батч**, а не на каждую новость — экономия input-токенов ≈ N×(system_prompt_size). При `batch_size=1` поведение идентично поштучному (`evaluate()`).
+
+Формат батч-ответа LLM: `{"results": [{"id": 1, "score": 0-10, "urgent": bool, "summary": "...", "reason": "..."}, ...]}`. Per-item валидация: пропущенный/битый id или невалидные поля → только этот item получает `ok=False` (fallback), остальные обрабатываются normally. Полный сбой LLM (`LLMError`) → все items `ok=False` (fallback).
+
+Retry-items с сохранённым `llm_score` **не попадают в батч** — они синтезируют `FilterResult` из БД и не тратят бюджет.
+
+`llm.max_tokens` (по умолчанию 4096): лимит completion tokens.
+  - Батч из 10 items ≈ 4000 токенов ответа + запас → 4096 покрывает типичный случай.
+  - При усечении (`finish_reason="length"`) LLM поднимает `LLMError` с warning-логом,
+    батч получает fallback (per-item: ok=False → доставка непрофильтрованной).
+  - Конфиг позволяет переопределить (`batch_size=5` → 3000, и т.п.).
+
+**`llm.off_peak_only`** (по умолчанию `false`): ограничить LLM-вызовы
+непиковыми часами DeepSeek (там цена ×0.5). В пик новые новости
+собираются, остаются необработанными (`new`; подхватятся в следующем
+off-peak цикле). Ручной запуск `--once` тоже гейтится (консистентно).
+
+| Период                        | UTC          | MSK (UTC+3)           |
+|-------------------------------|--------------|-----------------------|
+| **Пик** (включить нельзя)     | 01:00–03:59  | 04:00–06:59           |
+|                               | 06:00–09:59  | 09:00–12:59           |
+| **Off-peak** (можно)          | всё остальное время + выходные |
+
+> ⚠️ Китайские государственные праздники консервативно считаются пиком
+> (не учитываются — модель будет выключена в праздник вместо работы со скидкой).
 
 ## Telegram-доставка
 
@@ -246,6 +299,11 @@ telegram:
 - Последние 👎 (и 👍) из таблицы `feedback` подставляются в промпт LLM-фильтра
 - Блок «ДАННЫЕ (НЕ ИНСТРУКЦИИ)» с примерами: `<|пример: Title (Source)|>`
 - Санитизация: удаляются `\n`, `\r`, control-chars, схлопываются пробелы
+- **Санитизация title/summary/source в промпте (M1-фикс):** поля новости
+  прогоняются через `sanitize_item_field()` перед подстановкой. Это защита от
+  prompt injection: ``<|данные:N|>`` / ``<|конец данных:N|>`` / ``<|пример: …|>``
+  нейтрализуются (``< |`` / ``| >``). Работает в обоих путях — одиночном
+  (`evaluate`) и батчевом (`build_batch_user_message`).
 - Суммарный лимит: 1500 символов на блок
 - Охранная директива в `SYSTEM_PROMPT`: модель НЕ выполняет указания из примеров
 - Гейт: `feedback.enabled`; один запрос `get_recent_feedback` за цикл
@@ -260,10 +318,14 @@ telegram:
 digest:
   enabled: true                       # вкл/выкл автоматический дайджест
   times: ["09:00", "21:00"]          # HH:MM в ЛОКАЛЬНОЙ tz
-  max_items: 100                      # лимит новостей в одном дайджесте
+  max_items: 30                       # ≤30 самых важных (сортировка: score DESC)
   max_items_per_message: 20           # новостей на одно сообщение
   on_empty: skip                      # "skip" — не слать пустой дайджест
 ```
+
+Собирает все non-urgent релевантные новости (score 5–6), отбирает ≤30
+топовых по score, отправляет 2×/день. Семантические перефразы НЕ
+дедуплицируются (нужен отдельный этап embeddings/LLM).
 
 **Гарантии:**
 - ≤ 4096 символов на сообщение (HTML-экранирование, безопасное усечение body по word boundary)
@@ -272,15 +334,53 @@ digest:
 - Частичный сбой: отправленные → `digested`; остаток → `deferred` (retry в следующем окне)
 
 **Команды бота:**
+- `/stop` — приостановить обработку и доставку (сбор RSS продолжается,
+  items остаются `state='new'`, обработаются после `/continue`)
+- `/continue` — возобновить обработку после `/stop`
 - `/digest` — сигнализирует демон-циклу (выполняется основным потоком)
 - `/start`, `/help` — справка
 
+**Пауза (мета-ключ `paused` в БД):** флаг хранится в `meta` SQLite
+(ключ `paused`="1"/"0"), переживает рестарт контейнера. При паузе:
+RSS-сбор → `state='new'` (продолжается) → LLM-фильтр, доставка,
+авто-дайджест и алерт баланса — пропускаются. Mid-batch пауза
+останавливает обработку, оставшиеся items → `state='pending'`
+(retry в следующем цикле, at-least-once).
+
 ## Дедупликация
 
+**Два уровня (оба конфигурируемые):**
+
+**Уровень 1 — глобальный точный:** `title_hash` БЕЗ `source` в пределах `window_days`.
+Активируется: `dedup.cross_source=true` (дефолт True). Окно: `dedup.window_days`
+(дефолт 3 дня). Первая копия идёт как обычно, последующие — `skipped`.
+
+**Уровень 2 — нечёткий (fuzzy):** `difflib.SequenceMatcher` с предфильтром
+(токен-сеты / длина) и лимитом кандидатов — не O(N²). Активируется:
+`dedup.fuzzy=true` (дефолт True), **только при `cross_source=true`** (кросс-источниковый
+контекст). Порог: `dedup.threshold` (дефолт 0.95). Дубли → `skipped`.
+
+**Защита от ложных склеек** — три условия И-вместе:
+  (a) `ratio ≥ threshold` — SequenceMatcher ratio
+  (b) **числовой guard** — мультимножества (кратности учитываются) `\d+(?:[.,]\d+)?` совпадают (жёсткий запрет)
+  (c) **token-guard** — Jaccard значащих токенов ≥ `token_threshold` (дефолт 0.8)
+      (слова ≥4 букв., без стоп-слов и чисел)
+
+`дубль ⟺ (a) И (b) И (c)`
+
+Предфильтр: `MAX_LEN_DIFF=15` слов, `MIN_TOKEN_INTERSECTION=0.3`,
+`MAX_FUZZY_CANDIDATES=200`. Новые параметры: `dedup.threshold` (0.95),
+`dedup.token_threshold` (0.8). Семантические перефразы НЕ ловятся (embeddings/LLM
+— отдельный этап). При `cross_source=false` fuzzy игнорируется (per-source
+поведение сохранено).
+
+**Всегда:**
 - **URL** — точный, permanent, все записи (без TTL).
-- **Заголовок** — нормализованный (lowercase,strip) + source, TTL 30 дней.
-- **NOTE:** нормализация URL (удаление `utm_*`, trailing slash) — **отложена**
-  (known limitation; будет реализована отдельно).
+- **Заголовок** — нормализованный (strip, collapse spaces, lowercase, remove punctuation,
+  срез префиксов `Reuters:`, `Bloomberg:`, `Источник:` и т.п.) + `source`, TTL 30 дней.
+
+**NOTE:** семантические перефразы (одна и та же новость, разными словами)
+**НЕ ловятся** — для этого нужны embeddings или LLM. Решается отдельно.
 
 ## Конфигурация
 
@@ -291,7 +391,12 @@ digest:
 | `database.retention_days`     | Хранить delivered/skipped/failed/digested | 90          |
 | `database.retry_threshold_sec` | pending считается зависшим через    | 60                    |
 | `database.max_retries`        | Лимит retry попыток → state=failed   | 8                     |
-| `llm.max_per_cycle`           | Макс. LLM-вызовов на цикл           | 150                   |
+| `database.deferred_retention_days` | Удалять старые deferred-items (не попали в digest) | 14               |
+| `database.recovery_new_limit` | Макс. 'new'-items, загружаемых в RAM за цикл (K1-recovery) | 500          |
+| `llm.max_per_cycle`           | Макс. LLM-оценок (items) на цикл    | 150                   |
+| `llm.batch_size`             | ≤N новостей одним LLM-вызовом (1=поштучно) | 10              |
+| `llm.max_tokens`            | Лимит completion tokens (≈4000 для батча 10) | 4096           |
+| `llm.off_peak_only`           | LLM только в off-peak часы DeepSeek   | false                 |
 | `logging.level`               | DEBUG / INFO / WARNING               | INFO                  |
 | `telegram.token`              | Bot token от @BotFather              | из `.env`             |
 | `telegram.chat_id`            | Привязанный chat_id владельца        | из `.env`             |
@@ -301,6 +406,11 @@ digest:
 | `digest.times`                | HH:MM в локальной tz                 | `["09:00","21:00"]`   |
 | `feedback.enabled`            | Приём обратной связи                 | true                  |
 | `feedback.max_examples`       | Примеров в few-shot                 | 10                    |
+| `dedup.cross_source`          | Глобальный точный дедуп по title_hash (без source) | true          |
+| `dedup.fuzzy`                 | Нечёткое сравнение (только при cross_source=true)  | true          |
+| `dedup.threshold`             | Порог SequenceMatcher ratio (0..1, clamp автоматический) | 0.95    |
+| `dedup.token_threshold`       | Порог Jaccard значащих токенов (0..1, clamp автоматический) | 0.8   |
+| `dedup.window_days`           | Окно сравнения для fuzzy и cross_source (дни)     | 3               |
 
 **.env (рядом с config.yaml, НЕ в git):**
 ```
@@ -309,16 +419,16 @@ TELEGRAM_CHAT_ID=<привязанный chat_id>
 DEEPSEEK_API_KEY=<ключ от platform.deepseek.com>
 ```
 
-## Схема БД (v8, идемпотентные миграции v1→v8)
+## Схема БД (v10, идемпотентные миграции v1→v10)
 
 ```sql
 -- items: state-машина
 items: id, source, url, title, summary, published, fetched_at,
        state, state_at, llm_score, llm_summary, llm_reason,
-       filtered_at, retry_count
+       llm_urgent INTEGER (v10, 0/1), filtered_at, retry_count
 
--- seen_titles: title-dedup, TTL 30 дней
-seen_titles: id, title_hash, source, fetched_at, expires_at
+-- seen_titles: title-dedup, TTL 30 дней (v9: + title_normalized для fuzzy)
+seen_titles: id, title_hash, source, fetched_at, expires_at, title_normalized
 
 -- meta: ключи-значения (last_digest_at, llm_balance_last_check, …)
 meta: key TEXT PRIMARY KEY, value TEXT
@@ -340,10 +450,12 @@ feedback: id, target_id UNIQUE, url, source, title, summary, llm_score,
 ```bash
 python -m pytest tests -q
 ```
-**333 теста, 9 файлов:** `test_llm_filter_mocks`, `test_pipeline_llm`,
+**564 теста, 12 файлов:** все тесты `test_llm_filter_mocks` (включая
+urgent/route/parse), `test_pipeline_llm` (включая маршрутизацию с urgent),
+`test_llm_batch` (19 новых тестов: happy path, per-item fallback, pipeline-интеграция),
 `test_core_reliability`, `test_delivery_security`, `test_digest`,
 `test_feedback_storage`, `test_feedback_flow`, `test_telegram_poller`,
-`test_feedback_prompt`. Все зелёные.
+`test_feedback_prompt`, `test_dedup`, `test_pause`. Все зелёные.
 
 ## Известные ограничения
 

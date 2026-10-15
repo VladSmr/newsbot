@@ -120,8 +120,13 @@ poll_interval_minutes: 15
 # --- База данных ---
 database:
   path: data/newsbot.db
-  retention_days: 90       # удалять delivered/skipped items старше N дней
+  retention_days: 90       # удалять delivered/skipped/failed/digested + 'new' items старше N дней
   retry_threshold_sec: 60 # pending считается зависшим через N секунд
+  deferred_retention_days: 14  # удалять старые deferred-items старше N дней (не попали в digest)
+                                  # 14 дней = окно между дайджестами × запас;
+                                  # критично для VPS с 1 GB RAM (deferred копились бесконечно)
+  recovery_new_limit: 500     # макс. 'new'-items, загружаемых в RAM при K1-recovery за один цикл
+                                  # (при долгой паузе 'new' накапливаются; лимит защищает RAM)
 
 # --- Логирование ---
 logging:
@@ -141,7 +146,8 @@ telegram:
 digest:
   enabled: true                       # вкл/выкл автоматический дайджест
   times: ["09:00", "21:00"]         # HH:MM в ЛОКАЛЬНОЙ tz; совпадает с format_time_utc
-  max_items: 100                     # лимит новостей в одном дайджесте (сортировка: score DESC, fetched_at ASC)
+  max_items: 30                      # лимит новостей в одном дайджесте (≤30 самых важных, сортировка: score DESC, fetched_at ASC).
+                                   # При 40 deferred-items в дайджест попадают только топ-30 (т.к. get_deferred_items LIMIT 30).
   max_items_per_message: 20         # новостей на одно Telegram-сообщение (не более 4096 символов)
   on_empty: skip                    # "skip" — не слать пустой дайджест; другое — на будущее
 
@@ -155,6 +161,26 @@ feedback:
   retention_days: 180             # удалять feedback_targets старше N дней
                                  # (сама таблица feedback не чистится —
                                  #  это обучающие данные для Фазы 2c)
+
+# --- Дедупликация: кросс-источниковая (v9) ---
+# Два уровня: (1) глобальный точный — title_hash без source в пределах window_days;
+# (2) нечёткий (fuzzy) — SequenceMatcher, threshold 0.95, предфильтр по токен-сету.
+# Fuzzy выполняется ТОЛЬКО при cross_source=true (кросс-источниковый контекст).
+#
+# Защита от ложных склеек (три условия И-вместе):
+#   (a) ratio ≥ threshold (SequenceMatcher)
+#   (b) числовые мультимножества совпадают (кратности учитываются) (\d+(?:[.,]\d+)?)
+#   (c) Jaccard значащих токенов ≥ token_threshold (≥4 буквы, без стоп-слов)
+# Дубль ⟺ (a) И (b) И (c)
+#
+# NOTE: семантические перефразы (одна новость разными словами) НЕ ловятся —
+# нужны embeddings или LLM (отдельный этап).
+dedup:
+  cross_source: true             # уровень 1: глобальный точный дедуп по title_hash (без source)
+  fuzzy: true                    # уровень 2: нечёткое сравнение (только при cross_source=true)
+  threshold: 0.95                # порог SequenceMatcher ratio (0..1)
+  token_threshold: 0.8           # порог Jaccard значащих токенов (0..1)
+  window_days: 3                # окно сравнения для fuzzy и cross_source (в днях)
 
 # --- LLM-фильтр ---
 llm:
@@ -170,13 +196,25 @@ llm:
   temperature: 0
   timeout_sec: 60
   max_retries: 3
-  push_threshold: 7               # score >= 7 → пуш
+  push_threshold: 7               # score >= 7 → пуш (только если urgent при push_urgent_only=true)
   digest_threshold: 5             # 5..6 → дайджест; < 5 → skipped
+  push_urgent_only: true           # пуш ТОЛЬКО срочные (urgent=true, score>=7); остальное → дайджест
+                                   # ВАЖНО: при отсутствии ключа в конфиге — warning + дефолт True (urgent-only).
+                                   # Legacy-поведение (все push) → явно задайте push_urgent_only: false.
   balance:
     enabled: true
     threshold: 2.0
     check_interval_hours: 24
-  max_per_cycle: 150
+  max_per_cycle: 150            # макс. LLM-оценок (items) на цикл (Major #1-фикс: теперь в items, не в вызовах)
+  max_tokens: 4096             # лимит completion tokens (Major #2-фикс: батч 10 items ≈ 4000 токенов + запас)
+  batch_size: 10              # оценка ≤10 новостей одним LLM-вызовом (1=поштучно)
+  # off_peak_only: ограничить LLM-вызовы непиковыми часами DeepSeek (×0.5).
+  #   По умолчанию false (текущее поведение — без ограничений).
+  #   Пиковые часы UTC (Пн–Пт): 01:00–03:59 и 06:00–09:59.
+  #   MSK (UTC+3): 04:00–06:59 и 09:00–12:59, Пн–Пт.
+  #   В пик новые новости остаются pending, доставляются в off-peak.
+  #   Китайские гос. праздники НЕ учитываются (консервативно = пик).
+  # off_peak_only: false
   # B12: system_prompt очищен. Источник истины — newsbot/llm/prompts.py.
   # Раскомментируйте и заполните только для override; иначе используется код.
   # system_prompt: ""

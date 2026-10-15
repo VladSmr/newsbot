@@ -37,9 +37,24 @@ from .digest import run_digest as _run_digest, build_digest_messages
 from .llm import LLMFilter
 from .llm.filter import FilterResult, route
 from .llm.client import BalanceInfo, LLMError, UsageStats
+from .offpeak import is_llm_allowed_now
 from .storage import Storage
 
 logger = logging.getLogger("newsbot.pipeline")
+
+
+def _parse_bool(value) -> bool:
+    """
+    Явный парсер bool-значений из конфига.
+    - bool: как есть
+    - str: "true","1","yes","on" (case-insensitive) → True; всё остальное → False
+    - прочее: False
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
 
 
 class NewsPipeline:
@@ -48,16 +63,21 @@ class NewsPipeline:
         self.sources = config.get("sources", []) or []
 
         db_path = self._resolve_db_path(config)
-        self.storage = Storage(db_path)
+        dedup_cfg = config.get("dedup", {})
+        self.storage = Storage(db_path, dedup_config=dedup_cfg)
 
         self.delivery: Delivery = self._build_delivery(config)
 
         # LLM-фильтр: только если включён И есть api_key
         self.llm_filter: Optional[LLMFilter] = self._build_llm_filter(config)
 
-        # лимит LLM-вызовов на цикл
+        # лимит items (оценок) на цикл
         self._max_per_cycle = int(config.get("llm", {}).get("max_per_cycle", 150))
         self._llm_calls_left: int = self._max_per_cycle  # общий бюджет на цикл
+        # off-peak гейт: ограничить LLM вызовами в непиковые часы DeepSeek
+        # явный парсер: bool("false")==True, поэтому проверяем строковые значения
+        off_peak_raw = config.get("llm", {}).get("off_peak_only", False)
+        self._off_peak_only = _parse_bool(off_peak_raw)
         # лимит retry-попыток
         self._max_retries = int(
             config.get("database", {}).get("max_retries", Storage.DEFAULT_MAX_RETRIES)
@@ -86,6 +106,34 @@ class NewsPipeline:
         return self.config.get("database", {}).get(
             "retry_threshold_sec",
             Storage.DEFAULT_RETRY_THRESHOLD_SECONDS,
+        )
+
+    def _is_paused(self) -> bool:
+        """Проверяет флаг паузы в meta (ключ 'paused')."""
+        try:
+            val = self.storage.get_meta("paused")
+            return val == "1"
+        except Exception as e:
+            logger.warning("_is_paused: %s", e)
+            return False
+
+    def _cleanup(self) -> None:
+        """
+        Очистка: purge_seen_titles + purge_items по retention из конфига.
+        Вызывается во всех трёх ветках конвейера (top-of-cycle pause,
+        off-peak, normal) — единая точка (DRY).
+        """
+        self.storage.purge_seen_titles()
+        retention = self.config.get("database", {}).get("retention_days", 90)
+        feedback_ret = self.config.get("feedback", {}).get("retention_days", 180)
+        deferred_ret = self.config.get("database", {}).get(
+            "deferred_retention_days",
+            self.storage.DEFAULT_DEFERRED_RETENTION_DAYS,
+        )
+        self.storage.purge_items(
+            retention_days=retention,
+            feedback_retention_days=feedback_ret,
+            deferred_retention_days=deferred_ret,
         )
 
     def _load_feedback_context(self) -> None:
@@ -162,8 +210,9 @@ class NewsPipeline:
 
         try:
             flt = LLMFilter(llm_cfg)
-            logger.info("LLM-фильтр инициализирован (%s / %s)",
-                         flt.model, flt.push_threshold)
+            mode = "urgent-only" if flt.push_urgent_only else "legacy"
+            logger.info("LLM-фильтр инициализирован (%s / th=%d / mode=%s)",
+                         flt.model, flt.push_threshold, mode)
             return flt
         except Exception as e:
             logger.error("Не удалось инициализировать LLM-фильтр: %s", e)
@@ -199,11 +248,25 @@ class NewsPipeline:
         collector = FeedCollector(self.sources)
 
         # ── K1: подхватываем 'new'-items из прошлого цикла (recovery) ──
+        # 2b-фикс: лимит на чтение, чтобы не грузить неограниченный объём в RAM
+        # при долгой паузе. Остаток подхватится в следующих циклах (at-least-once).
         recovered: List[NewsItem] = []
         try:
-            recovered = self.storage.get_all_by_state("new")
+            recovery_limit = int(
+                self.config.get("database", {}).get("recovery_new_limit", 500)
+            )
+            recovered = self.storage.get_all_by_state("new", limit=recovery_limit)
             if recovered:
-                logger.info("K1-recovery: подхвачено %d items со state='new'", len(recovered))
+                total_new_count = self.storage.count_by_state("new")
+                logger.info(
+                    "K1-recovery: подхвачено %d/%d items со state='new' (лимит=%d)",
+                    len(recovered), total_new_count, recovery_limit,
+                )
+                if total_new_count > recovery_limit:
+                    logger.info(
+                        "K1: остаток %d items со state='new' ждёт следующего цикла",
+                        total_new_count - recovery_limit,
+                    )
         except Exception as e:
             logger.warning("K1-recovery: ошибка чтения 'new'-items: %s", e)
 
@@ -225,7 +288,8 @@ class NewsPipeline:
                 items = result.items
                 total_collected += len(items)
 
-                new_items, _, dup_count = filter_new(items, self.storage)
+                dedup_cfg = self.config.get("dedup", {})
+                new_items, _, dup_count = filter_new(items, self.storage, dedup_config=dedup_cfg)
                 total_dups += dup_count
 
                 # save_many — батчевая вставка (В5); N1 возвращает реально вставленные NewsItem
@@ -266,6 +330,46 @@ class NewsPipeline:
         threshold = self._retry_threshold()
         self.storage.recover_stuck_pending(self._max_retries, retry_threshold_sec=threshold)
 
+        # ── off-peak гейт: проверяем ДО любого вызова LLM ──
+        # Paused-гейт ВЫШЕ off-peak: пауза приоритетнее off-peak.
+        # При паузе: сбор/дедуп/сохранение уже выполнены (items в state='new'),
+        # останавливаемся до LLM/доставки/дайджеста/алертов.
+        if self._is_paused():
+            total_new_items_count = self.storage.count_by_state("new")
+            pending_items = self.storage.get_stuck_pending(
+                max_age_seconds=threshold,
+                max_retries=self._max_retries,
+            )
+            total_waiting = total_new_items_count + len(pending_items)
+            logger.info(
+                "PAUSED gate: обработка пропущена, %d items ждут возобновления "
+                "(new=%d, pending=%d)",
+                total_waiting, total_new_items_count, len(pending_items),
+            )
+            # очистка ВЫПОЛНЯЕТСЯ (purge не зависит от LLM/доставки)
+            self._cleanup()
+            return  # ← выходим: без LLM, доставки, дайджеста, алертов
+
+        if self._off_peak_only and not is_llm_allowed_now(self._off_peak_only):
+            # вычисляем реальное число ожидающих items до return
+            stuck_items = self.storage.get_stuck_pending(
+                max_age_seconds=threshold,
+                max_retries=self._max_retries,
+            )
+            total_waiting = len(all_items) + len(stuck_items)
+            logger.info(
+                "off-peak gate: сейчас пик DeepSeek — LLM-обработка пропущена, "
+                "%d items ждут off-peak",
+                total_waiting,
+            )
+            # items остаются в state='new'/'pending', будут обработаны в off-peak
+            # Major #1: перепроверяем паузу — она могла наступить ПОСЛЕ off-peak-гейта
+            # баланс-чек вызывается и в пик — он не тратит LLM-токены (отдельный API)
+            # Major #1: единая точка входа для обоих вызовов — не дублируем проверку
+            self._run_delivery_side_effects()
+            self._cleanup()
+            return  # ← выходим из цикла; LLM не вызывается
+
         # ── B13: retry-очередь обрабатывается ПЕРЕД кандидатами ──
         # резервируем не менее половины бюджета под retry при наличии таковых
         stuck = self.storage.get_stuck_pending(
@@ -300,23 +404,26 @@ class NewsPipeline:
                 len(all_items), remaining_budget, self._max_per_cycle,
             )
             # N1: candidates теперь реально вставленные items
-            self._process_batch(all_items, budget_override=remaining_budget)
+            # 2c-фикс: remainder кандидатов (не доставлены по сбой TG API)
+            # инкрементируют retry_count и терминализируются при исчерпании лимита.
+            # Это распространяет at-least-once на candidates, а не только на retry-очередь.
+            failed_candidate_urls = self._process_batch(
+                all_items, budget_override=remaining_budget
+            )
+            if failed_candidate_urls:
+                self.storage.increment_retry_count(failed_candidate_urls)
+                self._check_and_mark_failed(failed_candidate_urls)
 
         # ── единое логирование LLM-usage за весь цикл (после обоих батчей) ──
         self._log_llm_usage()
 
-        # ── проверка баланса LLM (раз в check_interval_hours) ──
-        self._maybe_check_balance()
-
-        # ── проверка расписания дайджеста (демон-режим) ──
-        self._maybe_run_digest()
+        # Major #1: единая точка — перепроверяем паузу после батчей.
+        # При паузе пропускаем дайджест и баланс-алерт, но purge выполняется
+        # в вызывающем коде (выше).
+        self._run_delivery_side_effects()
 
         # ── очистка ──
-        self.storage.purge_seen_titles()
-        retention = self.config.get("database", {}).get("retention_days", 90)
-        # F1: feedback_targets прунятся отдельно (feedback — обучающие данные, не чистим)
-        feedback_ret = self.config.get("feedback", {}).get("retention_days", 180)
-        self.storage.purge_items(retention_days=retention, feedback_retention_days=feedback_ret)
+        self._cleanup()
 
     def _process_batch(
         self,
@@ -336,6 +443,14 @@ class NewsPipeline:
             items: список NewsItem для обработки
             budget_override: если указано — использовать этот бюджет вместо
                              остатка общего счётчика (для retry с резервацией).
+
+        Бюджет (max_per_cycle):
+            — Единица учёта: **items** (НЕ LLM-вызовы).
+            — Списание: len(fresh_batch) на каждый вызов evaluate_batch
+              (retry-items с llm_score бюджет не тратят).
+            — При max_per_cycle=150, batch_size=10 → до 150 items за цикл.
+            — При budget<=0: все items остаются pending, LLM не вызывается.
+            — При budget<0: клампится в 0 (items[:0] = []).
 
         При ошибке доставки: items остаются 'pending', retry в следующем цикле.
         Если фильтр неактивен (нет api_key) или LLM вернул ok=False →
@@ -360,9 +475,12 @@ class NewsPipeline:
         if self.llm_filter is not None:
             push_th = self.llm_filter.push_threshold
             digest_th = self.llm_filter.digest_threshold
+            push_urgent_only = self.llm_filter.push_urgent_only
 
-            # лимит LLM-вызовов: бюджет передан явно (retry) или остаток общего счётчика
+            # лимит items: бюджет передан явно (retry) или остаток общего счётчика
             budget = budget_override if budget_override is not None else self._llm_calls_left
+            # Minor #4-фикс: при budget<0 → клампим в 0 (items[:<0] даёт непустой префикс)
+            budget = max(0, budget)
             items_to_llm = items
             if budget <= 0:
                 # бюджет исчерпан — все items остаются pending.
@@ -382,73 +500,62 @@ class NewsPipeline:
                 )
                 items_to_llm = items[:budget]
 
+            # batch_size из конфига; 1 = поштучный режим (всегда evaluate)
+            batch_size = max(1, int(self.config.get("llm", {}).get("batch_size", 10)))
+
             llm_call_count = 0
-            for item in items_to_llm:
-                # retry: если llm_score уже есть — не переоцениваем (не тратит бюджет)
-                if item.llm_score is not None:
-                    logger.debug("retry: llm_score=%d уже сохранён для %s",
-                                 item.llm_score, item.url[:60])
+
+            # быстрая реакция на паузу: проверяем перед каждым батчем.
+            # При паузе прекращаем → оставшиеся items остаются pending (retry в след.цикле).
+            for batch_start in range(0, len(items_to_llm), batch_size):
+                if self._is_paused():
+                    remaining = len(items_to_llm) - batch_start
+                    logger.info(
+                        "PAUSED mid-batch: остановлены %d unprocessed items → pending",
+                        remaining,
+                    )
+                    break
+
+                batch = items_to_llm[batch_start: batch_start + batch_size]
+
+                # разделяем retry-items (llm_score есть) и fresh-items (нужна оценка)
+                retry_batch = [item for item in batch if item.llm_score is not None]
+                fresh_batch = [item for item in batch if item.llm_score is None]
+
+                # ── retry: synthesize FilterResult from DB (не тратят бюджет) ──
+                for item in retry_batch:
                     res = FilterResult(
                         ok=True,
                         score=item.llm_score,
                         summary=item.llm_summary or item.summary,
                         reason=item.llm_reason or "",
+                        urgent=bool(item.llm_urgent) if item.llm_urgent is not None else False,
                     )
-                else:
-                    # 2.1: try/except Exception — не роняем батч
-                    try:
-                        res = self.llm_filter.evaluate(
-                            item, feedback_context=self._feedback_context,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Неожиданное исключение при оценке '%s': %s — "
-                            "fallback: шлём непрофильтрованным",
-                            item.title[:60], e,
-                        )
-                        res = FilterResult(ok=False)
-                    # сохраняем результат в item (всегда, даже ok=False)
-                    item.llm_score = res.score
-                    item.llm_summary = res.summary
-                    item.llm_reason = res.reason
-                    self._llm_calls_left -= 1
+                    self._apply_result(item, res, push_th, digest_th,
+                                       push_urgent_only, skipped_urls, deferred_urls,
+                                       to_deliver, llm_batch_records)
+
+                # ── fresh: батч-оценка через LLM ──
+                if fresh_batch:
+                    # batch_size=1 → evaluate_batch ведёт себя как evaluate
+                    batch_results = self.llm_filter.evaluate_batch(
+                        fresh_batch, feedback_context=self._feedback_context,
+                    )
+                    # Major #1-фикс: бюджет считается в items (не в вызовах).
+                    # При max_per_cycle=150 и batch_size=10 → до 150 items/цикл.
+                    # Списание = len(fresh_batch) — retry-items с llm_score
+                    # бюджет не тратят (они уже синтезированы выше).
+                    self._llm_calls_left -= len(fresh_batch)
                     llm_call_count += 1
 
-                if not res.ok:
-                    # F3: fallback → kind='fallback' (не профильтрован LLM,
-                    # не путается с обычным push в few-shot выборке (2c)).
-                    to_deliver.append(item)
-                    item._feedback_kind = "fallback"  # type: ignore[attr-defined]
-                    continue
-
-                r = route(res.score, push_th, digest_th)
-                if r == "skip":
-                    skipped_urls.append(item.url)
-                    # 2.2: сохраняем llm-результат и для skipped (единообразие данных)
-                    llm_batch_records.append({
-                        "url": item.url,
-                        "score": res.score,
-                        "summary": res.summary,
-                        "reason": res.reason,
-                    })
-                elif r == "digest":
-                    deferred_urls.append(item.url)
-                    llm_batch_records.append({
-                        "url": item.url,
-                        "score": res.score,
-                        "summary": res.summary,
-                        "reason": res.reason,
-                    })
-                else:
-                    # r == "push"
-                    to_deliver.append(item)
-                    item._feedback_kind = "push"  # type: ignore[attr-defined]
-                    llm_batch_records.append({
-                        "url": item.url,
-                        "score": res.score,
-                        "summary": res.summary,
-                        "reason": res.reason,
-                    })
+                    for item, res in zip(fresh_batch, batch_results):
+                        # сохраняем результат в item (всегда, даже ok=False)
+                        item.llm_score = res.score
+                        item.llm_summary = res.summary
+                        item.llm_reason = res.reason
+                        self._apply_result(item, res, push_th, digest_th,
+                                           push_urgent_only, skipped_urls, deferred_urls,
+                                           to_deliver, llm_batch_records)
 
             logger.debug("LLM-вызовов за батч: %d", llm_call_count)
 
@@ -456,19 +563,22 @@ class NewsPipeline:
             if llm_batch_records:
                 self.storage.update_llm_results_batch(llm_batch_records)
 
+            # ── фиксируем state и логируем итоговые счётчики (одна INFO-строка) ──
+            n_skipped = len(skipped_urls)
+            n_deferred = len(deferred_urls)
+            n_push = len(to_deliver)
+
             if skipped_urls:
                 self.storage.set_state(skipped_urls, "skipped")
-                logger.info(
-                    "LLM пропустил %d items (skipped, score<%d)",
-                    len(skipped_urls), digest_th,
-                )
-
             if deferred_urls:
                 self.storage.set_state(deferred_urls, "deferred")
-                logger.info(
-                    "LLM отложил %d items (deferred, score %d–%d)",
-                    len(deferred_urls), digest_th, push_th - 1,
-                )
+
+            mode_tag = " [urgent-only]" if push_urgent_only else ""
+            logger.info(
+                "Маршрутизация%s: push=%d deferred=%d skipped=%d",
+                mode_tag, n_push, n_deferred, n_skipped,
+            )
+
             # M1: если все отфильтрованы (to_deliver пуст) — НЕ возвращаем
             #     filtered items как failed_urls; сначала фиксируем их state.
             #     Защита: items остаются pending навсегда без этого.
@@ -487,6 +597,15 @@ class NewsPipeline:
             return []
 
         # ── доставка ──
+        # NIT: Major #1-фикс — pause-гейт ВЫШЕ создания feedback_targets.
+        # При паузе не создаём targets для недоставленных items.
+        if self._is_paused():
+            logger.info(
+                "PAUSED перед доставкой: %d items → pending (retry в след.цикле)",
+                len(to_deliver),
+            )
+            return []
+
         # F2: создаём feedback_targets ТОЛЬКО при TelegramDelivery (не Console).
         # F1: get_or_create — идемпотентно (retry не создаёт дублей).
         # F3: kind из item._feedback_kind ('push' или 'fallback').
@@ -553,6 +672,72 @@ class NewsPipeline:
         failed_urls = set(not_delivered)
 
         return list(failed_urls)
+
+    def _apply_result(
+        self,
+        item: "NewsItem",
+        res: FilterResult,
+        push_th: int,
+        digest_th: int,
+        push_urgent_only: bool,
+        skipped_urls: List[str],
+        deferred_urls: List[str],
+        to_deliver: List["NewsItem"],
+        llm_batch_records: List[dict],
+    ) -> None:
+        """
+        Применяет FilterResult к одному item: маршрутизация + сбор record.
+        Вызывается из _process_batch после evaluate / synthesize (retry).
+        """
+        if not res.ok:
+            # M2-фикс: fallback при push_urgent_only=True → deferred (дайджест).
+            # Это защищает от спама пушами: сбой LLM не означает срочность.
+            # При push_urgent_only=False — прежнее поведение (push).
+            if push_urgent_only:
+                deferred_urls.append(item.url)
+                llm_batch_records.append({
+                    "url": item.url,
+                    "score": None,
+                    "summary": "",
+                    "reason": "",
+                    "urgent": False,
+                })
+            else:
+                to_deliver.append(item)
+                item._feedback_kind = "fallback"  # type: ignore[attr-defined]
+            return
+
+        r = route(res.score, push_th, digest_th,
+                  urgent=res.urgent, push_urgent_only=push_urgent_only)
+        if r == "skip":
+            skipped_urls.append(item.url)
+            llm_batch_records.append({
+                "url": item.url,
+                "score": res.score,
+                "summary": res.summary,
+                "reason": res.reason,
+                "urgent": res.urgent,
+            })
+        elif r == "digest":
+            deferred_urls.append(item.url)
+            llm_batch_records.append({
+                "url": item.url,
+                "score": res.score,
+                "summary": res.summary,
+                "reason": res.reason,
+                "urgent": res.urgent,
+            })
+        else:
+            # r == "push"
+            to_deliver.append(item)
+            item._feedback_kind = "push"  # type: ignore[attr-defined]
+            llm_batch_records.append({
+                "url": item.url,
+                "score": res.score,
+                "summary": res.summary,
+                "reason": res.reason,
+                "urgent": res.urgent,
+            })
 
     def _check_and_mark_failed(self, failed_retry_urls: List[str]) -> None:
         """
@@ -796,6 +981,28 @@ class NewsPipeline:
             except Exception as e:
                 logger.error("Дайджест: исключение: %s", e, exc_info=True)
             break  # Одно окно за цикл — достаточно
+
+    def _run_delivery_side_effects(self) -> None:
+        """
+        Major #1: единая точка проверки паузы для дайджеста и баланс-алерта.
+        Вызывается ПОСЛЕ основных батчей (и в normal path, и в off-peak path).
+        При паузе пропускает оба вызова, логирует; purge по-прежнему выполняется
+        в вызывающем коде. Каждый эффект обёрнут в отдельный try/except:
+        падение одного не блокирует другой.
+        """
+        if self._is_paused():
+            logger.info(
+                "PAUSED: дайджест и баланс-алерт пропущены (выполняется очистка)"
+            )
+            return
+        try:
+            self._maybe_check_balance()
+        except Exception as e:
+            logger.warning("_maybe_check_balance ошибка: %s", e)
+        try:
+            self._maybe_run_digest()
+        except Exception as e:
+            logger.warning("_maybe_run_digest ошибка: %s", e)
 
     def _maybe_check_balance(self) -> None:
         """

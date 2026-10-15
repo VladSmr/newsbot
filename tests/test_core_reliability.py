@@ -421,6 +421,29 @@ class TestBrokenFeedResilience(unittest.TestCase):
 # =============================================================================
 
 class TestNewItemsRecovery(unittest.TestCase):
+    def test_count_by_state_returns_correct_count(self):
+        """K1: count_by_state возвращает точное количество items без загрузки в RAM."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            st.save(_mk_item(title="N1", url="https://cnt.com/1"))
+            st.save(_mk_item(title="N2", url="https://cnt.com/2"))
+            st.save(_mk_item(title="N3", url="https://cnt.com/3"))
+            st.save(_mk_item(title="Pending", url="https://cnt.com/4"))
+            conn = st._connect()
+            conn.execute(
+                "UPDATE items SET state='pending' WHERE url=?",
+                ("https://cnt.com/4",)
+            )
+            conn.commit()
+
+            self.assertEqual(st.count_by_state("new"), 3)
+            self.assertEqual(st.count_by_state("pending"), 1)
+            self.assertEqual(st.count_by_state("delivered"), 0)
+            st.close()
+        finally:
+            _cleanup_db(path)
+
     def test_get_all_by_state_new(self):
         path = _tmp_db()
         try:
@@ -446,15 +469,15 @@ class TestNewItemsRecovery(unittest.TestCase):
 
 
 # =============================================================================
-# K5: deferred не purge'ится
+# K5: deferred не purge'ится основным retention, но purge'ится по deferred_retention_days
 # =============================================================================
 
-class TestDeferredNotPurged(unittest.TestCase):
-    def test_deferred_not_deleted_by_purge(self):
+class TestDeferredPurge(unittest.TestCase):
+    def test_deferred_not_deleted_by_main_retention(self):
+        """deferred не удаляется по retention_days (он использует deferred_retention_days)."""
         path = _tmp_db()
         try:
             st = Storage(Path(path))
-            # Вставляем deferred item
             item = _mk_item(title="Deferred", url="https://def.example/1")
             st.save(item)
             conn = st._connect()
@@ -464,13 +487,124 @@ class TestDeferredNotPurged(unittest.TestCase):
             )
             conn.commit()
 
-            deleted = st.purge_items(retention_days=0)  # retention=0 → всё старое
-            self.assertEqual(deleted, 0, "deferred не должен удаляться purge")
+            # retention=0, но deferred_retention_days=14 (default) — deferred остаётся
+            deleted = st.purge_items(retention_days=0, deferred_retention_days=14)
+            self.assertEqual(deleted, 0, "deferred не должен удаляться при deferred_retention_days>0")
 
             count = conn.execute(
                 "SELECT COUNT(*) FROM items WHERE state='deferred'"
             ).fetchone()[0]
             self.assertEqual(count, 1)
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_old_deferred_deleted_by_deferred_retention(self):
+        """Старый deferred (старше deferred_retention_days) удаляется."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            item = _mk_item(title="OldDeferred", url="https://olddef.example/1")
+            st.save(item)
+            conn = st._connect()
+            # state_at = 20 дней назад → старше deferred_retention_days=14
+            from datetime import timedelta
+            old_at = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+            conn.execute(
+                "UPDATE items SET state='deferred', state_at=? WHERE url=?",
+                (old_at, "https://olddef.example/1")
+            )
+            conn.commit()
+
+            # deferred_retention_days=14, item 20 дней → удаляется
+            deleted = st.purge_items(retention_days=90, deferred_retention_days=14)
+            self.assertGreaterEqual(deleted, 1, "Старый deferred должен быть удалён")
+
+            count = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE state='deferred'"
+            ).fetchone()[0]
+            self.assertEqual(count, 0, "Старый deferred должен быть удалён из БД")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_fresh_deferred_kept_by_deferred_retention(self):
+        """Свежий deferred (младше deferred_retention_days) остаётся."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            item = _mk_item(title="FreshDeferred", url="https://freshdef.example/1")
+            st.save(item)
+            conn = st._connect()
+            # state_at = сейчас, UPDATE по РЕАЛЬНОМУ URL сохранённого item
+            conn.execute(
+                "UPDATE items SET state='deferred', state_at=? WHERE url=?",
+                (datetime.now(timezone.utc).isoformat(), "https://freshdef.example/1")
+            )
+            conn.commit()
+
+            deleted = st.purge_items(retention_days=90, deferred_retention_days=14)
+            # Свежий deferred не удалён (ему 0 дней < 14)
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE state='deferred'"
+            ).fetchone()[0]
+            self.assertEqual(remaining, 1, "Свежий deferred должен остаться в БД")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+
+# =============================================================================
+# 2b-фикс: purge удаляет старые 'new'-items
+# =============================================================================
+
+class TestNewPurge(unittest.TestCase):
+    def test_old_new_purged(self):
+        """Старые 'new'-items (старше retention_days) удаляются purge."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            item = _mk_item(title="OldNew", url="https://oldnew.example/1")
+            st.save(item)  # state='new', state_at=сейчас
+            conn = st._connect()
+            from datetime import timedelta
+            # state_at = 100 дней назад → старше retention_days=90
+            old_at = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
+            conn.execute(
+                "UPDATE items SET state='new', state_at=? WHERE url=?",
+                (old_at, "https://oldnew.example/1")
+            )
+            conn.commit()
+
+            deleted = st.purge_items(retention_days=90, deferred_retention_days=14)
+            self.assertGreaterEqual(deleted, 1, "Старый new item должен быть удалён")
+
+            count = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE state='new'"
+            ).fetchone()[0]
+            self.assertEqual(count, 0, "Старый new должен быть удалён")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_get_all_by_state_respects_limit(self):
+        """K1: get_all_by_state('new') возвращает не более limit items."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            # 50 new items
+            for i in range(50):
+                item = _mk_item(title=f"New{i}", url=f"https://new{i}.com/1")
+                st.save(item)
+
+            # Читаем лимит 10
+            items = st.get_all_by_state("new", limit=10)
+            self.assertEqual(len(items), 10, "Должно вернуться ровно 10 items при limit=10")
+
+            # Без лимита — все 50
+            items_all = st.get_all_by_state("new")
+            self.assertEqual(len(items_all), 50, "Без лимита возвращаются все 50 items")
+
             st.close()
         finally:
             _cleanup_db(path)
@@ -637,14 +771,14 @@ class TestPubdateParsing(unittest.TestCase):
 # =============================================================================
 
 class TestSchemaV8(unittest.TestCase):
-    def test_schema_version_8(self):
+    def test_schema_version_9(self):
         path = _tmp_db()
         try:
             st = Storage(Path(path))
-            self.assertEqual(st.SCHEMA_VERSION, 8)
+            self.assertEqual(st.SCHEMA_VERSION, 10)
             conn = st._connect()
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 8)
+            self.assertEqual(version, 10)
             st.close()
         finally:
             _cleanup_db(path)
@@ -929,31 +1063,36 @@ class TestProcessBatchC1(unittest.TestCase):
 
     def test_budget_cut_excess_not_in_failed_urls(self):
         """
-        C1': активный LLM, 5 items, budget_override=3, доставлены 2 из 3 обработанных.
-        Excess (items[3:]) НЕ в failed_urls.
+        C1': активный LLM, 5 items, batch_size=1, budget_override=3,
+        доставлены 2 из 3 обработанных. Excess (items[3:]) НЕ в failed_urls.
+        При batch_size=1 evaluate_batch вызывает evaluate (single-item fallback).
         """
         from unittest.mock import MagicMock
         from newsbot.llm.filter import FilterResult
 
         items = [_mk_item(title=f"B{i}", url=f"https://cut.com/{i}") for i in range(5)]
-        # мок LLM: всем score=10 → push, доставляем 2 из обработанных 3
         mock_llm = MagicMock()
         mock_llm.push_threshold = 7
         mock_llm.digest_threshold = 5
-        # evaluate возвращает push для всех items_to_llm
-        def eval_side(item):
+        mock_llm.push_urgent_only = False
+
+        def eval_side(item, feedback_context=None):
             return FilterResult(ok=True, score=10, summary="sum", reason="r")
         mock_llm.evaluate.side_effect = eval_side
+
+        def batch_side(items, feedback_context=None):
+            return [mock_llm.evaluate(item, feedback_context) for item in items]
+        mock_llm.evaluate_batch.side_effect = batch_side
 
         pipeline = self._patch_pipeline(
             delivered_urls=[f"https://cut.com/0", f"https://cut.com/1"],
             llm_filter=mock_llm,
         )
+        # batch_size=1 → поштучный режим (точный лимит как в старой логике)
+        pipeline.config.setdefault("llm", {})["batch_size"] = 1
 
-        # бюджет=3, доставлены 2 из 3 обработанных
         result = pipeline._process_batch(items, budget_override=3)
 
-        # failed = только не доставленные из обработанных (1 item)
         self.assertEqual(set(result), {"https://cut.com/2"},
             "Failed должны быть только реально не доставленные, НЕ excess")
         self.assertNotIn("https://cut.com/3", result,
@@ -1037,6 +1176,95 @@ class TestProcessBatchC1(unittest.TestCase):
             "Успешно доставленный retry item НЕ должен быть в failed_urls")
         self.assertIn("https://fail.example/2", result,
             "Не доставленный retry item ДОЛЖЕН быть в failed_urls")
+
+
+# =============================================================================
+# K1-интеграция (pytest-стиль, caplog)
+# =============================================================================
+
+try:
+    import pytest  # noqa: F401
+    _HAS_PYTEST = True
+except ImportError:
+    _HAS_PYTEST = False
+
+
+if _HAS_PYTEST:
+
+    def test_k1_recovery_logs_remainder(caplog):
+        """
+        K1-интеграция: >recovery_new_limit items в state='new' →
+        recovery берёт ≤ limit, в логе есть 'подхвачено X/Y' и 'остаток Z'.
+        Использует реальный Storage и реальный run_cycle с пустым collector.
+        """
+        import logging
+        import tempfile
+        import os as _os
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        _os.close(fd)
+        _os.unlink(db_path)
+        try:
+            # Подготовка: 7 items в state='new'
+            s = Storage(Path(db_path))
+            for i in range(7):
+                s.save(_mk_item(title=f"R{i}", url=f"https://recov.com/{i}"))
+            s.close()
+
+            from newsbot.pipeline import NewsPipeline
+
+            cfg = {
+                "sources": [{"name": "Test", "url": "https://example.com/f.xml"}],
+                "database": {
+                    "path": db_path,
+                    "retention_days": 90,
+                    "recovery_new_limit": 3,
+                },
+                "llm": {"enabled": False},
+                "telegram": {"token": "", "chat_id": ""},
+            }
+
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = cfg
+            p.sources = cfg["sources"]
+            p.storage = Storage(Path(db_path))
+            p.delivery = MagicMock()
+            p.delivery.send_batch.return_value = []
+            p.llm_filter = None
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._max_retries = 8
+            p._feedback_context = None
+            p._off_peak_only = False
+
+            class EmptyCollector:
+                def collect(self):
+                    return []
+
+            p.collector = EmptyCollector()
+
+            with caplog.at_level(logging.INFO, logger="newsbot.pipeline"):
+                p.run_cycle_with_delivery()
+
+            messages = [r.message for r in caplog.records]
+            # 'подхвачено 3/7': взято 3 из 7
+            found_recovery = any(
+                "подхвачено" in m and "/7" in m for m in messages
+            )
+            assert found_recovery, (
+                f"Ожидался лог 'подхвачено 3/7'. Логи: {messages}"
+            )
+            # 'остаток 4': 7 - 3 = 4
+            found_remainder = any(
+                "остаток" in m and "4" in m for m in messages
+            )
+            assert found_remainder, (
+                f"Ожидался лог 'остаток 4'. Логи: {messages}"
+            )
+
+            p.storage.close()
+        finally:
+            _cleanup_db(db_path)
 
 
 # =============================================================================

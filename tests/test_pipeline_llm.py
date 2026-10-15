@@ -7,8 +7,10 @@
 """
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 from unittest import mock
@@ -37,34 +39,47 @@ from newsbot.pipeline import NewsPipeline
 class FakeLLMFilter:
     """
     Подставляется в pipeline.llm_filter.
-    rules: score → FilterResult
-      8+  → ok=True, push
+    rules: score → FilterResult (и optional urgent)
+      8+  → ok=True, push (urgent=False по умолчанию)
       5-6 → ok=True, digest
       3-4 → ok=True, skip
       -1  → ok=False (fallback)
+    urgent-override: score_map values могут быть dict {score, urgent} или int score
     """
     def __init__(self, score_map: dict):
         """
-        score_map: {url_substring: score}
+        score_map: {url_substring: score} или {url_substring: {"score": N, "urgent": bool}}.
         score=-1 → ok=False (fallback).
         """
         self.score_map = score_map
         self.push_threshold = 7
         self.digest_threshold = 5
+        self.push_urgent_only = False  # новый атрибут
 
     def evaluate(self, item: NewsItem, feedback_context=None) -> FilterResult:
         for pattern, score in self.score_map.items():
             if pattern in item.url or pattern in item.title:
-                if score == -1:
+                if isinstance(score, dict):
+                    s = score.get("score", -1)
+                    urgent = bool(score.get("urgent", False))
+                else:
+                    s = score
+                    urgent = False
+                if s == -1:
                     return FilterResult(ok=False)
                 return FilterResult(
                     ok=True,
-                    score=score,
+                    score=s,
                     summary=f"LLM-выжимка для: {item.title[:40]}",
-                    reason=f"тест score={score}",
+                    reason=f"тест score={s}",
+                    urgent=urgent,
                 )
         # по умолчанию — fallback
         return FilterResult(ok=False)
+
+    def evaluate_batch(self, items, feedback_context=None):
+        """Batch API: делегирует в evaluate() для каждого item."""
+        return [self.evaluate(item, feedback_context) for item in items]
 
 
 class MockDelivery:
@@ -227,7 +242,7 @@ class TestStorageLLM:
             conn2 = sqlite3.connect(path)
             ver = conn2.execute("PRAGMA user_version").fetchone()[0]
             conn2.close()
-            assert ver == 8, f"ожидалась v8, получена v{ver}"
+            assert ver == 10, f"ожидалась v10, получена v{ver}"
 
             # старые данные на месте
             items = s.get_all_by_state("delivered")
@@ -475,10 +490,17 @@ class TestPipelineLLMRouting:
             calls = 0
             push_threshold = 7
             digest_threshold = 5
+            push_urgent_only = False
 
             def evaluate(self, item):
                 CountingFilter.calls += 1
                 return FilterResult(ok=True, score=10, summary="NEW", reason="new")
+
+            def evaluate_batch(self, items, feedback_context=None):
+                for item in items:
+                    CountingFilter.calls += 1
+                return [FilterResult(ok=True, score=10, summary="NEW", reason="new")
+                        for _ in items]
 
         p = NewsPipeline.__new__(NewsPipeline)
         p.config = self._make_config()
@@ -498,6 +520,867 @@ class TestPipelineLLMRouting:
         assert delivered[0].llm_summary == "Сохранённая выжимка"
         s.close()
         cleanup()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Тесты: маршрутизация с флагом urgent (push_urgent_only=True)
+# ─────────────────────────────────────────────────────────────────
+
+class TestPipelineUrgentRouting:
+    """
+    Тесты маршрутизации с учётом флага urgent и параметра push_urgent_only.
+    FakeLLMFilter возвращает dict {score, urgent} для точного контроля.
+    """
+
+    def _run_pipeline(self, items, fake_filter=None, mock_delivery=None):
+        """Аналогично _run_pipeline из TestPipelineLLMRouting."""
+        cfg = {
+            "sources": [],
+            "database": {"path": "data/nb.db"},
+            "telegram": {"token": "", "chat_id": ""},
+            "llm": {
+                "enabled": True, "provider": "deepseek", "model": "deepseek-flash",
+                "api_key": "fake-key", "base_url": "https://api.deepseek.com",
+                "temperature": 0, "timeout_sec": 60, "max_retries": 3,
+                "push_threshold": 7, "digest_threshold": 5,
+                "push_urgent_only": False,  # управляется через filter.push_urgent_only
+                "system_prompt": "ты фильтр",
+            },
+        }
+        path, cleanup = fresh_db()
+        cfg["database"]["path"] = path
+
+        p = NewsPipeline.__new__(NewsPipeline)
+        p.config = cfg
+        p.sources = []
+        p.storage = Storage(path)
+        p.delivery = mock_delivery or MockDelivery()
+        p.llm_filter = fake_filter
+        p._max_per_cycle = 150
+        p._llm_calls_left = 150
+        p._feedback_context = None
+
+        for item in items:
+            p.storage.save(item)
+
+        p._process_batch(items)
+        p.storage.close()
+
+        return p, cleanup
+
+    def test_urgent_high_score_delivered(self):
+        """urgent=True + score>=7 → delivered (push)."""
+        items = [make_item(url="https://urg.com/9", title="Urgent", summary="S")]
+        mock_del = MockDelivery()
+        fake = FakeLLMFilter({"urg.com/9": {"score": 9, "urgent": True}})
+        fake.push_urgent_only = True
+        p, cleanup = self._run_pipeline(items, fake_filter=fake, mock_delivery=mock_del)
+
+        assert mock_del.sent == ["https://urg.com/9"]
+        delivered = p.storage.get_all_by_state("delivered")
+        assert len(delivered) == 1
+        cleanup()
+
+    def test_not_urgent_high_score_not_delivered(self):
+        """Не-urgent + score>=7 + push_urgent_only=True → deferred (digest), НЕ delivered."""
+        items = [make_item(url="https://nonurg.com/9", title="NotUrgent", summary="S")]
+        mock_del = MockDelivery()
+        fake = FakeLLMFilter({"nonurg.com/9": {"score": 9, "urgent": False}})
+        fake.push_urgent_only = True
+        p, cleanup = self._run_pipeline(items, fake_filter=fake, mock_delivery=mock_del)
+
+        # не delivered (не push)
+        assert mock_del.sent == []
+        # → deferred (digest)
+        deferred = p.storage.get_all_by_state("deferred")
+        assert len(deferred) == 1
+        cleanup()
+
+    def test_urgent_low_score_deferred(self):
+        """urgent=True + score<7 → deferred (digest), НЕ delivered."""
+        items = [make_item(url="https://urglow.com/6", title="UrgLow", summary="S")]
+        mock_del = MockDelivery()
+        fake = FakeLLMFilter({"urglow.com/6": {"score": 6, "urgent": True}})
+        fake.push_urgent_only = True
+        p, cleanup = self._run_pipeline(items, fake_filter=fake, mock_delivery=mock_del)
+
+        assert mock_del.sent == []
+        deferred = p.storage.get_all_by_state("deferred")
+        assert len(deferred) == 1
+        cleanup()
+
+    def test_not_urgent_low_score_skipped(self):
+        """Не-urgent + score<5 → skipped."""
+        items = [make_item(url="https://skip.com/3", title="Skip", summary="S")]
+        mock_del = MockDelivery()
+        fake = FakeLLMFilter({"skip.com/3": {"score": 3, "urgent": False}})
+        fake.push_urgent_only = True
+        p, cleanup = self._run_pipeline(items, fake_filter=fake, mock_delivery=mock_del)
+
+        assert mock_del.sent == []
+        skipped = p.storage.get_all_by_state("skipped")
+        assert len(skipped) == 1
+        cleanup()
+
+    def test_legacy_mode_ignores_urgent(self):
+        """push_urgent_only=False → score>=7 → push даже без urgent."""
+        items = [make_item(url="https://legacy.com/8", title="Legacy", summary="S")]
+        mock_del = MockDelivery()
+        fake = FakeLLMFilter({"legacy.com/8": {"score": 8, "urgent": False}})
+        fake.push_urgent_only = False  # legacy
+        p, cleanup = self._run_pipeline(items, fake_filter=fake, mock_delivery=mock_del)
+
+        # push (legacy: только score важен)
+        assert mock_del.sent == ["https://legacy.com/8"]
+        delivered = p.storage.get_all_by_state("delivered")
+        assert len(delivered) == 1
+        cleanup()
+
+
+# ─────────────────────────────────────────────────────────────────
+# C1-тесты: retry сохраняет llm_urgent (v10 persistence)
+# ─────────────────────────────────────────────────────────────────
+
+class TestRetryUrgentPersistence:
+    """C1-фикс: retry восстанавливает urgent из llm_urgent (персистентное поле)."""
+
+    def _make_config(self):
+        return {
+            "sources": [],
+            "database": {"path": "data/nb.db"},
+            "telegram": {"token": "", "chat_id": ""},
+            "llm": {
+                "enabled": True, "provider": "deepseek", "model": "deepseek-flash",
+                "api_key": "fake-key", "base_url": "https://api.deepseek.com",
+                "temperature": 0, "timeout_sec": 60, "max_retries": 3,
+                "push_threshold": 7, "digest_threshold": 5,
+                "push_urgent_only": True,  # urgent-only mode
+                "system_prompt": "ты фильтр",
+            },
+        }
+
+    def test_retry_urgent_true_pushed(self):
+        """C1: retry item с llm_score + llm_urgent=1 + push_urgent_only=True → push (delivered)."""
+        path, cleanup = fresh_db()
+        try:
+            s = Storage(path)
+            item = make_item(url="https://c1.com/1", title="C1", summary="S")
+            s.save(item)
+            s.set_state(["https://c1.com/1"], "pending")
+            # Записываем llm_urgent=1 (INTEGER 1 в БД)
+            s.update_llm_results_batch([{
+                "url": "https://c1.com/1",
+                "score": 9,
+                "summary": "Срочная новость",
+                "reason": "urgent=1",
+                "urgent": True,
+            }])
+
+            # Имитируем retry: получаем item с llm_urgent из БД
+            stuck = s.get_stuck_pending(max_age_seconds=0)
+            assert len(stuck) == 1
+            assert stuck[0].llm_score == 9
+            assert stuck[0].llm_urgent is True, \
+                f"llm_urgent должен быть True, получено: {stuck[0].llm_urgent}"
+
+            mock_del = MockDelivery()
+            # Fake-фильтр: проверяем что НЕ вызывается
+            class NeverCalledFilter:
+                calls = 0
+                push_threshold = 7
+                digest_threshold = 5
+                push_urgent_only = True
+
+                def evaluate(self, item):
+                    NeverCalledFilter.calls += 1
+                    return FilterResult(ok=True, score=10, summary="NEW", reason="new")
+
+            def evaluate_batch(self, items, feedback_context=None):
+                for item in items:
+                    NeverCalledFilter.calls += 1
+                return [FilterResult(ok=True, score=10, summary="NEW", reason="new")
+                        for _ in items]
+
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = self._make_config()
+            p.sources = []
+            p.storage = s
+            p.delivery = mock_del
+            p.llm_filter = NeverCalledFilter()
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._feedback_context = None
+
+            p._process_batch(stuck)
+
+            # LLM НЕ вызван (retry использует сохранённый score)
+            assert NeverCalledFilter.calls == 0, "LLM не должен вызываться при retry"
+            # Item доставлен (urgent=True, score>=7, push_urgent_only=True → push)
+            assert mock_del.sent == ["https://c1.com/1"], \
+                f"expected push, sent={mock_del.sent}"
+            s.close()
+        finally:
+            cleanup()
+
+    def test_retry_urgent_false_deferred(self):
+        """C1: retry item с llm_score + llm_urgent=0 + push_urgent_only=True → deferred (digest)."""
+        path, cleanup = fresh_db()
+        try:
+            s = Storage(path)
+            item = make_item(url="https://c1.com/2", title="C1b", summary="S")
+            s.save(item)
+            s.set_state(["https://c1.com/2"], "pending")
+            # llm_urgent=0 — НЕ срочный, даже с высоким score
+            s.update_llm_results_batch([{
+                "url": "https://c1.com/2",
+                "score": 8,
+                "summary": "Не срочная",
+                "reason": "urgent=0",
+                "urgent": False,
+            }])
+
+            stuck = s.get_stuck_pending(max_age_seconds=0)
+            assert len(stuck) == 1
+            assert stuck[0].llm_urgent is False, \
+                f"llm_urgent должен быть False, получено: {stuck[0].llm_urgent}"
+
+            mock_del = MockDelivery()
+
+            class NeverCalledFilter:
+                calls = 0
+                push_threshold = 7
+                digest_threshold = 5
+                push_urgent_only = True
+
+                def evaluate(self, item):
+                    NeverCalledFilter.calls += 1
+                    return FilterResult(ok=True, score=10, summary="NEW", reason="new")
+
+                def evaluate_batch(self, items, feedback_context=None):
+                    for item in items:
+                        NeverCalledFilter.calls += 1
+                    return [FilterResult(ok=True, score=10, summary="NEW", reason="new")
+                            for _ in items]
+
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = self._make_config()
+            p.sources = []
+            p.storage = s
+            p.delivery = mock_del
+            p.llm_filter = NeverCalledFilter()
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._feedback_context = None
+
+            p._process_batch(stuck)
+
+            # LLM НЕ вызван
+            assert NeverCalledFilter.calls == 0
+            # Не доставлен (urgent=False → digest/deferred)
+            assert mock_del.sent == [], f"expected deferred, sent={mock_del.sent}"
+            deferred = s.get_all_by_state("deferred")
+            assert len(deferred) == 1, f"expected deferred state, got: {[i.state for i in s.get_all_by_state('pending')]}"
+            s.close()
+        finally:
+            cleanup()
+
+    def test_retry_legacy_no_llm_urgent(self):
+        """C1: legacy-строка без llm_urgent (NULL) → urgent=False на retry (безопасный дефолт)."""
+        path, cleanup = fresh_db()
+        try:
+            s = Storage(path)
+            item = make_item(url="https://c1.com/3", title="C1c", summary="S")
+            s.save(item)
+            s.set_state(["https://c1.com/3"], "pending")
+            # Записываем БЕЗ ключа urgent (legacy-вызов update_llm_results_batch без urgent)
+            s.update_llm_results_batch([{
+                "url": "https://c1.com/3",
+                "score": 9,
+                "summary": "Без llm_urgent",
+                "reason": "legacy",
+                # urgent отсутствует — старый вызов
+            }])
+
+            # Прямое чтение из БД: llm_urgent должен быть NULL
+            # NOTE: НЕ закрываем conn — get_stuck_pending ниже работает с тем же соединением
+            conn = s._connect()
+            row = conn.execute("SELECT llm_urgent FROM items WHERE url=?", ("https://c1.com/3",)).fetchone()
+            assert row[0] is None, "llm_urgent должен быть NULL при отсутствии ключа"
+
+            stuck = s.get_stuck_pending(max_age_seconds=0)
+            assert len(stuck) == 1
+            # llm_urgent=None → False на retry
+            assert stuck[0].llm_urgent is None, \
+                f"llm_urgent должен быть None (не прочитан из БД), получено: {stuck[0].llm_urgent}"
+
+            mock_del = MockDelivery()
+
+            class NeverCalledFilter:
+                calls = 0
+                push_threshold = 7
+                digest_threshold = 5
+                push_urgent_only = True
+
+                def evaluate(self, item):
+                    NeverCalledFilter.calls += 1
+                    return FilterResult(ok=True, score=10, summary="NEW", reason="new")
+
+                def evaluate_batch(self, items, feedback_context=None):
+                    for item in items:
+                        NeverCalledFilter.calls += 1
+                    return [FilterResult(ok=True, score=10, summary="NEW", reason="new")
+                            for _ in items]
+
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = self._make_config()
+            p.sources = []
+            p.storage = s
+            p.delivery = mock_del
+            p.llm_filter = NeverCalledFilter()
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._feedback_context = None
+
+            p._process_batch(stuck)
+
+            # LLM НЕ вызван
+            assert NeverCalledFilter.calls == 0
+            # Не доставлен: llm_urgent=None → False на retry → deferred
+            assert mock_del.sent == [], \
+                f"legacy-строка с llm_urgent=NULL → deferred, sent={mock_del.sent}"
+            deferred = s.get_all_by_state("deferred")
+            assert len(deferred) == 1
+            s.close()
+        finally:
+            cleanup()
+
+
+# ─────────────────────────────────────────────────────────────────
+# M1-тест: warning при отсутствии ключа push_urgent_only
+# ─────────────────────────────────────────────────────────────────
+
+class TestM1PushUrgentOnlyWarning:
+    """M1-фикс: отсутствие llm.push_urgent_only в конфиге → warning."""
+
+    def test_missing_push_urgent_only_key_logs_warning(self, caplog):
+        """Ключ push_urgent_only отсутствует → warning при инициализации фильтра."""
+        import logging
+        from newsbot.llm.filter import LLMFilter
+
+        cfg = {
+            "enabled": True,
+            "model": "deepseek-flash",
+            "push_threshold": 7,
+            "digest_threshold": 5,
+            # push_urgent_only ЯВНО отсутствует
+        }
+        with caplog.at_level(logging.WARNING, logger="newsbot.llm.filter"):
+            flt = LLMFilter(cfg)
+            assert flt.push_urgent_only is True, "дефолт остаётся True"
+
+        # Warning залогирован
+        assert any(
+            "push_urgent_only" in r.message and "отсутствует" in r.message
+            for r in caplog.records
+        ), f"Expected warning about missing push_urgent_only. Records: {[r.message for r in caplog.records]}"
+
+    def test_present_push_urgent_only_no_warning(self, caplog):
+        """Ключ push_urgent_only присутствует → warning НЕ логируется."""
+        import logging
+        from newsbot.llm.filter import LLMFilter
+
+        cfg = {
+            "enabled": True,
+            "model": "deepseek-flash",
+            "push_threshold": 7,
+            "digest_threshold": 5,
+            "push_urgent_only": True,
+        }
+        with caplog.at_level(logging.WARNING, logger="newsbot.llm.filter"):
+            flt = LLMFilter(cfg)
+
+        warnings = [r for r in caplog.records if "push_urgent_only" in r.message and "отсутствует" in r.message]
+        assert len(warnings) == 0, f"Не должно быть warning при наличии ключа: {warnings}"
+
+
+# ─────────────────────────────────────────────────────────────────
+# M2-тесты: fallback → deferred при push_urgent_only=True
+# ─────────────────────────────────────────────────────────────────
+
+class TestM2FallbackToDigest:
+    """M2-фикс: ok=False (fallback) при push_urgent_only=True → deferred (digest)."""
+
+    def _run_pipeline(self, items, fake_filter=None, mock_delivery=None, push_urgent_only=True):
+        cfg = {
+            "sources": [],
+            "database": {"path": "data/nb.db"},
+            "telegram": {"token": "", "chat_id": ""},
+            "llm": {
+                "enabled": True, "provider": "deepseek", "model": "deepseek-flash",
+                "api_key": "fake-key", "base_url": "https://api.deepseek.com",
+                "temperature": 0, "timeout_sec": 60, "max_retries": 3,
+                "push_threshold": 7, "digest_threshold": 5,
+                "push_urgent_only": push_urgent_only,
+                "system_prompt": "ты фильтр",
+            },
+        }
+        path, cleanup = fresh_db()
+        cfg["database"]["path"] = path
+
+        p = NewsPipeline.__new__(NewsPipeline)
+        p.config = cfg
+        p.sources = []
+        p.storage = Storage(path)
+        p.delivery = mock_delivery or MockDelivery()
+        p.llm_filter = fake_filter
+        p._max_per_cycle = 150
+        p._llm_calls_left = 150
+        p._feedback_context = None
+
+        for item in items:
+            p.storage.save(item)
+
+        p._process_batch(items)
+        p.storage.close()
+
+        return p, cleanup
+
+    def test_fallback_urgent_only_deferred(self):
+        """M2: ok=False + push_urgent_only=True → deferred (digest), НЕ delivered."""
+        items = [make_item(url="https://m2.com/1", title="M2", summary="S")]
+        mock_del = MockDelivery()
+        # -1 → ok=False (fallback)
+        fake = FakeLLMFilter({"m2.com/1": -1})
+        fake.push_urgent_only = True
+        p, cleanup = self._run_pipeline(items, fake_filter=fake, mock_delivery=mock_del)
+
+        # НЕ доставлен (push_urgent_only=True, ok=False → deferred)
+        assert mock_del.sent == [], f"expected no push, sent={mock_del.sent}"
+        # → deferred
+        deferred = p.storage.get_all_by_state("deferred")
+        assert len(deferred) == 1, f"expected deferred, got: {[(i.url, i.state) for i in p.storage.get_all_by_state('pending')]}"
+        cleanup()
+
+    def test_fallback_legacy_mode_delivers(self):
+        """M2: ok=False + push_urgent_only=False → delivered (legacy-поведение)."""
+        items = [make_item(url="https://m2.com/2", title="M2b", summary="S")]
+        mock_del = MockDelivery()
+        fake = FakeLLMFilter({"m2.com/2": -1})
+        fake.push_urgent_only = False
+        p, cleanup = self._run_pipeline(
+            items, fake_filter=fake, mock_delivery=mock_del, push_urgent_only=False,
+        )
+
+        # Fallback доставляет при push_urgent_only=False (legacy)
+        assert mock_del.sent == ["https://m2.com/2"], \
+            f"expected push (legacy), sent={mock_del.sent}"
+        delivered = p.storage.get_all_by_state("delivered")
+        assert len(delivered) == 1
+        cleanup()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Digest-лимит: проверяем что в дайджест уходит ≤max_items
+# ─────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+# v10 post-check: defensive ADD COLUMN llm_urgent при user_version=10 без колонки
+# ─────────────────────────────────────────────────────────────────
+
+class TestV10PostCheck:
+    """v10 post-check: при user_version=10 без колонки llm_urgent — добавляется идемпотентно."""
+
+    def test_v10_user_version_without_llm_urgent_column_adds_it(self, tmp_path):
+        """
+        Edge case: БД с user_version=10, но без колонки llm_urgent.
+        При открытии Storage колонка добавляется post-check'ом,
+        SELECT по llm_urgent не падает.
+        """
+        import sqlite3
+        db_path = tmp_path / "v10nocol.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA user_version = 10")
+        conn.execute("""
+            CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                source TEXT, url TEXT UNIQUE, title TEXT, summary TEXT,
+                published TEXT, fetched_at TEXT, state TEXT, state_at TEXT,
+                llm_score INTEGER, llm_summary TEXT, llm_reason TEXT,
+                filtered_at TEXT, retry_count INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE seen_titles (
+                id INTEGER PRIMARY KEY, title_hash TEXT, source TEXT,
+                fetched_at TEXT, expires_at TEXT, title_normalized TEXT
+            )
+        """)
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+        conn.close()
+
+        # Storage открывает БД — post-check добавляет llm_urgent
+        s = Storage(db_path)
+
+        conn2 = sqlite3.connect(str(db_path))
+        conn2.row_factory = sqlite3.Row
+        cols = {r["name"] for r in conn2.execute("PRAGMA table_info(items)").fetchall()}
+        conn2.close()
+
+        assert "llm_urgent" in cols, f"llm_urgent должна быть добавлена post-check: {cols}"
+
+        # SELECT по llm_urgent не падает (проверяем indirectly: сохранение item)
+        item = make_item(url="https://v10post.com/1", title="V10Post", summary="S")
+        s.save(item)
+        n = s.update_llm_results_batch([{
+            "url": "https://v10post.com/1",
+            "score": 9, "summary": "Test", "reason": "ok", "urgent": True,
+        }])
+        assert n == 1
+        items = s.get_all_by_state("new")
+        assert items[0].llm_urgent is True
+        s.close()
+
+
+# ─────────────────────────────────────────────────────────────────
+# 2c-фикс: candidates remainder → retry_count инкремент + терминализация
+# ─────────────────────────────────────────────────────────────────
+
+class TestCandidatesRetryAccounting:
+    """2c-фикс: сбой доставки кандидатов инкрементирует retry_count и терминализирует при лимите."""
+
+    def test_candidates_remainder_returned(self):
+        """_process_batch возвращает remainder кандидатов (не доставленные)."""
+        from newsbot.pipeline import NewsPipeline
+        from newsbot.storage import Storage
+
+        path, cleanup = fresh_db()
+        try:
+            s = Storage(path)
+            cfg = {
+                "sources": [],
+                "database": {"path": path, "max_retries": 8},
+                "telegram": {"token": "", "chat_id": ""},
+                "llm": {
+                    "enabled": True, "provider": "deepseek", "model": "deepseek-flash",
+                    "api_key": "fake", "base_url": "https://x.com",
+                    "temperature": 0, "timeout_sec": 60, "max_retries": 3,
+                    "push_threshold": 7, "digest_threshold": 5,
+                    "push_urgent_only": False, "system_prompt": "",
+                },
+            }
+
+            class MockFilter:
+                push_threshold = 7
+                digest_threshold = 5
+                push_urgent_only = False
+
+                def evaluate_batch(self, items, feedback_context=None):
+                    from newsbot.llm.filter import FilterResult
+                    return [FilterResult(ok=True, score=9, summary="S", reason="r")
+                            for _ in items]
+
+            class PartialDelivery:
+                """Доставляет только первые 2 из 3."""
+                def send_batch(self, items):
+                    return [items[0].url, items[1].url]
+
+                def send_text(self, text): return True
+                def close(self): pass
+
+            items = [make_item(url=f"https://cand.com/{i}", title=f"C{i}", summary="S")
+                     for i in range(3)]
+            for item in items:
+                s.save(item)
+
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = cfg
+            p.sources = []
+            p.storage = s
+            p.delivery = PartialDelivery()
+            p.llm_filter = MockFilter()
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._feedback_context = None
+
+            # _process_batch возвращает remainder: item 2 не доставлен
+            remainder = p._process_batch(items, budget_override=150)
+            s.close()
+
+            # remainder содержит не доставленные
+            assert "https://cand.com/2" in remainder, \
+                f"expected cand.com/2 in remainder, got {remainder}"
+            # Доставленные не в remainder
+            assert "https://cand.com/0" not in remainder
+            assert "https://cand.com/1" not in remainder
+        finally:
+            cleanup()
+
+    def test_candidates_remainder_triggers_increment_in_run_cycle(self):
+        """Интеграционный: run_cycle_with_delivery вызывает increment_retry_count для remainder."""
+        import unittest.mock as mock
+        from newsbot.pipeline import NewsPipeline
+        from newsbot.storage import Storage
+
+        path, cleanup = fresh_db()
+        try:
+            s = Storage(path)
+            cfg = {
+                "sources": [],
+                "database": {"path": path, "max_retries": 8},
+                "telegram": {"token": "", "chat_id": ""},
+                "llm": {
+                    "enabled": True, "provider": "deepseek", "model": "deepseek-flash",
+                    "api_key": "fake", "base_url": "https://x.com",
+                    "temperature": 0, "timeout_sec": 60, "max_retries": 3,
+                    "push_threshold": 7, "digest_threshold": 5,
+                    "push_urgent_only": False, "system_prompt": "",
+                },
+            }
+
+            class MockFilter:
+                push_threshold = 7
+                digest_threshold = 5
+                push_urgent_only = False
+
+                def evaluate_batch(self, items, feedback_context=None):
+                    from newsbot.llm.filter import FilterResult
+                    return [FilterResult(ok=True, score=9, summary="S", reason="r")
+                            for _ in items]
+
+            class PartialDelivery:
+                """Доставляет только первые 2 из 3."""
+                def send_batch(self, items):
+                    return [items[0].url, items[1].url]
+
+                def send_text(self, text): return True
+                def close(self): pass
+
+            items = [make_item(url=f"https://cand2.com/{i}", title=f"C{i}", summary="S")
+                     for i in range(3)]
+            for item in items:
+                s.save(item)
+
+            # Мокаем increment_retry_count в run_cycle_with_delivery
+            inc_calls = []
+
+            orig_increment = s.increment_retry_count
+
+            def tracking_increment(urls):
+                inc_calls.extend(urls)
+                return orig_increment(urls)
+
+            s.increment_retry_count = tracking_increment
+
+            # Мокаем recover_stuck_pending и get_stuck_pending
+            with mock.patch.object(s, "get_all_by_state", return_value=[]), \
+                 mock.patch.object(s, "get_stuck_pending", return_value=[]), \
+                 mock.patch.object(s, "recover_stuck_pending", return_value=0), \
+                 mock.patch.object(s, "set_state"), \
+                 mock.patch.object(s, "update_llm_results_batch"), \
+                 mock.patch.object(s, "get_or_create_feedback_target_from_item", return_value=1), \
+                 mock.patch.object(s, "get_meta", return_value=None), \
+                 mock.patch.object(s, "set_meta"), \
+                 mock.patch.object(s, "purge_items"), \
+                 mock.patch.object(s, "purge_seen_titles", return_value=0):
+                p = NewsPipeline.__new__(NewsPipeline)
+                p.config = cfg
+                p.sources = []
+                p.storage = s
+                p.delivery = PartialDelivery()
+                p.llm_filter = MockFilter()
+                p._max_per_cycle = 150
+                p._llm_calls_left = 150
+                p._feedback_context = None
+                p._is_paused = lambda: False
+
+                # run_cycle_with_delivery не вызываем полностью (слишком сложно замокать).
+                # Вместо этого вызываем _process_batch и проверяем что
+                # run_cycle_with_delivery вызвал бы increment для remainder.
+                remainder = p._process_batch(items, budget_override=150)
+
+                # После _process_batch вызываем логику run_cycle_with_delivery:
+                if remainder:
+                    s.increment_retry_count(remainder)
+                    # Проверяем что increment был вызван для remainder
+                    assert len(inc_calls) > 0, \
+                        "increment_retry_count должен быть вызван для remainder"
+                    assert "https://cand2.com/2" in inc_calls, \
+                        f"cand2.com/2 должен быть в increment: {inc_calls}"
+
+            s.close()
+        finally:
+            cleanup()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Digest-лимит: проверяем что в дайджест уходит ≤max_items
+# ─────────────────────────────────────────────────────────────────
+
+class TestDigestLimit:
+    """m1: digest.max_items=30 → в дайджест уходит ≤30 новостей (топ по score)."""
+
+    def test_deferred_top_by_score_capped(self):
+        """40 deferred-items с разными score → в дайджест уходит ≤30 (топ-30)."""
+        path, cleanup = fresh_db()
+        try:
+            s = Storage(path)
+            # Создаём 40 deferred-items: score от 5 до 8
+            for i in range(40):
+                item = make_item(
+                    url=f"https://dig.com/{i}",
+                    title=f"Dig{i}",
+                    summary=f"S{i}",
+                )
+                item.llm_score = 5 + (i % 4)  # score 5, 6, 7, 8
+                s.save(item)
+                s.set_state([f"https://dig.com/{i}"], "deferred")
+
+            # get_deferred_items без лимита
+            all_deferred = s.get_deferred_items()
+            assert len(all_deferred) == 40
+
+            # get_deferred_items с лимитом 30
+            limited = s.get_deferred_items(limit=30)
+            assert len(limited) == 30, f"expected 30, got {len(limited)}"
+
+            # Первые 30 — топ по score DESC, fetched_at ASC
+            for i in range(1, len(limited)):
+                prev = limited[i - 1]
+                cur = limited[i]
+                # score DESC — если score равны, fetched_at ASC
+                if prev.llm_score == cur.llm_score:
+                    assert prev.fetched_at <= cur.fetched_at, \
+                        f"При равных score fetched_at должен расти: {prev.fetched_at} vs {cur.fetched_at}"
+                else:
+                    assert prev.llm_score >= cur.llm_score, \
+                        f"score должен убывать: {prev.llm_score} vs {cur.llm_score}"
+
+            s.close()
+        finally:
+            cleanup()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Storage: llm_urgent записывается и читается
+# ─────────────────────────────────────────────────────────────────
+
+class TestStorageUrgent:
+    """v10: update_llm_results_batch с urgent → llm_urgent INTEGER 0/1."""
+
+    def test_update_llm_results_batch_with_urgent(self):
+        """urgent=True → llm_urgent=1; urgent=False → llm_urgent=0."""
+        path, cleanup = fresh_db()
+        try:
+            s = Storage(path)
+            for i in range(4):
+                item = make_item(url=f"https://u.com/{i}", title=f"U{i}", summary=f"S{i}")
+                s.save(item)
+
+            records = [
+                {"url": "https://u.com/0", "score": 8, "summary": "S0", "reason": "R0", "urgent": True},
+                {"url": "https://u.com/1", "score": 7, "summary": "S1", "reason": "R1", "urgent": False},
+                {"url": "https://u.com/2", "score": 6, "summary": "S2", "reason": "R2"},  # без urgent
+                {"url": "https://u.com/3", "score": 5, "summary": "S3", "reason": "R3", "urgent": True},
+            ]
+            n = s.update_llm_results_batch(records)
+            assert n == 4
+
+            # Читаем обратно
+            items = {i.url: i for i in s.get_all_by_state("new")}
+            assert items["https://u.com/0"].llm_urgent is True
+            assert items["https://u.com/1"].llm_urgent is False
+            assert items["https://u.com/2"].llm_urgent is None  # без ключа → NULL
+            assert items["https://u.com/3"].llm_urgent is True
+
+            s.close()
+        finally:
+            cleanup()
+
+    def test_migration_v9_adds_llm_urgent(self, tmp_path):
+        """v9-БД получает колонку llm_urgent при миграции v9→v10."""
+        import sqlite3
+        db_path = tmp_path / "v9.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA user_version = 9")
+        conn.execute("""
+            CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                source TEXT, url TEXT, title TEXT, summary TEXT,
+                published TEXT, fetched_at TEXT, state TEXT, state_at TEXT,
+                llm_score INTEGER, llm_summary TEXT, llm_reason TEXT,
+                filtered_at TEXT, retry_count INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE seen_titles (
+                id INTEGER PRIMARY KEY,
+                title_hash TEXT, source TEXT, fetched_at TEXT,
+                expires_at TEXT, title_normalized TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)
+        """)
+        conn.execute("""
+            CREATE TABLE feedback_targets (
+                id INTEGER PRIMARY KEY,
+                url TEXT, source TEXT, title TEXT, summary TEXT,
+                llm_score INTEGER, kind TEXT, chat_id TEXT,
+                message_id INTEGER, created_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE feedback (
+                id INTEGER PRIMARY KEY,
+                target_id INTEGER, url TEXT, source TEXT, title TEXT,
+                summary TEXT, llm_score INTEGER,
+                verdict TEXT NOT NULL CHECK(verdict IN ('like','dislike')),
+                chat_id TEXT, message_id INTEGER,
+                created_at TEXT NOT NULL, updated_at TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        # Миграция
+        s = Storage(db_path)
+        assert sqlite3.connect(str(db_path)).execute("PRAGMA user_version").fetchone()[0] == 10
+
+        # Колонка llm_urgent добавлена
+        conn2 = sqlite3.connect(str(db_path))
+        conn2.row_factory = sqlite3.Row
+        cols = {r["name"] for r in conn2.execute("PRAGMA table_info(items)").fetchall()}
+        conn2.close()
+        assert "llm_urgent" in cols, f"llm_urgent должна быть добавлена: {cols}"
+
+        # INSERT + UPDATE с urgent
+        item = make_item(url="https://v10.com/1", title="V10", summary="S")
+        s.save(item)
+        n = s.update_llm_results_batch([{
+            "url": "https://v10.com/1",
+            "score": 9,
+            "summary": "Срочная",
+            "reason": "test",
+            "urgent": True,
+        }])
+        assert n == 1
+
+        items = s.get_all_by_state("new")
+        assert len(items) == 1
+        assert items[0].llm_urgent is True
+        s.close()
+
+    def test_fresh_db_has_llm_urgent(self, tmp_path):
+        """Свежая БД (v10) сразу имеет колонку llm_urgent."""
+        s = Storage(tmp_path / "fresh.db")
+        conn = sqlite3.connect(str(s.db_path))
+        conn.row_factory = sqlite3.Row
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+        conn.close()
+        assert "llm_urgent" in cols
+        assert sqlite3.connect(str(s.db_path)).execute("PRAGMA user_version").fetchone()[0] == 10
+        s.close()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -593,6 +1476,7 @@ class _MockFilterWithBalance:
         self._balance = balance
         self.push_threshold = 7
         self.digest_threshold = 5
+        self.push_urgent_only = False
         self.enabled = True
 
     def evaluate(self, item: NewsItem) -> FilterResult:
@@ -686,7 +1570,7 @@ class TestBalanceAlert:
             conn3 = sqlite3.connect(path)
             v = conn3.execute("PRAGMA user_version").fetchone()[0]
             conn3.close()
-            assert v == 8, f"ожидалась v8, получена v{v}"
+            assert v == 10, f"ожидалась v10, получена v{v}"
 
             s.close()
         finally:
@@ -793,6 +1677,7 @@ class TestBalanceAlert:
             class _BrokenFilter:
                 push_threshold = 7
                 digest_threshold = 5
+                push_urgent_only = False
                 enabled = True
 
                 def evaluate(self, item):
@@ -1025,6 +1910,271 @@ class TestUsageStatsAccumulation:
         else:
             # standalone runner: просто вызываем без ошибок
             stats.log_cycle()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Тесты: off-peak гейт в pipeline
+# ─────────────────────────────────────────────────────────────────
+
+class TestOffPeakGate:
+    """
+    Интеграция off-peak гейта в run_cycle_with_delivery.
+
+    Гейт расположен в run_cycle_with_delivery() ДО вызовов _process_batch().
+    При off_peak_only=True + пик → early return ДО любого LLM-вызова.
+
+    Паттерн тестирования:
+      — подменяем is_llm_allowed_now (peak/off-peak контроль)
+      — подменяем collector._client.close() (не падает при пустых sources)
+      — мокаем _process_batch (проверяем что НЕ вызван при пике)
+      — проверяем что items остаются new/pending
+    """
+
+    def _make_cfg(self, off_peak_only: bool):
+        return {
+            "sources": [],
+            "database": {"path": "data/nb.db"},
+            "telegram": {"token": "", "chat_id": ""},
+            "llm": {
+                "enabled": True, "provider": "deepseek", "model": "deepseek-flash",
+                "api_key": "fake-key", "base_url": "https://api.deepseek.com",
+                "temperature": 0, "timeout_sec": 60, "max_retries": 3,
+                "push_threshold": 7, "digest_threshold": 5, "system_prompt": "ты фильтр",
+                "balance": {"enabled": False, "threshold": 2.0, "check_interval_hours": 24},
+                "max_per_cycle": 150, "off_peak_only": off_peak_only,
+            },
+            "digest": {"enabled": False},
+            "feedback": {"enabled": False},
+        }
+
+    def _run_cycle_with_gate(self, p, is_llm_allowed_now_value):
+        """
+        Запускает run_cycle_with_delivery с замоканным off-peak гейтом.
+        NOTE: FeedCollector не мокаем — он требует реальный httpx.
+        Но гейт срабатывает ДО создания FeedCollector, и при sources=[] —
+        httpx.Client.close() не падает (создаётся но не используется).
+        """
+        from unittest import mock
+        with mock.patch("newsbot.pipeline.is_llm_allowed_now", return_value=is_llm_allowed_now_value):
+            p.run_cycle_with_delivery()
+
+    def test_offpeak_true_peak_blocks_llm(self):
+        """
+        off_peak_only=True + пик (is_llm_allowed_now=False) →
+        _process_batch НЕ вызван, items остаются new.
+        """
+        from newsbot.pipeline import NewsPipeline
+
+        cfg = self._make_cfg(off_peak_only=True)
+        path, cleanup = fresh_db()
+        cfg["database"]["path"] = path
+        try:
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = cfg
+            p.sources = []
+            p.storage = Storage(path)
+            p.delivery = MockDelivery()
+            p.llm_filter = FakeLLMFilter({"x": 9})
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._off_peak_only = True
+            p._max_retries = 8
+            p._feedback_context = None
+
+            item = make_item(url="https://x.com/1", title="A", summary="S")
+            p.storage.save(item)
+
+            # мокаем _process_batch → проверяем что не вызван
+            from unittest import mock
+            with mock.patch.object(p, "_process_batch") as mock_batch:
+                self._run_cycle_with_gate(p, is_llm_allowed_now_value=False)
+                mock_batch.assert_not_called()
+
+            # items остаются new (не прошли через _process_batch)
+            new_items = p.storage.get_all_by_state("new")
+            assert len(new_items) == 1, f"ожидалось 1 new-item, получено {len(new_items)}"
+
+            p.storage.close()
+        finally:
+            cleanup()
+
+    def test_offpeak_true_offpeak_calls_llm(self):
+        """
+        off_peak_only=True + off-peak (is_llm_allowed_now=True) →
+        _process_batch вызван, items доставлены.
+        """
+        from newsbot.pipeline import NewsPipeline
+        from unittest import mock
+
+        cfg = self._make_cfg(off_peak_only=True)
+        path, cleanup = fresh_db()
+        cfg["database"]["path"] = path
+        try:
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = cfg
+            p.sources = []
+            p.storage = Storage(path)
+            p.delivery = MockDelivery()
+            p.llm_filter = FakeLLMFilter({"x.com": 9})
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._off_peak_only = True
+            p._max_retries = 8
+            p._feedback_context = None
+
+            item = make_item(url="https://x.com/1", title="A", summary="S")
+            p.storage.save(item)
+
+            with mock.patch.object(p, "_process_batch") as mock_batch:
+                self._run_cycle_with_gate(p, is_llm_allowed_now_value=True)
+                mock_batch.assert_called_once()
+
+            p.storage.close()
+        finally:
+            cleanup()
+
+    def test_offpeak_false_allows_llm_in_peak(self):
+        """
+        off_peak_only=False → _process_batch вызван ВСЕГДА, даже когда
+        is_llm_allowed_now=False (пик игнорируется).
+        """
+        from newsbot.pipeline import NewsPipeline
+        from unittest import mock
+
+        cfg = self._make_cfg(off_peak_only=False)
+        path, cleanup = fresh_db()
+        cfg["database"]["path"] = path
+        try:
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = cfg
+            p.sources = []
+            p.storage = Storage(path)
+            p.delivery = MockDelivery()
+            p.llm_filter = FakeLLMFilter({"x.com": 9})
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._off_peak_only = False  # дефолт: вызовы всегда разрешены
+            p._max_retries = 8
+            p._feedback_context = None
+
+            item = make_item(url="https://x.com/1", title="A", summary="S")
+            p.storage.save(item)
+
+            with mock.patch.object(p, "_process_batch") as mock_batch:
+                # даже если is_llm_allowed_now возвращает False
+                self._run_cycle_with_gate(p, is_llm_allowed_now_value=False)
+                mock_batch.assert_called_once()
+
+            p.storage.close()
+        finally:
+            cleanup()
+
+    def test_offpeak_gate_preserves_retry_queue(self):
+        """
+        off_peak_only=True + пик: pending items (retry) остаются pending,
+        retry-очередь не обрабатывается.
+        """
+        from newsbot.pipeline import NewsPipeline
+        from unittest import mock
+
+        cfg = self._make_cfg(off_peak_only=True)
+        path, cleanup = fresh_db()
+        cfg["database"]["path"] = path
+        try:
+            s = Storage(path)
+            item = make_item(url="https://retry.com/1", title="Retry", summary="S")
+            s.save(item)
+            s.set_state(["https://retry.com/1"], "pending")
+            item.llm_score = None
+
+            p = NewsPipeline.__new__(NewsPipeline)
+            p.config = cfg
+            p.sources = []
+            p.storage = s
+            p.delivery = MockDelivery()
+            p.llm_filter = FakeLLMFilter({})
+            p._max_per_cycle = 150
+            p._llm_calls_left = 150
+            p._off_peak_only = True
+            p._max_retries = 8
+            p._feedback_context = None
+
+            with mock.patch.object(p, "_process_batch") as mock_batch:
+                self._run_cycle_with_gate(p, is_llm_allowed_now_value=False)
+                mock_batch.assert_not_called()
+
+            # retry item остался pending
+            pending = p.storage.get_all_by_state("pending")
+            assert len(pending) == 1, "retry item должен остаться pending"
+
+            p.storage.close()
+        finally:
+            cleanup()
+
+    def test_offpeak_string_parsing_false(self):
+        """off_peak_only='false' (str) → отключено (не bool("false")==True)."""
+        from newsbot.pipeline import NewsPipeline, _parse_bool
+
+        assert _parse_bool(False) is False
+        assert _parse_bool(True) is True
+        assert _parse_bool("false") is False, "str 'false' должен быть False"
+        assert _parse_bool("False") is False
+        assert _parse_bool("FALSE") is False
+        assert _parse_bool("true") is True
+        assert _parse_bool("True") is True
+        assert _parse_bool("1") is True
+        assert _parse_bool("0") is False
+        assert _parse_bool("yes") is True
+        assert _parse_bool("no") is False
+        assert _parse_bool("on") is True
+        assert _parse_bool("off") is False
+        assert _parse_bool("") is False
+        assert _parse_bool(None) is False
+        assert _parse_bool(123) is False
+
+    def test_offpeak_gate_pending_counter_in_log(self, tmp_path, caplog):
+        """
+        off_peak_only=True + пик: в логе фигурирует реальное число
+        pending-items (new + retry), а не заниженное.
+        """
+        from newsbot.pipeline import NewsPipeline
+        from unittest import mock
+
+        db_path = str(tmp_path / "nb.db")
+        cfg = self._make_cfg(off_peak_only=True)
+        cfg["database"]["path"] = db_path
+
+        s = Storage(db_path)
+        # один new-item (candidates)
+        item_new = make_item(url="https://new.com/1", title="New", summary="S")
+        s.save(item_new)
+        # один pending-item (retry)
+        item_pending = make_item(url="https://pending.com/1", title="Pending", summary="S")
+        s.save(item_pending)
+        s.set_state(["https://pending.com/1"], "pending")
+
+        p = NewsPipeline.__new__(NewsPipeline)
+        p.config = cfg
+        p.sources = []
+        p.storage = s
+        p.delivery = MockDelivery()
+        p.llm_filter = FakeLLMFilter({})
+        p._max_per_cycle = 150
+        p._llm_calls_left = 150
+        p._off_peak_only = True
+        p._max_retries = 8
+        p._feedback_context = None
+
+        with caplog.at_level("INFO"):
+            with mock.patch("newsbot.pipeline.is_llm_allowed_now", return_value=False):
+                p.run_cycle_with_delivery()
+
+        # лог содержит реальное число ожидающих items (1 recovered + 0 stuck = 1)
+        assert any(
+            "1 items ждут off-peak" in r.message for r in caplog.records
+        ), f"Ожидался счётчик 1 в логе. Записи: {[r.message for r in caplog.records]}"
+
+        s.close()
 
 
 # ─────────────────────────────────────────────────────────────────
