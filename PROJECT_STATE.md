@@ -96,7 +96,7 @@ llm_score не тратят бюджет, few-shot блок в промпте) �
     читает оригинальные (не нормализованные) заголовки из `items` table
     (исключая `skipped/failed`), лимит 20 по умолчанию.
 
-**State-машина (v9):** new / pending / delivered / skipped / deferred / failed / digested.
+**State-машина (v11):** new / pending / delivered / skipped / deferred / failed / digested.
 `retry_count` INTEGER DEFAULT 0 в БД. При исчерпании retry_count >= max_retries
 → 'failed' (терминальный). Recovery C2: зависшие 'pending' с retry_count
 >= лимитом → 'failed' на старте цикла.
@@ -110,9 +110,9 @@ K1-recovery ограничен `recovery_new_limit` (500) — при долго�
 и терминализируются при исчерпании лимита — at-least-once для candidates.
 skipped: LLM-фильтр (score<5) + кросс-источниковые дубли (уровни 1/2).
 
-**Схема БД v10** (SCHEMA_VERSION=10):
+**Схема БД v11** (SCHEMA_VERSION=11):
 - `items`: id, source, url, title, summary, published, fetched_at,
-  state, state_at, llm_score, llm_summary, llm_reason, **llm_urgent INTEGER 0/1 (v10)**,
+  state, state_at, llm_score, llm_summary, llm_reason, **llm_urgent INTEGER 0/1 (v10/v11)**,
   filtered_at, retry_count.
   `llm_urgent` — персистентный флаг срочности; восстанавливается на retry.
   Legacy-строки (до v10) с `llm_urgent=NULL` → `urgent=False` (безопасный дефолт).
@@ -144,7 +144,7 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
   verdict CHECK('like'/'dislike'), chat_id, message_id, created_at, updated_at.
   Индексы: (verdict, created_at), (created_at), (updated_at).
 - WAL journal_mode, busy_timeout=5000.
-- Миграции v1→v9 идемпотентны (IF NOT EXISTS, безопасный ROLLBACK,
+- Миграции v1→v11 идемпотентны (IF NOT EXISTS, безопасный ROLLBACK,
   ранний return при актуальной версии).
 
 **LLM-фильтр:**
@@ -169,7 +169,7 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - Конфиг: `llm.push_urgent_only` (bool, дефолт True), `llm.push_threshold` (7), `llm.digest_threshold` (5), `llm.batch_size` (10), `llm.max_tokens` (4096).
 - Fallback при сбое/отсутствии ключа: всё доставляется непрофильтрованным (kind='fallback').
 - `max_per_cycle=150` — единый бюджет на цикл (candidates + retry ≤ 150).
-- Retry-items с готовым llm_score не тратят бюджет; **urgent восстанавливается из llm_urgent (v10)**.
+- Retry-items с готовым llm_score не тратят бюджет; **urgent восстанавливается из llm_urgent (v10/v11)**.
   Legacy-строки с `llm_urgent=NULL` → `urgent=False`.
 - Balance-алерт: при total_balance < threshold отправляется в Telegram
   (cooldown по check_interval_hours; при is_available=False — лог, НЕ алерт).
@@ -245,7 +245,8 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 Игры (3): IGN, Eurogamer, DTF. Кино (2): Deadline, Variety.
 
 ## Тесты
-**689 тестов, 18 файлов, запуск: `python -m pytest tests -q -p no:randomly`**
+**Тесты, запуск: `python -m pytest tests -q -p no:randomly`**
+(точный список — `pytest --collect-only -q tests/ | grep test_`)
 - `test_llm_batch` — батч-оценка (happy path, per-item fallback, pipeline-интеграция)
 - `test_llm_filter_mocks` — LLM-фильтр (mock client, urgent/route/parse)
 - `test_pipeline_llm` — pipeline + LLM
@@ -264,6 +265,10 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - `test_config_env_collector` — env.py (m2/unquoted-spaces), DEFAULT_CONFIG, collector M1 (max-feed-bytes + httpx.MockTransport)
 - `test_log_sanitizer` — лог-санитизация, лимиты, unicode
 - `test_digest_schedule` — расписание дайджеста
+- `test_storage_hardening` — storage hardening (T1)
+- `test_poller_lifecycle` — poller lifecycle
+- `test_llm_routing` — LLM routing
+- `test_digest_retry` — digest retry
 
 ## Фиксы по ревью (краткий список)
 
@@ -326,6 +331,7 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 | 2b     | recovery_new_limit: K1-recovery ограничен лимитом (500, конфиг); get_all_by_state(state, limit=...) не грузит неограниченный объём в RAM при долгой паузе |
 | 2c     | candidates remainder → increment_retry_count + _check_and_mark_failed (at-least-once для кандидатов; раньше retry_count не инкрементировался при сбое TG API) |
 | v10-PC | v10 post-check: defensive ADD COLUMN llm_urgent при user_version=10 без колонки (конкурентная миграция edge case) |
+| v11    | Создание индексов idx_seen_fetched (seen_titles) и idx_items_state_state_at (items) для оптимизации purge и get_stuck_pending |
 
 ## План этапов
 
@@ -335,21 +341,22 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
   inline-кнопка. R1-фикс: ConsoleDelivery → List[str].
 - [x] Этап 2b-1 (LLM-ядро): ✅ РЕАЛИЗОВАН. DeepSeekClient, LLMFilter,
   SYSTEM_PROMPT v3, config llm.*, env deepseek_api_key(), --check-llm.
-  18/18 тестов на моках.
+  18/18 тестов на моках *(на момент этапа)*.
 - [x] Этап 2b-2a (LLM в pipeline): ✅ РЕАЛИЗОВАН. Schema v4, deferred-state,
   update_llm_results_batch, retry с переиспользованием llm_score.
-  15 новых тестов, итого 33.
+  15 новых тестов, итого 33 *(на момент этапа)*.
 - [x] Этап 2b-2b (баланс-алерт + hardening): ✅ РЕАЛИЗОВАН.
   BalanceInfo, is_available-логика, SCHEMA v5 (meta), send_text, max_per_cycle,
-  try/except evaluate(), finally-close клиента. 40 тестов.
+  try/except evaluate(), finally-close клиента. 40 тестов *(на момент этапа)*.
 - [x] Финальное hardening (после полного code-review): ✅ ЗАВЕРШЕНО.
   Recovery 'new', HTTPError, finally, retry_count/failed/лимит, WAL/busy_timeout,
   save_many N1, cap summary, единый форматтер, маскирование токенов,
   восстановление _set_chat_id (max update_id), и др.
-  **123 теста зелёные.**
+  **123 теста зелёные (на момент этапа). Счётчик после правок — 746 (убран 1 дубль).**
 - [x] Этап 2b-2c (Дайджест): ✅ РЕАЛИЗОВАН. Schema v8, digest.py, build_digest_messages,
   расписание 2×/день (digest.times), ручной --digest, on_empty, гарантия ≤4096,
-  last_digest_at по мета, digested-state, at-least-once. **481 тест зелёный.**
+  last_digest_at по мета, digested-state, at-least-once.
+  **481 тест зелёный (на момент этапа). Счётчик после правок — 746.**
 - [x] Фича «пуш только срочного» (urgent-only routing): ✅ РЕАЛИЗОВАН.
   JSON `urgent` в SYSTEM_PROMPT, FilterResult.urgent, route(urgent, push_urgent_only),
   `llm.push_urgent_only=True` (дефолт), `digest.max_items=30`. Обратная совместимость

@@ -253,9 +253,25 @@ class TelegramPoller:
         self._log.info("Stopping TelegramPoller...")
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=5)
-            self._thread = None
-        self._log.info("TelegramPoller stopped")
+            # Minor-фикс: join с учётом poll_timeout. Long-poll может висеть
+            # до poll_timeout секунд (~25 с); удлиняем timeout соответственно.
+            # НЕ обнуляем _thread если поток ещё alive — это защита от
+            # race с _run_loop: close() может вызваться когда _run_loop ещё
+            # работает и _thread ещё жив, но stop() уже отпустил GIL.
+            # Вместо этого ждём реального завершения потока.
+            join_timeout = self._poll_timeout + 5
+            self._thread.join(timeout=join_timeout)
+            # Только если поток ДЕЙСТВИТЕЛЬНО завершился — обнуляем.
+            # Иначе оставляем reference alive (не создаём второй поллер).
+            if not self._thread.is_alive():
+                self._thread = None
+                self._log.info("TelegramPoller stopped")
+            else:
+                self._log.warning(
+                    "TelegramPoller thread still alive after %.1f s timeout "
+                    "(poll_timeout=%d). Leaving thread reference (no second poller).",
+                    join_timeout, self._poll_timeout,
+                )
 
     # ── poller thread ────────────────────────────────────────────────────────
 
@@ -613,6 +629,16 @@ class TelegramPoller:
         """
         Закрывает HTTP-клиент poller.
         m2: НЕ закрывает Storage — это делает _run_loop в finally (в poller thread).
-        Вызывать только после stop() + join().
+        Minor-фикс: выставляем _stop_event ДО join — защита от сценария,
+        когда close() вызвана БЕЗ предварительного stop().
+        Без set(): если поток в long-poll (25 с), close() без stop() ждёт
+        все 30 с — лишнее ожидание. С set() поток проснётся сразу (через
+        _sleep_backoff с is_set()-проверкой).
         """
+        # Minor-фикс: выставить флаг ДО join — снимает лишнее ожидание
+        # и защищает от close() без предварительного stop().
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._log.debug("close: waiting for poller thread to finish...")
+            self._thread.join(timeout=self._poll_timeout + 5)
         self._client.close()

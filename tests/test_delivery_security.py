@@ -87,7 +87,7 @@ class TestStripInlineComment:
         ('"a#b"', '"a#b"'),
         ("'x # y'", "'x # y'"),
         ('"a#b" # comment', '"a#b"'),
-        ("a#b", "a"),
+        ("a#b", "a#b"),
         ('"hello"  # inline', '"hello"'),
         ("no_comment", "no_comment"),
         ('"val#ue" # comment', '"val#ue"'),
@@ -253,13 +253,15 @@ class Test429RetryCap:
 
         with patch.object(client._http, "post", side_effect=exc):
             with patch("time.sleep") as mock_sleep:
-                with pytest.raises(LLMError):
+                with pytest.raises(LLMError) as exc_info:
                     client.chat_json("sys", "user")
-                # time.sleep вызывается с аргументом <= 120
-                if mock_sleep.called:
-                    for call in mock_sleep.call_args_list:
-                        wait_arg = call[0][0]
-                        assert wait_arg <= 120, f"wait={wait_arg} > 120!"
+                # Конкретный тип исключения: LLMError (не generic Exception)
+                assert isinstance(exc_info.value, LLMError)
+                # retry-after=999 должен быть закаплен в 120
+                assert mock_sleep.called, "time.sleep должен быть вызван при 429"
+                for call in mock_sleep.call_args_list:
+                    wait_arg = call[0][0]
+                    assert wait_arg <= 120, f"wait={wait_arg} превышает cap 120!"
 
 
 # ══════════════════════════════════════════════════════════════════

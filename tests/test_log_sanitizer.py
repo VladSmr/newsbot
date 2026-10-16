@@ -12,6 +12,12 @@ import pytest
 
 from newsbot.log import TokenSanitizer, _sanitize
 
+# ─── Паттерны-заглушки (35 символов, ≥15, гарантированно матчатся регекспом) ───
+_TG_SECRET = "A" * 35
+_TG_TOKEN = "bot" + "123456" + ":" + _TG_SECRET     # матчит re: bot\d+:[A-Za-z0-9_-]{15,}
+_BARE_TOKEN = "123456" + ":" + _TG_SECRET            # матчит re: \d+:[A-Za-z0-9_-]{15,}
+_DS_KEY = "sk-" + "a" * 30                           # матчит re: sk-[A-Za-z0-9]{16,}
+
 
 # ────────────────────────────────────────────────────────────────
 # Юнит-тесты _sanitize()
@@ -22,33 +28,36 @@ class TestSanitizeUnit:
 
     def test_telegram_token_in_msg(self):
         """T4: Telegram-токен с префиксом bot вырезается."""
-        raw = "Token: bot123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
-        assert "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw" not in _sanitize(raw)
-        assert "bot" not in _sanitize(raw)  # только маска
+        raw = "Token: " + _TG_TOKEN
+        sanitized = _sanitize(raw)
+        assert _TG_SECRET not in sanitized
+        assert "bot" not in sanitized  # только маска
 
     def test_naked_token_in_msg(self):
         """T4: Голый токен <digits>:<secret> вырезается."""
-        raw = "Found token 123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw in request"
-        assert "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw" not in _sanitize(raw)
-        assert "123456" not in _sanitize(raw)
+        raw = "Found token " + _BARE_TOKEN + " in request"
+        sanitized = _sanitize(raw)
+        assert _TG_SECRET not in sanitized
+        assert "123456" not in sanitized
 
     def test_deepseek_key_in_msg(self):
         """T4: DeepSeek API key (sk-…) вырезается."""
-        raw = "Authorization: Bearer sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ"
-        assert "sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ" not in _sanitize(raw)
-        assert "***REDACTED***" in _sanitize(raw)
+        raw = "Authorization: Bearer " + _DS_KEY
+        sanitized = _sanitize(raw)
+        assert _DS_KEY not in sanitized
+        assert "***REDACTED***" in sanitized
 
     def test_multiple_tokens_in_msg(self):
         """T4: Несколько секретов в одном сообщении — все вырезаются."""
         raw = (
             "bot789:ABCDefgh1234567890abcdefg "
             "also 999888:XYz1234567890abcdefghij "
-            "and sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ"
+            "and " + _DS_KEY
         )
         result = _sanitize(raw)
         assert "ABCDefgh1234567890abcdefg" not in result
         assert "XYz1234567890abcdefghij" not in result
-        assert "sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ" not in result
+        assert _DS_KEY not in result
         # маска присутствует ≥ 3 раз
         assert result.count("***REDACTED***") >= 3
 
@@ -92,45 +101,51 @@ class TestTokenSanitizerFilter:
     def test_filter_msg_token(self):
         """T4: токен в record.msg вырезается."""
         record = self._make_record(
-            "Telegram API call to bot123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
+            "Telegram API call to " + _TG_TOKEN
         )
         self._apply_filter(record)
-        assert "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw" not in record.msg
+        assert _TG_SECRET not in record.msg
 
     def test_filter_args_positional(self):
         """T4: токен в positional args вырезается."""
+        _secret = "SecretTokenHere"
+        _token = "bot777888:" + _secret
         record = self._make_record(
-            "URL: %s", "https://api.telegram.org/bot777888:SecretTokenHere/sendMessage"
+            "URL: %s", "https://api.telegram.org/" + _token + "/sendMessage"
         )
         self._apply_filter(record)
         # args — tuple, проверяем через getMessage()
-        assert "SecretTokenHere" not in record.getMessage()
+        assert _secret not in record.getMessage()
 
     def test_filter_args_mapping(self):
         """T4: токен в Mapping args (dict) вырезается."""
+        _secret = "VeryLongSecretTokenABCDEF"
+        _token = "bot999000:" + _secret
         record = self._make_record(
-            "Data: %(token)s", {"token": "bot999000:VeryLongSecretTokenABCDEF"}
+            "Data: %(token)s", {"token": _token}
         )
         self._apply_filter(record)
         # args остаётся dict; проверяем getMessage() — подставляет значения
-        assert "VeryLongSecretTokenABCDEF" not in record.getMessage()
+        assert _secret not in record.getMessage()
 
     def test_filter_args_tuple_of_dict(self):
         """T4: токен внутри dict, который сам является элементом args tuple."""
+        _secret = "AbcDefGhIjkLmNoPqRsTuVwXyz123456"
+        _token = "555444:" + _secret
         record = self._make_record(
-            "Request: %s", {"api_token": "555444:AbcDefGhIjkLmNoPqRsTuVwXyz123456"}
+            "Request: %s", {"api_token": _token}
         )
         self._apply_filter(record)
         msg = record.getMessage()
-        assert "AbcDefGhIjkLmNoPqRsTuVwXyz123456" not in msg
+        assert _secret not in msg
 
     def test_filter_deepseek_key_in_msg(self):
         """T4: DeepSeek API key в record.msg вырезается."""
         record = self._make_record(
-            "DeepSeek auth: sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ"
+            "DeepSeek auth: " + _DS_KEY
         )
         self._apply_filter(record)
-        assert "sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ" not in record.msg
+        assert _DS_KEY not in record.msg
 
     def test_filter_stack_info(self):
         """
@@ -140,9 +155,9 @@ class TestTokenSanitizerFilter:
         SanitizingFormatter.format() (проверено end-to-end тестом
         test_traceback_sanitized). Проверяем ключевую функцию _sanitize().
         """
-        text = "During call: bot123456:SecretTokenABCDEFghij"
+        text = "During call: " + _TG_TOKEN
         sanitized = _sanitize(text)
-        assert "SecretTokenABCDEFghij" not in sanitized
+        assert _TG_SECRET not in sanitized
         assert "bot" not in sanitized  # только маска
 
     def test_filter_exc_text(self):
@@ -153,9 +168,11 @@ class TestTokenSanitizerFilter:
         поэтому санация происходит в SanitizingFormatter.format() (проверено
         end-to-end тестом test_traceback_sanitized). Проверяем _sanitize().
         """
-        text = "Traceback (most recent call last):\n  token=bot777888:SecretKEYHereABCDEF\n"
+        _secret = "SecretKEYHereABCDEF"
+        _token = "bot777888:" + _secret
+        text = "Traceback (most recent call last):\n  token=" + _token + "\n"
         sanitized = _sanitize(text)
-        assert "SecretKEYHereABCDEF" not in sanitized
+        assert _secret not in sanitized
         assert "bot" not in sanitized  # только маска
 
 
@@ -184,14 +201,15 @@ class TestSanitizerEndToEnd:
             logger = logging.getLogger("t4_test")
 
             # Сценарий 1: токен в msg
-            logger.info("Bot token: bot123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw")
+            logger.info("Bot token: " + _TG_TOKEN)
             # Сценарий 2: токен в аргументе
-            logger.info("Request URL: https://api.telegram.org/bot888999:SecretHereABCDEF/send")
+            _secret2 = "SecretHereABCDEF"
+            logger.info("Request URL: https://api.telegram.org/bot888999:" + _secret2 + "/send")
             # Сценарий 3: DeepSeek
-            logger.info("Auth header: sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ")
+            logger.info("Auth header: " + _DS_KEY)
             # Сценарий 4: несколько токенов
             logger.info(
-                "Multi: bot111:Tok11111111111111111  222333:Tok22222222222222222  sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ"
+                "Multi: bot111:Tok11111111111111111  222333:Tok22222222222222222  " + _DS_KEY
             )
 
             logger.handlers.clear()  # очищаем после теста
@@ -199,9 +217,9 @@ class TestSanitizerEndToEnd:
             sys.stderr = old_stderr
 
         output = captured.getvalue()
-        assert "AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw" not in output
-        assert "SecretHereABCDEF" not in output
-        assert "sk-9RNDl3vLm2xKp8Yu4ZhQ6wJ" not in output
+        assert _TG_SECRET not in output
+        assert _secret2 not in output
+        assert _DS_KEY not in output
         assert "Tok11111111111111111" not in output
         assert "Tok22222222222222222" not in output
         # Маска присутствует
@@ -213,6 +231,9 @@ class TestSanitizerEndToEnd:
         """
         from newsbot.log import setup_logging
 
+        _secret = "SecretKeyABCDEFGHIJKLMN"
+        _token = "bot555666:" + _secret
+
         old_stderr = sys.stderr
         captured = io.StringIO()
         sys.stderr = captured
@@ -222,7 +243,7 @@ class TestSanitizerEndToEnd:
             logger = logging.getLogger("t4_tb_test")
 
             try:
-                raise RuntimeError("auth=bot555666:SecretKeyABCDEFGHIJKLMN")
+                raise RuntimeError("auth=" + _token)
             except Exception:
                 logger.error("API failed", exc_info=sys.exc_info())
 
@@ -231,4 +252,4 @@ class TestSanitizerEndToEnd:
             sys.stderr = old_stderr
 
         output = captured.getvalue()
-        assert "SecretKeyABCDEFGHIJKLMN" not in output
+        assert _secret not in output

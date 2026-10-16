@@ -159,7 +159,222 @@ def _make_transport(rss_body: bytes, content_encoding: str = ""):
     return httpx.MockTransport(handler), lambda: call_count
 
 
-class TestCollectorHttpMock:
+# ── collector.py: M3 — SSRF-защита (scheme-валидация) ──────────────────────────
+
+
+class TestCollectorUrlValidation:
+    """M3-фикс: collector валидирует URL до HTTP-запроса (только http/https + непустой хост)."""
+
+    def test_validate_url_http_https(self):
+        from newsbot.collector import FeedCollector
+
+        c = FeedCollector([{"name": "x", "url": "http://example.com/rss"}])
+        assert c._validate_url("http://example.com/rss") is True
+        assert c._validate_url("https://example.com/rss") is True
+        c.close()
+
+    def test_validate_url_rejects_file_ftp_mailto(self):
+        from newsbot.collector import FeedCollector
+
+        c = FeedCollector([{"name": "x", "url": "http://x"}])
+        assert c._validate_url("file:///etc/passwd") is False
+        assert c._validate_url("ftp://example.com/rss") is False
+        assert c._validate_url("mailto://user@example.com") is False
+        assert c._validate_url("javascript:alert(1)") is False
+        c.close()
+
+    def test_validate_url_rejects_empty_host(self):
+        from newsbot.collector import FeedCollector
+
+        c = FeedCollector([{"name": "x", "url": "http://x"}])
+        assert c._validate_url("http://") is False
+        assert c._validate_url("https://:8080") is False
+        assert c._validate_url("http:///path") is False
+        assert c._validate_url("https:///") is False
+        c.close()
+
+    def test_collect_rejects_bad_scheme(self):
+        from newsbot.collector import FeedCollector
+
+        collector = FeedCollector([
+            {"name": "bad_feed", "url": "file:///etc/passwd"},
+            {"name": "good_feed", "url": "http://example.com/rss"},
+        ])
+        try:
+            results = list(collector.collect())
+            assert len(results) == 1
+            assert results[0][0] == "good_feed"
+        finally:
+            collector.close()
+
+
+# ── env.py: B9 — inline comment (# внутри значения) ────────────────────────────
+
+
+class TestEnvInlineComment:
+    """B9-фикс (rev2): # — комментарий только если пробел перед ним (или начало строки),
+    внутри кавычек не трогается."""
+
+    def test_hash_inside_double_quotes_preserved(self, tmp_path):
+        """KEY="value#with#hashes" → значение сохраняет все #."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('SECRET_WITH_HASH="abc#123#xyz"\n', encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("SECRET_WITH_HASH") == "abc#123#xyz", \
+                f"Expected 'abc#123#xyz', got {result.get('SECRET_WITH_HASH')!r}"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+    def test_hash_inside_single_quotes_preserved(self, tmp_path):
+        """KEY='x#y#z' → значение сохраняет все #."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("SECRET_WITH_HASH='x#y#z'\n", encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("SECRET_WITH_HASH") == "x#y#z", \
+                f"Expected 'x#y#z', got {result.get('SECRET_WITH_HASH')!r}"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+    def test_hash_outside_quotes_with_space_is_comment(self, tmp_path):
+        """KEY=value # comment → comment отрезается, KEY="value"."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=value # comment\n", encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("KEY") == "value", f"Got {result.get('KEY')!r}"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+    def test_hash_in_value_with_trailing_comment(self, tmp_path):
+        """KEY="a#b" # comment → VALUE="a#b", comment отрезан."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('KEY="a#b" # this is a comment\n', encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("KEY") == "a#b", f"Got {result.get('KEY')!r}"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+
+# ── env.py: M2 — ровно одна пара кавычек ──────────────────────────────────────
+
+
+class TestEnvExactOneQuotePair:
+    """M2-фикс: снимается ровно ОДНА парная кавычка, не все по краям."""
+
+    def test_trailing_quote_not_stripped(self, tmp_path):
+        """KEY=VALUE" → VALUE" (не VALUE); VALUE" — валидный secret."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('API_TOKEN=secret123"\n', encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("API_TOKEN") == 'secret123"', \
+                f"Expected 'secret123\"', got {result.get('API_TOKEN')!r}"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+    def test_leading_quote_not_stripped(self, tmp_path):
+        """KEY="VALUE → "VALUE (не VALUE)."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('API_TOKEN="VALUE\n', encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("API_TOKEN") == '"VALUE', \
+                f"Expected '\"VALUE', got {result.get('API_TOKEN')!r}"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+    def test_double_quotes_exact_pair_removed(self, tmp_path):
+        """KEY="VALUE" → VALUE."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('KEY="VALUE"\n', encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("KEY") == "VALUE"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+    def test_single_quotes_exact_pair_removed(self, tmp_path):
+        """KEY='VALUE' → VALUE."""
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY='VALUE'\n", encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("KEY") == "VALUE"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+    def test_double_quoted_with_spaces(self, tmp_path):
+        """KEY="hello world" → hello world."""
+        env_file = tmp_path / ".env"
+        env_file.write_text('KEY="hello world"\n', encoding="utf-8")
+
+        import newsbot.env
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+        try:
+            result = newsbot.env.load_env()
+            assert result.get("KEY") == "hello world"
+        finally:
+            newsbot.env._cache = None
+            newsbot.env._ENV_PATH = None
+
+
+# ── collector.py: httpx.MockTransport-тесты (happy-path / overflow / gzip) ───
+
+
+class TestCollectorMockTransport:
     """httpx.MockTransport: happy-path, overflow, gzip-overflow."""
 
     def test_happy_path_parses_rss_and_returns_items(self):

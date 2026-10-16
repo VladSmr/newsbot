@@ -89,21 +89,19 @@ def _render_item_raw(item: NewsItem) -> Tuple[str, str, str, str]:
     url_clean = is_valid_http_url(item.url or "")
 
     if url_clean:
-        # M1'-фикс: cap по ESCAPED длине — "&"/'"' раздуваются в 6 раз.
-        # Ограничиваем raw URL так, чтобы после escape ≤ _MAX_FOOTER_URL_ESC_LEN.
         url_esc = html.escape(url_clean)
         if len(url_esc) > _MAX_FOOTER_URL_ESC_LEN:
-            # Урезаем raw так, чтобы после escape гарантированно влезло.
-            # Бинарный поиск по аналогии с body: lo..hi = 0..len(url_clean)
-            lo, hi = 0, len(url_clean)
-            while lo < hi:
-                mid = (lo + hi + 1) // 2
-                if len(html.escape(url_clean[:mid])) <= _MAX_FOOTER_URL_ESC_LEN:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            url_esc = html.escape(url_clean[:lo])
-        footer = f'{time_str} <a href="{url_esc}">🔗</a>'
+            # Minor-фикс: НЕ обрезаем URL-prefix (дает битую ссылку).
+            # Вместо этого отдаём футер БЕЗ <a> — валидный HTML, без ссылки.
+            # Пользователь увидит время и текст, но не получит битой ссылки.
+            logger.debug(
+                "URL слишком длинный (%d escaped, лимит %d) — "
+                "футер без ссылки для %s",
+                len(url_esc), _MAX_FOOTER_URL_ESC_LEN, url_clean[:60],
+            )
+            footer = time_str
+        else:
+            footer = f'{time_str} <a href="{url_esc}">🔗</a>'
     else:
         footer = time_str
     return title_raw, source_raw, raw_body, footer
@@ -319,9 +317,29 @@ def _send_digest_with_targets(
     """
     sent_urls: List[str] = []
     sent_groups: List[Tuple[str, List[NewsItem]]] = []
-    n_groups = len(groups)
 
     try:
+        # Minor-фикс: zip молча обрезает хвост при рассинхроне длин.
+        # Логируем рассинхрон и дополняем пустыми кнопками, чтобы
+        # ни одна группа не потерялась.
+        n_groups = len(groups)
+        n_buttons = len(item_buttons_per_msg)
+        if n_groups != n_buttons:
+            logger.warning(
+                "Дайджест: рассинхрон groups=%d vs item_buttons_per_msg=%d — "
+                "%s",
+                n_groups, n_buttons,
+                "дополняем пустыми кнопками для лишних групп"
+                if n_groups > n_buttons
+                else "обрезаем лишние кнопки",
+            )
+            if n_groups > n_buttons:
+                item_buttons_per_msg = list(item_buttons_per_msg) + [
+                    [] for _ in range(n_groups - n_buttons)
+                ]
+            else:
+                item_buttons_per_msg = list(item_buttons_per_msg[:n_groups])
+
         for i, ((msg, group_items), item_buttons) in enumerate(
             zip(groups, item_buttons_per_msg), 1
         ):

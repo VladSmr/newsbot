@@ -510,28 +510,61 @@ class NewsPipeline:
                 self._llm_dedup_skipped_urls.clear()
 
         # ── B13: retry-очередь обрабатывается ПЕРЕД кандидатами ──
-        # резервируем не менее половины бюджета под retry при наличии таковых
+        # M1-фикс: scored items (llm_score уже сохранён) НЕ тратят LLM-бюджет.
+        #   — Разделяем stuck на scored (retry без LLM) и fresh (требуют оценки).
+        #   — Scored обрабатываются БЕЗ ограничения бюджетом.
+        #   — Fresh обрабатываются в рамках retry_budget (как и раньше).
+        # Это решает проблему «голодовки» при _llm_calls_left==0:
+        #   при исчерпанном бюджете scored-pending всё равно доставляются.
         stuck = self.storage.get_stuck_pending(
             max_age_seconds=threshold,
             max_retries=self._max_retries,
         )
 
-        retry_budget: int
         if stuck:
-            retry_budget = max(self._llm_calls_left // 2, len(stuck))
-            retry_budget = min(retry_budget, self._llm_calls_left)
-            logger.info(
-                "B13: retry queue %d items — резервируем бюджет %d/%d; "
-                "retry-очередь ПЕРЕД кандидатами (%d new + %d recovered)",
-                len(stuck), retry_budget, self._max_per_cycle, len(candidates), len(recovered),
-            )
-            # C1: _process_batch возвращает НЕВЫПОЛНЕННЫЕ URL
-            failed_retry_urls = self._process_batch(stuck, budget_override=retry_budget)
-            # инкрементируем retry_count ТОЛЬКО для невыполненных
-            if failed_retry_urls:
-                self.storage.increment_retry_count(failed_retry_urls)
-                # B3: терминализируем только невыполненные, превысившие лимит
-                self._check_and_mark_failed(failed_retry_urls)
+            # Разделяем scored vs fresh для справедливого учёта бюджета
+            stuck_scored = [item for item in stuck if item.llm_score is not None]
+            stuck_fresh = [item for item in stuck if item.llm_score is None]
+
+            # Scored: обрабатываются БЕЗ ограничения LLM-бюджетом
+            # Major-фикс: budget_override=len(stuck_scored) — явно резервируем
+            # бюджет для scored-items. При _llm_calls_left==0 бюджет всё равно
+            # расходуется только fresh-items (retry_batch пропускает LLM), scored
+            # доставляются без среза.
+            if stuck_scored:
+                logger.info(
+                    "B13: retry queue %d items (%d scored, %d fresh), "
+                    "LLM-бюджет=%d/%d",
+                    len(stuck), len(stuck_scored), len(stuck_fresh),
+                    self._llm_calls_left, self._max_per_cycle,
+                )
+                failed_retry_scored = self._process_batch(
+                    stuck_scored, budget_override=len(stuck_scored)
+                )
+                if failed_retry_scored:
+                    self.storage.increment_retry_count(failed_retry_scored)
+                    self._check_and_mark_failed(failed_retry_scored)
+            else:
+                failed_retry_scored = []
+
+            # Fresh retry: бюджет по-старому (минимум половины или len, кламп)
+            retry_budget: int
+            if stuck_fresh:
+                retry_budget = max(self._llm_calls_left // 2, len(stuck_fresh))
+                retry_budget = min(retry_budget, self._llm_calls_left)
+                if stuck_scored:
+                    logger.info(
+                        "B13: retry fresh %d items — бюджет %d/%d",
+                        len(stuck_fresh), retry_budget, self._llm_calls_left,
+                    )
+                failed_retry_fresh = self._process_batch(stuck_fresh, budget_override=retry_budget)
+                if failed_retry_fresh:
+                    self.storage.increment_retry_count(failed_retry_fresh)
+                    self._check_and_mark_failed(failed_retry_fresh)
+                # Объединяем невыполненные scored + fresh
+                failed_retry_urls = failed_retry_scored + failed_retry_fresh
+            else:
+                failed_retry_urls = failed_retry_scored
         else:
             retry_budget = 0
 
@@ -953,16 +986,33 @@ class NewsPipeline:
         # Nit T4-фикс: одно чтение вместо двух (ранее было limit=1 + limit=max_items).
         # Deferred items читаем ОДИН раз, используем для обеих проверок.
         deferred_items = self.storage.get_deferred_items(limit=max_items)
+
+        # M2-фикс: при пустом deferred + on_empty=skip пишем маркер ОКНА,
+        # чтобы _maybe_run_digest не спамил в следующем цикле.
         if not deferred_items and not force:
             if on_empty == "skip":
-                logger.debug("Дайджест: нет отложенных новостей, пропускаем.")
+                logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
+                self.storage.set_meta(
+                    "last_digest_at",
+                    datetime.now(tz.utc).isoformat(),
+                )
                 return 0
+            # on_empty=send: обрабатывается дальше (пустое уведомление)
 
         # ── Feedback targets + передача готовых groups в digest ──
         # F2: только при TelegramDelivery + feedback.enabled + digest_enabled.
         # digest_enabled=false (дефолт): не создаём targets (экономия БД-записей),
         # item_buttons_per_msg=None → send_text (без клавиатуры).
-        # m2-фикс: единый источник — groups строятся ОДИН раз в pipeline,
+        # m2-фикс: единый источник — groups строятся ОДИН раз в pipeline.
+        # Critical-фикс: deferred НЕ терминализируются по неуспешным попыткам
+        # дайджеста. Retry_count для deferred не инкрементируется в цикле
+        # дайджеста. Deferred-items остаются в 'deferred' до успешной
+        # отправки (at-least-once) или штатного retention-purge.
+        # NOTE: retention-purge для 'deferred' реализован через
+        # deferred_retention_days в purge_items (deferred удаляются по age).
+        # При транзиентном сбое отправки deferred-items остаются в очереди
+        # и повторяются в следующем окне.
+
         # передаются в run_digest() (без пересчёта).
         # Порядок кнопок СТРОГО соответствует порядку новостей в groups.
         feedback_cfg = self.config.get("feedback", {})
@@ -1020,29 +1070,42 @@ class NewsPipeline:
             item_buttons_per_msg=item_buttons_per_msg,
         )
 
-        # N1: last_digest_at пишется ТОЛЬКО при sent_count>0.
+        # Critical-фикс: retry_count для deferred НЕ инкрементируется,
+        # deferred НЕ терминализируются. При транзиентном сбое они остаются
+        # в очереди и повторяются в следующем окне. last_digest_at пишется
+        # только при успешной отправке (sent_count>0), обеспечивая retry.
+        # Retention-purge для deferred реализован в purge_items
+        # (deferred_retention_days), но терминализация по retry НЕ применяется.
+
+        # M2-фикс: last_digest_at пишется ПРИ ЛЮБОМ корректном завершении окна.
+        # (a) sent>0: items отправлены → digested, окно обработано.
+        # (б) пустой deferred + on_empty=skip: окно корректно проверено,
+        #     слать нечего → пишем маркер (не спамим в следующем цикле).
+        # (в) пустой deferred + on_empty=send: пустое уведомление отправлено → окно обработано.
+        # (г) on_empty=send + force + пустой deferred: тоже пишем маркер.
         # При транзиентном сбое (все отправки failed) окно НЕ помечается
         # обработанным — retry в следующем цикле, а не через 12ч.
+        now_iso = datetime.now(tz.utc).isoformat()
         if sent_count > 0:
             logger.info("Дайджест: %d новостей → 'digested'", sent_count)
-            self.storage.set_meta(
-                "last_digest_at",
-                datetime.now(tz.utc).isoformat(),
-            )
+            self.storage.set_meta("last_digest_at", now_iso)
+        elif not deferred_items and on_empty == "skip":
+            # M2: окно проверено, слать нечего → пишем маркер чтобы
+            # _maybe_run_digest не запускал повторно в следующем цикле.
+            logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
+            self.storage.set_meta("last_digest_at", now_iso)
         elif not deferred_items and on_empty == "send":
             # on_empty=send: отправляем пустое уведомление
             empty_msg = "📰 Дайджест — нет новых новостей."
             try:
                 self.delivery.send_text(empty_msg)
                 logger.info("Дайджест: пустой дайджест отправлен (on_empty=send)")
-                # force+on_empty=send: пустой дайджест отправлен → окно обработано
-                self.storage.set_meta(
-                    "last_digest_at",
-                    datetime.now(tz.utc).isoformat(),
-                )
+                self.storage.set_meta("last_digest_at", now_iso)
             except Exception as e:
                 logger.warning("Дайджест: пустой дайджест не отправлен: %s", e)
         else:
+            # sent_count==0 при непустом deferred — транзиентный сбой,
+            # маркер НЕ пишем, retry в следующем цикле.
             logger.debug("Дайджест: пропущен (empty, force=%s)", force)
 
         return sent_count

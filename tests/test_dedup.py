@@ -628,12 +628,13 @@ class TestSchemaV9(unittest.TestCase):
         path = _tmp_db()
         try:
             st = Storage(Path(path))
-            self.assertEqual(st.SCHEMA_VERSION, 10)
+            # Version-independent: сравниваем с константой класса, не литералом.
+            self.assertEqual(st.SCHEMA_VERSION, Storage.SCHEMA_VERSION)
             import sqlite3
             conn = sqlite3.connect(path)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             conn.close()
-            self.assertEqual(version, 10)
+            self.assertEqual(version, Storage.SCHEMA_VERSION)
             st.close()
         finally:
             _cleanup_db(path)

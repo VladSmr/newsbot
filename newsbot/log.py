@@ -30,13 +30,19 @@ def _sanitize(text: str) -> str:
 
 class TokenSanitizer(logging.Filter):
     """
-    Filter вырезает Telegram-токены из лог-сообщений.
-    Паттерн: bot<digits>:<alphanum_string_len>=15.
+    Filter вырезает Telegram/DeepSeek-токены из лог-сообщений.
     Belt-and-suspenders — доп.защита, если httpx/httpcore
     всё же успеют залогировать URL до понижения уровня.
 
-    Подход: msg и args санируются, getMessage() вызывает
-    _LogRecord__original_getMessage или форматируется через санированный msg % args.
+    Подход (T4-фикс):
+      - msg санируется через _sanitize().
+      - args санируются: tuple (все элементы), Mapping (dict values).
+        Это покрывает logger.warning("URL: %s", url_with_token) —
+        getMessage() делает msg % args → токен попадает в результат,
+        если args не санировать.
+      - exc_text и stack_info санируются на уровне filter().
+      - SanitizingFormatter дублирует санацию на уровне итоговой строки
+        (покрывает вычисляемое exc_text, у которого нет сеттера в LogRecord).
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

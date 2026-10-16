@@ -242,7 +242,7 @@ class TestStorageLLM:
             conn2 = sqlite3.connect(path)
             ver = conn2.execute("PRAGMA user_version").fetchone()[0]
             conn2.close()
-            assert ver == 10, f"ожидалась v10, получена v{ver}"
+            assert ver == Storage.SCHEMA_VERSION, f"ожидалась v{Storage.SCHEMA_VERSION}, получена v{ver}"
 
             # старые данные на месте
             items = s.get_all_by_state("delivered")
@@ -1345,7 +1345,7 @@ class TestStorageUrgent:
 
         # Миграция
         s = Storage(db_path)
-        assert sqlite3.connect(str(db_path)).execute("PRAGMA user_version").fetchone()[0] == 10
+        assert sqlite3.connect(str(db_path)).execute("PRAGMA user_version").fetchone()[0] == Storage.SCHEMA_VERSION
 
         # Колонка llm_urgent добавлена
         conn2 = sqlite3.connect(str(db_path))
@@ -1379,7 +1379,7 @@ class TestStorageUrgent:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
         conn.close()
         assert "llm_urgent" in cols
-        assert sqlite3.connect(str(s.db_path)).execute("PRAGMA user_version").fetchone()[0] == 10
+        assert sqlite3.connect(str(s.db_path)).execute("PRAGMA user_version").fetchone()[0] == Storage.SCHEMA_VERSION
         s.close()
 
 
@@ -1566,11 +1566,11 @@ class TestBalanceAlert:
             s.set_meta("__test_key__", "test_value")
             assert s.get_meta("__test_key__") == "test_value"
 
-            # user_version = 6
+            # user_version = Storage.SCHEMA_VERSION
             conn3 = sqlite3.connect(path)
             v = conn3.execute("PRAGMA user_version").fetchone()[0]
             conn3.close()
-            assert v == 10, f"ожидалась v10, получена v{v}"
+            assert v == Storage.SCHEMA_VERSION, f"ожидалась v{Storage.SCHEMA_VERSION}, получена v{v}"
 
             s.close()
         finally:

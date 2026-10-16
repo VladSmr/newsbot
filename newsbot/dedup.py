@@ -60,7 +60,7 @@ _STOP_WORDS = {"the", "and", "for", "that", "this", "with", "from", "were", "was
 
 
 def _number_multiset(text: str) -> Counter:
-    """
+    r"""
     Мультимножество цифровых последовательностей из нормализованного текста.
     Жёсткий guard: разные мультимножества → НЕ дубль.
     "\d+(?:[.,]\\d+)?" на нормализованном тексте = просто \d+ (точки/запятые
@@ -145,7 +145,7 @@ def _quick_filter(norm: str, candidates: List[Tuple]) -> List[Tuple]:
 def _is_fuzzy_similar(
     a: str, b: str, threshold: float, token_threshold: float,
 ) -> bool:
-    """
+    r"""
     Сравнивает два нормализованных заголовка через SequenceMatcher
     с дополнительной защитой от ложных склеек.
 

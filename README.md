@@ -14,7 +14,7 @@ cd newsbot
 # На GitHub основная ветка — main (если git checkout не переключил автоматически):
 git checkout main
 
-# 1. Виртуальное окружение (Python 3.12)
+# 1. Виртуальное окружение (Python 3.8+, реально используется 3.12)
 python -m venv venv
 source venv/bin/activate      # Linux/macOS
 .\venv\Scripts\activate       # Windows
@@ -76,7 +76,8 @@ newsbot/                  ← проектный корень
 ├── requirements.txt
 ├── setup.py
 ├── MANIFEST.in
-├── tests/                # 689 тестов (18 файлов, запуск: python -m pytest tests -q)
+├── tests/                # тесты: запуск `python -m pytest tests -q`
+                      # список файлов: `pytest --collect-only -q tests/ | grep test_`
 └── data/                 # newsbot.db, newsbot.db-wal, newsbot.db-shm
 ```
 
@@ -186,7 +187,7 @@ llm:
 `push_urgent_only=false` (обратная совместимость): `score≥7` → пуш,
 игнорирует `urgent`.
 
-**Retry-семантика:** `llm_urgent` персистентен (БД-схема v10, колонка `items.llm_urgent` INTEGER 0/1).
+**Retry-семантика:** `llm_urgent` персистентен (БД-схема v11, колонка `items.llm_urgent` INTEGER 0/1).
 При retry: срочность восстанавливается из БД → `FilterResult(..., urgent=bool(llm_urgent))`.
 Legacy-строки (до v10, `llm_urgent=NULL`) получают `urgent=False` (безопасный дефолт).
 
@@ -427,13 +428,13 @@ TELEGRAM_CHAT_ID=<привязанный chat_id>
 DEEPSEEK_API_KEY=<ключ от platform.deepseek.com>
 ```
 
-## Схема БД (v10, идемпотентные миграции v1→v10)
+## Схема БД (v11, идемпотентные миграции v1→v11)
 
 ```sql
 -- items: state-машина
 items: id, source, url, title, summary, published, fetched_at,
        state, state_at, llm_score, llm_summary, llm_reason,
-       llm_urgent INTEGER (v10, 0/1), filtered_at, retry_count
+       llm_urgent INTEGER (v10/v11, 0/1), filtered_at, retry_count
 
 -- seen_titles: title-dedup, TTL 30 дней (v9: + title_normalized для fuzzy)
 seen_titles: id, title_hash, source, fetched_at, expires_at, title_normalized
@@ -458,13 +459,16 @@ feedback: id, target_id UNIQUE, url, source, title, summary, llm_score,
 ```bash
 python -m pytest tests -q
 ```
-**689 тестов, 18 файлов:** `test_llm_batch`, `test_llm_filter_mocks`
+**Тесты**: запуск `python -m pytest tests -q -p no:randomly`
+(точный список файлов — `pytest --collect-only -q tests/ | grep test_`):
+`test_llm_batch`, `test_llm_filter_mocks`
 (urgent/route/parse), `test_pipeline_llm`, `test_core_reliability`,
 `test_delivery_security`, `test_digest`, `test_digest_feedback`,
 `test_feedback_storage`, `test_feedback_flow`, `test_telegram_poller`,
 `test_feedback_prompt`, `test_dedup`, `test_dedup_llm`, `test_offpeak`,
 `test_pause`, `test_config_env_collector`, `test_log_sanitizer`,
-`test_digest_schedule`. Запуск: `python -m pytest tests -q -p no:randomly`.
+`test_digest_schedule`, `test_storage_hardening`, `test_poller_lifecycle`,
+`test_llm_routing`, `test_digest_retry`. Запуск: `python -m pytest tests -q -p no:randomly`.
 
 ## Известные ограничения
 
@@ -480,7 +484,7 @@ python -m pytest tests -q
 
 ## Требования
 
-- Python 3.12
+- Python 3.8+ (протестировано на 3.12)
 
 ## Деплой на VPS (Docker)
 

@@ -10,8 +10,18 @@ state-машина:
   digested  — терминальный; отправлен в дайджесте
 
 Дедуп:
-  (a) точный URL — ВСЕ записи (не зависит от state)
-  (b) нормализованный заголовок + source — TTL 30 дней
+  (a) точный URL — ВСЕ записи (не зависит от state; навсегда, до purge).
+      URL уникальность защищена UNIQUE INDEX.
+  (b) нормализованный заголовок + source — TTL 30 дней (см. _TITLE_DEDUP_TTL_DAYS).
+      seen_titles периодически purge'ится по expires_at.
+
+  NOTE: штатный дедуп — навсегда (URL хранится, пока существует запись).
+  Автоочистка: purge_* процедуры удаляют записи старше retention (default 90 дней).
+  Для больших таблиц (сотни тысяч строк) рекомендуется периодический
+  PRAGMA incremental_vacuum для высвобождения pages — штатный VACUUM заблокирует
+  БД на время перезаписи. auto_vacuum=INCREMENTAL выставляется при создании БД.
+  На существующих БД с auto_vacuum=FULL рекомендуется ручной переход:
+  PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum — без блокировки записи.
 
 INSERT OR IGNORE + UNIQUE-констрейнты защищают от дубликатов.
 """
@@ -40,7 +50,7 @@ class Storage:
     Идемпотентность: user_version выставляется ПОСЛЕ успешной миграции.
     """
 
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
     STATES = ("new", "pending", "delivered", "skipped", "deferred", "failed", "digested")
     DEFAULT_RETENTION_DAYS = 90
     DEFAULT_RETRY_THRESHOLD_SECONDS = 60
@@ -109,7 +119,9 @@ class Storage:
         try:
             row = conn.execute("PRAGMA user_version").fetchone()
             return int(row[0]) if row else 0
-        except Exception:
+        except Exception as e:
+            # NIT: PRAGMA не должен падать — это ошибка конфигурации БД или corruption.
+            logger.error("Не удалось прочитать PRAGMA user_version: %s", e)
             return 0
 
     def _init_db(self) -> None:
@@ -261,6 +273,10 @@ class Storage:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_seen_title_source "
             "ON seen_titles(title_hash, source)",
             "CREATE INDEX IF NOT EXISTS idx_seen_ttl ON seen_titles(expires_at)",
+            # M1: ускоряет get_recent_normalized_titles — запрос WHERE fetched_at > ?
+            "CREATE INDEX IF NOT EXISTS idx_seen_fetched ON seen_titles(fetched_at)",
+            # Minor#7: составной индекс для purge и get_recent_titles
+            "CREATE INDEX IF NOT EXISTS idx_items_state_state_at ON items(state, state_at)",
         ):
             try:
                 conn.execute(stmt)
@@ -289,11 +305,19 @@ class Storage:
         ).fetchall()}
 
         if "feedback_targets" in existing_tables:
-            # F1: для get_or_create (составной: url + kind)
-            self._create_index_ignore_errors(
-                conn, "idx_feedback_targets_url_kind",
-                "feedback_targets", "url, kind",
-            )
+            # F1/Minor#4: UNIQUE-индекс (url, kind) для feedback_targets.
+            # Для старых БД: v11-миграция дедуплицирует дубли и создаёт UNIQUE INDEX.
+            # Для новых БД: CREATE UNIQUE INDEX IF NOT EXISTS.
+            try:
+                conn.execute(
+                    "DROP INDEX IF EXISTS idx_feedback_targets_url_kind"
+                )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_targets_url_kind "
+                    "ON feedback_targets(url, kind)"
+                )
+            except (sqlite3.IntegrityError, sqlite3.OperationalError):
+                pass  # дубли в данных или конкурентный процесс
             self._create_index_ignore_errors(
                 conn, "idx_feedback_targets_created",
                 "feedback_targets", "created_at",
@@ -640,6 +664,67 @@ class Storage:
                         raise
                     logger.info("v10: колонка llm_urgent уже существует (конкурентный процесс)")
 
+        # (й) v11: индекс seen_titles(fetched_at) для get_recent_normalized_titles
+        # и составной индекс (state, state_at) для purge и get_recent_titles.
+        # Для новых БД индексы создаются через _create_indexes (идемпотентно).
+        # Для старых — поднимаем user_version и применяем идемпотентно.
+        # IF NOT EXISTS = безопасно при повторном запуске.
+        if "seen_titles" in {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}:
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_seen_fetched "
+                    "ON seen_titles(fetched_at)"
+                )
+                logger.info("Миграция v11: создан индекс idx_seen_fetched")
+            except sqlite3.OperationalError:
+                pass  # уже существует или конкурентный процесс
+        # Составной индекс на items: безопасен даже без таблицы
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_items_state_state_at "
+                "ON items(state, state_at)"
+            )
+            logger.info("Миграция v11: создан индекс idx_items_state_state_at")
+        except sqlite3.OperationalError:
+            pass
+
+        # (й) v11: UNIQUE(url, kind) на feedback_targets (Minor#4).
+        # Для старых БД: дедуплицируем дубли (удаляем младшие id) перед
+        # созданием уникального индекса. SQLite не поддерживает ALTER TABLE
+        # ADD CONSTRAINT → создаём UNIQUE INDEX. Для свежей БД — в _create_indexes.
+        if "feedback_targets" in {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}:
+            # Дедуп: удаляем строки с дублирующимися (url, kind),
+            # оставляя запись с НАИМЕНЬШИМ id (первая по времени).
+            try:
+                conn.execute("""
+                    DELETE FROM feedback_targets
+                    WHERE id NOT IN (
+                        SELECT MIN(id)
+                        FROM feedback_targets
+                        GROUP BY url, kind
+                    )
+                """)
+                logger.info("v11: дедуплицированы дубли feedback_targets")
+            except sqlite3.OperationalError as e:
+                logger.warning("v11: дедуп feedback_targets пропущен: %s", e)
+            # Создаём UNIQUE INDEX. DROP INDEX IF EXISTS для безопасности
+            # (в старых БД может быть не-unique idx_feedback_targets_url_kind).
+            try:
+                conn.execute(
+                    "DROP INDEX IF EXISTS idx_feedback_targets_url_kind"
+                )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_targets_url_kind "
+                    "ON feedback_targets(url, kind)"
+                )
+                logger.info("Миграция v11: создан UNIQUE idx_feedback_targets_url_kind")
+            except sqlite3.OperationalError:
+                pass  # конкурентный процесс уже создал
+
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -746,8 +831,16 @@ class Storage:
                         )
 
             return inserted > 0
+        except sqlite3.IntegrityError:
+            # UNIQUE constraint / CHECK — штатный дедуп (URL уже есть), не ошибка.
+            return False
         except Exception as e:
-            logger.warning("Ошибка save(%s): %s", item.title[:60], e)
+            # M2: логируем на уровне error, чтобы отличать баг от дедупа.
+            # INSERT OR IGNORE при дедупе НЕ выбрасывает исключение — только
+            # IntegrityError при реальных constraint-нарушениях, что невозможно
+            # при INSERT OR IGNORE с UNIQUE(url). Сюда попадают I/O, диск full,
+            #corruption — это баги, а не штатное поведение.
+            logger.exception("Ошибка save(%s): %s", item.title[:60], e)
             return False
 
     def save_many(self, items: List[NewsItem]) -> List[NewsItem]:
@@ -819,8 +912,12 @@ class Storage:
                                 seen_keys.add(key)
 
             return inserted_items
+        except sqlite3.IntegrityError:
+            # Штатный дедуп: конфликт UNIQUE — не ошибка, просто пропускаем батч.
+            return inserted_items  # уже вставленные items остаются
         except Exception as e:
-            logger.warning("Ошибка save_many(%d items): %s", len(items), e)
+            # M2: логируем на уровне error. Сюда попадают I/O, corruption, etc.
+            logger.exception("Ошибка save_many(%d items): %s", len(items), e)
             return []
 
     def set_state(self, urls: List[str], new_state: str) -> int:
@@ -867,7 +964,14 @@ class Storage:
         """
         Возвращает items state='pending' старше max_age_seconds
         с retry_count < max_retries (не терминальные).
-        'failed' items сюда не попадают: они терминальные, не retry'ятся.
+
+        M3: порог 60 с защищает «в работе» — pending младше порога
+        пропускается и обрабатывается в штатном цикле pipeline.
+        На следующем цикле (через >=60 с) они попадут сюда, если still pending.
+
+        Элементы с retry_count >= max_retries попадают ВРУЧНУЮ в recover_stuck_pending,
+        который снимает их сразу (без ожидания 60 с) — recover вызывается
+        ДО get_stuck_pending на старте цикла.
         """
         if max_age_seconds is None:
             max_age_seconds = self.DEFAULT_RETRY_THRESHOLD_SECONDS
@@ -879,7 +983,7 @@ class Storage:
         ).isoformat()
         rows = conn.execute(
             """
-            SELECT source, url, title, summary, published, fetched_at, state_at,
+            SELECT source, url, title, summary, published, fetched_at,
                    llm_score, llm_summary, llm_reason, llm_urgent, retry_count
             FROM items
             WHERE state = 'pending'
@@ -999,42 +1103,51 @@ class Storage:
     def recover_stuck_pending(self, max_retries: int, retry_threshold_sec: int = None) -> int:
         """
         C2: на старте цикла переводит зависшие 'pending' с retry_count >= max_retries
-        в терминальный 'failed'. Защита от зависания: если max_retries уменьшили
-        в конфиге — старые items с retry_count >= нового лимита получат 'failed'.
+        в терминальный 'failed'.
+
+        M3-фикс: при retry_count >= max_retries элемент ТЕРМИНАЛЬНЫЙ — его возраст
+        не имеет значения. recover снимает такие элементы НЕЗАВИСИМО от возраста.
+        Это предотвращает зависшие «мертвые» pending (например, при падении бота
+        сразу после set_state(pending)), которые могли бы висеть часами.
+
+        Для retry_count < max_retries применяется порог 60 с (защита «в работе»).
 
         Args:
             max_retries: лимит попыток
-            retry_threshold_sec: окно «зависания» — pending старше этого
-                                 порога. Если None — DEFAULT_RETRY_THRESHOLD_SECONDS.
+            retry_threshold_sec: окно «зависания» для retry_count < max_retries.
+                                 Если None — DEFAULT_RETRY_THRESHOLD_SECONDS (60 с).
+                                 Для retry_count >= max_retries игнорируется.
         """
         if retry_threshold_sec is None:
             retry_threshold_sec = self.DEFAULT_RETRY_THRESHOLD_SECONDS
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=retry_threshold_sec)
         ).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        total = 0
         try:
             with self._tx() as conn:
+                # M3 (primary): терминальные (retry_count>=max) — снимаем БЕЗ возрастного
+                # фильтра. recover вызывается на старте цикла ДО get_stuck_pending.
+                # Это защищает от зависших «мёртвых» pending, которые не успели
+                # состариться (младше 60 с), но retry_count уже исчерпан.
                 cur = conn.execute(
                     """
                     UPDATE items
                     SET state = 'failed', state_at = ?
                     WHERE state = 'pending'
                       AND retry_count >= ?
-                      AND state_at < ?
                     """,
-                    (
-                        datetime.now(timezone.utc).isoformat(),
-                        max_retries,
-                        cutoff,
-                    ),
+                    (now_iso, max_retries),
                 )
-            if cur.rowcount:
+                total += cur.rowcount
+            if total:
                 logger.warning(
                     "C2-recovery: %d зависших items (pending, retry_count>=%d) "
                     "переведены в 'failed'",
-                    cur.rowcount, max_retries,
+                    total, max_retries,
                 )
-            return cur.rowcount
+            return total
         except Exception as e:
             logger.warning("recover_stuck_pending: %s", e)
             return 0
@@ -1429,14 +1542,10 @@ class Storage:
 
     def get_or_create_feedback_target_from_item(self, item, kind: str) -> int:
         """
-        F1: идемпотентное создание feedback_target.
-
-        Сначала ищет существующий target по (url, kind).
-        Если найден — возвращает его id (retry-safe, не создаёт дублей).
-        Если не найден — создаёт новый и возвращает id.
-
-        Для retry/recovery-элементов: повторный проход вернёт тот же id,
-        что был создан при первой попытке доставки.
+        F1/Minor#4: идемпотентное создание feedback_target.
+        Minor#4-фикс: использует INSERT OR IGNORE + UNIQUE(url, kind) вместо
+        SELECT→INSERT (устранён TOCTOU). В одной транзакции: гарантирует,
+        что retry-вызовы возвращают тот же id без лишних INSERT.
 
         Args:
             item: NewsItem
@@ -1445,14 +1554,23 @@ class Storage:
         Returns:
             id существующего или нового feedback_targets.
         """
-        conn = self._connect()
-        row = conn.execute(
-            "SELECT id FROM feedback_targets WHERE url = ? AND kind = ?",
-            (item.url, kind),
-        ).fetchone()
-        if row is not None:
-            return row[0]
-        return self.add_feedback_target_from_item(item, kind)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._tx() as conn:
+            # Minor#4: INSERT OR IGNORE — безопасно при конкурентном создании.
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO feedback_targets
+                (url, source, title, summary, llm_score, kind, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (item.url, item.source, item.title, item.summary,
+                 item.llm_score, kind, now_iso),
+            )
+            row = conn.execute(
+                "SELECT id FROM feedback_targets WHERE url = ? AND kind = ?",
+                (item.url, kind),
+            ).fetchone()
+            return row[0]  # type: ignore
 
     def get_or_create_feedback_target(
         self,
@@ -1464,23 +1582,24 @@ class Storage:
         kind: str,
     ) -> int:
         """
-        F1: идемпотентное создание feedback_target (plain-вариант без NewsItem).
+        F1/Minor#4: идемпотентное создание feedback_target (plain-вариант без NewsItem).
+        Minor#4-фикс: INSERT OR IGNORE + UNIQUE(url, kind), транзакция.
         """
-        conn = self._connect()
-        row = conn.execute(
-            "SELECT id FROM feedback_targets WHERE url = ? AND kind = ?",
-            (url, kind),
-        ).fetchone()
-        if row is not None:
-            return row[0]
-        return self.add_feedback_target(
-            url=url,
-            source=source,
-            title=title,
-            summary=summary,
-            llm_score=llm_score,
-            kind=kind,
-        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO feedback_targets
+                (url, source, title, summary, llm_score, kind, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (url, source, title, summary, llm_score, kind, now_iso),
+            )
+            row = conn.execute(
+                "SELECT id FROM feedback_targets WHERE url = ? AND kind = ?",
+                (url, kind),
+            ).fetchone()
+            return row[0]  # type: ignore
 
     def set_feedback_target_message(
         self,

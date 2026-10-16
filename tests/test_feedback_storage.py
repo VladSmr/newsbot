@@ -62,7 +62,7 @@ def test_migration_v8_schema_version(storage):
     """user_version после инициализации = 8."""
     conn = sqlite3.connect(str(storage.db_path))
     conn.row_factory = sqlite3.Row
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == Storage.SCHEMA_VERSION
     conn.close()
 
 
@@ -84,17 +84,17 @@ def test_migration_v8_idempotent_reopen(tmp_path, news_item):
     db = tmp_path / "reopen.db"
     s1 = Storage(db)
     v1 = sqlite3.connect(str(db)).execute("PRAGMA user_version").fetchone()[0]
-    assert v1 == 10
+    assert v1 == Storage.SCHEMA_VERSION
 
     # повторное открытие (idempotent)
     s2 = Storage(db)
     v2 = sqlite3.connect(str(db)).execute("PRAGMA user_version").fetchone()[0]
-    assert v2 == 10
+    assert v2 == Storage.SCHEMA_VERSION
 
     # третий раз — тоже
     s3 = Storage(db)
     v3 = sqlite3.connect(str(db)).execute("PRAGMA user_version").fetchone()[0]
-    assert v3 == 10
+    assert v3 == Storage.SCHEMA_VERSION
 
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
@@ -133,7 +133,7 @@ def test_migration_v6_to_v8_full(tmp_path):
     conn.close()
 
     s = Storage(db_path)
-    assert sqlite3.connect(str(db_path)).execute("PRAGMA user_version").fetchone()[0] == 10
+    assert sqlite3.connect(str(db_path)).execute("PRAGMA user_version").fetchone()[0] == Storage.SCHEMA_VERSION
 
     conn2 = sqlite3.connect(str(db_path))
     conn2.row_factory = sqlite3.Row
@@ -197,7 +197,7 @@ def test_migration_v7_to_v8_adds_updated_at(tmp_path):
 
     # Миграция v7→v8
     s = Storage(db_path)
-    assert sqlite3.connect(str(db_path)).execute("PRAGMA user_version").fetchone()[0] == 10
+    assert sqlite3.connect(str(db_path)).execute("PRAGMA user_version").fetchone()[0] == Storage.SCHEMA_VERSION
 
     # updated_at добавлена
     conn2 = sqlite3.connect(str(db_path))

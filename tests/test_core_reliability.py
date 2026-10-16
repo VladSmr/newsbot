@@ -326,40 +326,48 @@ class TestRetryLimit(unittest.TestCase):
             _cleanup_db(path)
 
     def test_get_stuck_pending_respects_retry_limit(self):
+        """get_stuck_pending пропускает items с retry_count >= max_retries (детерминированно)."""
         path = _tmp_db()
         try:
-            st = Storage(Path(path))
-            item = _mk_item(title="Stuck", url="https://stuck.example/1")
-            st.save(item)
-            conn = st._connect()
-
-            update_at = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "UPDATE items SET state='pending', retry_count=7, state_at=? WHERE url=?",
-                (update_at, "https://stuck.example/1")
-            )
-            conn.commit()
-
-            # verify
-            row = conn.execute(
-                "SELECT state, retry_count FROM items WHERE url='https://stuck.example/1'"
-            ).fetchone()
-            self.assertEqual(row['state'], 'pending')
-            self.assertEqual(row['retry_count'], 7)
-
-            # raw SQL: same query as get_stuck_pending(0, 8)
             from datetime import timedelta
-            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=0)).isoformat()
-            raw = conn.execute(
-                "SELECT url FROM items WHERE state='pending' AND state_at < ? AND retry_count < 8"
-            , (cutoff,)).fetchall()
-            self.assertEqual(len(raw), 1, f"Raw SQL returned {len(raw)}: {[r[0] for r in raw]}")
 
+            st = Storage(Path(path))
+
+            # Создаём 3 items через save_many
+            items = [
+                _mk_item(title=f"Stuck{i}", url=f"https://stuck{i}.example/1")
+                for i in range(3)
+            ]
+            st.save_many(items)
+
+            # Все state/retry_count/state_at ставим через ОДНУ raw-сессию,
+            # чтобы НЕ закрывать внутреннее соединение Storage
+            fixed_at = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            conn = st._connect()
+            for i, rc in enumerate([7, 8, 9]):
+                conn.execute(
+                    "UPDATE items SET state='pending', retry_count=?, state_at=? WHERE url=?",
+                    (rc, fixed_at, f"https://stuck{i}.example/1")
+                )
+            conn.commit()
+            # НЕ вызываем conn.close() — это закроет self._conn и сломает
+            # последующие вызовы st.get_stuck_pending() через _connect()
+
+            # max_retries=8: retry_count=7 проходит, 8 и 9 — нет
             stuck = st.get_stuck_pending(max_age_seconds=0, max_retries=8)
-            self.assertEqual(len(stuck), 1, f"get_stuck_pending returned {len(stuck)}, expected 1")
+            stuck_urls = [i.url for i in stuck]
+            self.assertEqual(len(stuck), 1, f"Expected 1 stuck item, got {len(stuck)}")
+            self.assertIn("https://stuck0.example/1", stuck_urls,
+                "Item с retry_count=7 должен пройти фильтр max_retries=8")
+            self.assertNotIn("https://stuck1.example/1", stuck_urls,
+                "Item с retry_count=8 не должен пройти max_retries=8 (лимит включён)")
+            self.assertNotIn("https://stuck2.example/1", stuck_urls,
+                "Item с retry_count=9 не должен пройти max_retries=8")
 
-            stuck = st.get_stuck_pending(max_age_seconds=0, max_retries=7)
-            self.assertEqual(len(stuck), 0)
+            # max_retries=7: ничего не проходит (retry_count=7 не строго < 7)
+            stuck2 = st.get_stuck_pending(max_age_seconds=0, max_retries=7)
+            self.assertEqual(len(stuck2), 0,
+                "При max_retries=7 items с retry_count=7 не должны попасть в stuck")
             st.close()
         finally:
             _cleanup_db(path)
@@ -707,7 +715,6 @@ class TestStateAtUpdatedOnPending(unittest.TestCase):
             old_at = conn.execute(
                 "SELECT state_at FROM items WHERE url=?", ("https://sat.example/1",)
             ).fetchone()[0]
-            time.sleep(0.05)  # гарантируем другую метку времени
 
             # Повторный set_state в pending (N2: должен обновить state_at)
             st.set_state(["https://sat.example/1"], "pending")
@@ -800,10 +807,11 @@ class TestSchemaV8(unittest.TestCase):
         path = _tmp_db()
         try:
             st = Storage(Path(path))
-            self.assertEqual(st.SCHEMA_VERSION, 10)
+            # Version-independent: сравниваем с константой класса, не литералом.
+            self.assertEqual(st.SCHEMA_VERSION, Storage.SCHEMA_VERSION)
             conn = st._connect()
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 10)
+            self.assertEqual(version, Storage.SCHEMA_VERSION)
             st.close()
         finally:
             _cleanup_db(path)
@@ -842,74 +850,6 @@ class TestSchemaV8(unittest.TestCase):
 
 class TestC1RetryAccounting(unittest.TestCase):
     """Регрессионные тесты: retry_count инкрементируется только для НЕ доставленных."""
-
-    def test_successful_retry_item_not_marked_failed(self):
-        """
-        C1: retry item с retry_count=max-1, успешно доставленный,
-        НЕ становится 'failed'.
-        Симуляция: _process_batch вернул пустой список (всё доставлено),
-        pipeline не вызывает increment/mark_failed.
-        """
-        path = _tmp_db()
-        try:
-            st = Storage(Path(path))
-            item = _mk_item(title="Succ", url="https://succ.example/1")
-            st.save(item)
-
-            conn = st._connect()
-            conn.execute(
-                "UPDATE items SET state='pending', retry_count=7, state_at=? "
-                "WHERE url='https://succ.example/1'",
-                (datetime.now(timezone.utc).isoformat(),)
-            )
-            conn.commit()
-
-            # simulate: _process_batch вернул пустой список (доставлен)
-            # pipeline НЕ вызывает increment_retry_count и _check_and_mark_failed
-            # -> state остаётся pending, retry_count не растёт
-            state = conn.execute(
-                "SELECT state FROM items WHERE url='https://succ.example/1'"
-            ).fetchone()[0]
-            self.assertEqual(state, "pending",
-                "Успешно доставленный item не должен стать 'failed'")
-            st.close()
-        finally:
-            _cleanup_db(path)
-
-    def test_budget_cutdown_not_retried_nor_terminal(self):
-        """
-        C1: item, срезанный бюджетом, НЕ инкрементируется и НЕ терминализируется.
-        Для candidates pipeline НЕ вызывает increment/mark_failed.
-        """
-        path = _tmp_db()
-        try:
-            st = Storage(Path(path))
-            item = _mk_item(title="BudgetCut", url="https://budget.example/1")
-            st.save(item)
-            conn = st._connect()
-            conn.execute(
-                "UPDATE items SET state='pending', retry_count=0, state_at=? "
-                "WHERE url='https://budget.example/1'",
-                (datetime.now(timezone.utc).isoformat(),)
-            )
-            conn.commit()
-
-            # Для candidates pipeline не вызывает increment_retry_count
-            # -> retry_count остаётся 0, state pending
-            count = conn.execute(
-                "SELECT retry_count FROM items WHERE url='https://budget.example/1'"
-            ).fetchone()[0]
-            self.assertEqual(count, 0,
-                "Бюджетный срез не должен инкрементировать retry_count")
-
-            state = conn.execute(
-                "SELECT state FROM items WHERE url='https://budget.example/1'"
-            ).fetchone()[0]
-            self.assertEqual(state, "pending",
-                "Бюджетный срез не должен терминализировать item")
-            st.close()
-        finally:
-            _cleanup_db(path)
 
     def test_recover_stuck_pending_marks_terminal(self):
         """
@@ -1125,60 +1065,94 @@ class TestProcessBatchC1(unittest.TestCase):
         self.assertNotIn("https://cut.com/4", result,
             "Excess item[4] НЕ должен быть в failed_urls (не дошёл до delivery)")
 
-    def test_retry_path_budget_cut_no_increment(self):
+    def test_retry_path_both_processed_one_delivered(self):
         """
-        C1': retry item (pending), budget=1, 2 items, доставлен 1.
-        Срезанный бюджетом НЕ инкрементируется и НЕ в failed_urls.
+        C1': 2 items, budget=2, batch_size=1 — бюджет НЕ срезан (x==budget).
+        item[0] доставлен (delivered_urls), item[1] — не доставлен (TG-сбой)
+        → item[1] в failed_urls, item[0] — не в failed_urls.
+        NB: retry_count инкрементируется в run_cycle_with_delivery
+        (pipeline.py:585-587), а НЕ в _process_batch; _process_batch
+        только возвращает неуспешные URL.
         """
         from newsbot.llm.filter import FilterResult
 
         items = [
-            _mk_item(title="Retry 0", url="https://retry.com/0"),
-            _mk_item(title="Retry 1", url="https://retry.com/1"),
+            _mk_item(title="Retry 0", url="https://retry.com/0", llm_score=7),
+            _mk_item(title="Retry 1", url="https://retry.com/1", llm_score=8),
         ]
-        # мок LLM: всем push
         mock_llm = MagicMock()
         mock_llm.push_threshold = 7
         mock_llm.digest_threshold = 5
-        mock_llm.evaluate.side_effect = lambda item: FilterResult(ok=True, score=10, summary="s", reason="r")
+        mock_llm.push_urgent_only = False
+        mock_llm.evaluate.side_effect = lambda item, feedback_context=None: FilterResult(
+            ok=True, score=10, summary="s", reason="r"
+        )
+        mock_llm.evaluate_batch.side_effect = lambda items, feedback_context=None: [
+            mock_llm.evaluate(item, feedback_context) for item in items
+        ]
 
+        # item[0] доставлен, item[1] — НЕ доставлен (сбой TG)
         pipeline = self._patch_pipeline(
-            delivered_urls=["https://retry.com/0"],  # доставлен только первый
+            delivered_urls=["https://retry.com/0"],
             llm_filter=mock_llm,
         )
+        pipeline.config.setdefault("llm", {})["batch_size"] = 1
 
-        # бюджет=1, доставлен 1 из 1 обработанного
-        result = pipeline._process_batch(items, budget_override=1)
+        result = pipeline._process_batch(items, budget_override=2)
 
-        # failed = только не доставленный из обработанных (retry.com/0 обработан но не доставлен)
-        # retry.com/1 — срезан бюджетом, НЕ в failed_urls
-        self.assertEqual(result, [],
-            "Не доставленный из обработанных: retry.com/0 — доставлен, "
-            "retry.com/1 срезан бюджетом → failed_urls пуст")
-        # NOTE: в этом сценарии оба retry item доставлены (budget=1, доставлен 1)
-        # Не доставленных из обработанных нет → empty
+        # Оба обработаны; item[0] доставлен, item[1] — не доставлен
+        self.assertIn("https://retry.com/1", result,
+            "Не доставленный item[1] ДОЛЖЕН быть в failed_urls (сбой TG)")
+        self.assertNotIn("https://retry.com/0", result,
+            "Доставленный item[0] НЕ должен быть в failed_urls")
 
     def test_all_filtered_returns_empty_failed_urls(self):
         """
         M1: все items отфильтрованы (skipped), to_deliver пуст.
         failed_urls должен быть ПУСТЫМ (не skipped items).
+        NB: evaluate.side_effect БЕЗ evaluate_batch.side_effect → MagicMock()
+        возвращает пустой итератор → zip([]) → to_deliver не заполняется →
+        ранний return [] (pipeline.py:757) — тест проходит даже без логики.
+        Фикс: evaluate_batch возвращает реальные FilterResult(score=3, skip).
+        Проверяем: (1) result==[] и (2) items в Storage → state='skipped'.
         """
-        from unittest.mock import MagicMock
         from newsbot.llm.filter import FilterResult
 
         items = [_mk_item(title=f"Skip{i}", url=f"https://skip.com/{i}") for i in range(3)]
         mock_llm = MagicMock()
         mock_llm.push_threshold = 7
         mock_llm.digest_threshold = 5
-        # всем skip (score=3)
-        mock_llm.evaluate.side_effect = lambda item, feedback_context=None: FilterResult(ok=True, score=3, summary="s", reason="r")
+        # evaluate_batch возвращает реальные результаты (ключевой фикс):
+        # без этого — MagicMock.__iter__ → [] → zip пуст → ранний return []
+        mock_llm.evaluate_batch.side_effect = lambda items, feedback_context=None: [
+            FilterResult(ok=True, score=3, summary="s", reason="r") for _ in items
+        ]
+        mock_llm.evaluate.side_effect = lambda item, feedback_context=None: FilterResult(
+            ok=True, score=3, summary="s", reason="r"
+        )
 
-        pipeline = self._patch_pipeline(delivered_urls=[], llm_filter=mock_llm)
+        db_path = _tmp_db()
+        try:
+            storage = Storage(db_path)
+            for item in items:
+                storage.save(item)
 
-        result = pipeline._process_batch(items, budget_override=3)
+            pipeline = self._patch_pipeline(delivered_urls=[], llm_filter=mock_llm)
+            pipeline.storage = storage
 
-        self.assertEqual(result, [],
-            "Все skipped — to_deliver пуст — failed_urls должен быть пустым")
+            result = pipeline._process_batch(items, budget_override=3)
+
+            # 1) result пуст (не skipped items)
+            self.assertEqual(result, [],
+                "Все skipped — to_deliver пуст — failed_urls должен быть пустым")
+            # 2) items реально попали в Storage как skipped (ключевая проверка)
+            skipped_items = {i.url for i in storage.get_all_by_state("skipped")}
+            for item in items:
+                self.assertIn(item.url, skipped_items,
+                    f"{item.url} должен быть в state='skipped'")
+            storage.close()
+        finally:
+            _cleanup_db(db_path)
 
     def test_successful_retry_item_not_in_failed_urls(self):
         """
@@ -1201,6 +1175,69 @@ class TestProcessBatchC1(unittest.TestCase):
             "Успешно доставленный retry item НЕ должен быть в failed_urls")
         self.assertIn("https://fail.example/2", result,
             "Не доставленный retry item ДОЛЖЕН быть в failed_urls")
+
+    def test_budget_cutdown_not_retried_nor_terminal(self):
+        """
+        C1: 5 fresh items (без llm_score), budget=1, batch_size=2.
+        Обработан только item[0] (budget=1), items[1..4] срезаны бюджетом.
+        Проверяем: (1) item[0] доставлен; (2) items[1..4] НЕ в failed_urls;
+        (3) items[1..4] остаются pending в Storage.
+        NB: мёртвый setup с llm_score=8 → items попадали в retry_batch,
+        evaluate_batch не вызывался — убрано.
+        """
+        from newsbot.llm.filter import FilterResult
+
+        # Fresh items (НЕ retry — без llm_score), чтобы evaluate_batch
+        # реально вызывался и budget учитывался при срезе fresh_batch.
+        items = [
+            _mk_item(title=f"B{i}", url=f"https://budget{i}.com/1")
+            for i in range(5)
+        ]
+        mock_llm = MagicMock()
+        mock_llm.push_threshold = 7
+        mock_llm.digest_threshold = 5
+        mock_llm.push_urgent_only = False
+        mock_llm.evaluate.side_effect = lambda item, feedback_context=None: FilterResult(
+            ok=True, score=10, summary="s", reason="r"
+        )
+        mock_llm.evaluate_batch.side_effect = lambda items, feedback_context=None: [
+            mock_llm.evaluate(item, feedback_context) for item in items
+        ]
+
+        db_path = _tmp_db()
+        try:
+            storage = Storage(db_path)
+            for item in items:
+                storage.save(item)
+
+            pipeline = self._patch_pipeline(
+                delivered_urls=["https://budget0.com/1"],
+                llm_filter=mock_llm,
+            )
+            pipeline.storage = storage
+            pipeline.config.setdefault("llm", {})["batch_size"] = 2
+            # batch_size=2 покрывает оба items за один вызов evaluate_batch,
+            # затем budget=1 оставляет только item[0] в to_deliver.
+
+            result = pipeline._process_batch(items, budget_override=1)
+
+            # Позитивная проверка: item[0] доставлен — НЕ в failed_urls
+            self.assertNotIn("https://budget0.com/1", result,
+                "Доставленный item[0] НЕ должен быть в failed_urls")
+            # Негативная проверка: items[1..4] срезаны бюджетом — НЕ в failed_urls
+            self.assertNotIn("https://budget1.com/1", result,
+                "Срезанный бюджетом item[1] НЕ должен быть в failed_urls")
+            self.assertNotIn("https://budget4.com/1", result,
+                "Срезанный бюджетом item[4] НЕ должен быть в failed_urls")
+            # Проверка через Storage: items[1..4] остались pending (не отправлены на delivery)
+            pending_items = {i.url for i in storage.get_all_by_state("pending")}
+            for i in range(1, 5):
+                url = f"https://budget{i}.com/1"
+                self.assertIn(url, pending_items,
+                    f"item[{i}] ({url}) должен остаться pending")
+            storage.close()
+        finally:
+            _cleanup_db(db_path)
 
 
 # =============================================================================

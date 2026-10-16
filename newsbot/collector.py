@@ -154,6 +154,30 @@ class FeedCollector:
             trust_env=True,  # подхватывает HTTP_PROXY / HTTPS_PROXY из окружения (Docker)
         )
 
+    def _validate_url(self, url: str) -> bool:
+        """
+        M3-фикс: проверяет URL до HTTP-запроса (SSRF-защита).
+        Принимаются только http:// и https:// с непустым хостом.
+        Админ-контролируемые фиды — риск низкий, но консервативный
+        фикс не даёт случайным фидам открыть file:// / ftp:// и т.п.
+
+        ⚠️  Остаточный риск: follow_redirects=True разрешает редиректы,
+            валидный http(s) фид может ответить 30x → private IP / loopback.
+            Фиды админ-контролируемые, риск минимальный. При необходимости
+            отключить редиректы: httpx.Client(follow_redirects=False).
+        """
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return False
+            # hostname непустой — отсекает "http://", "https://:8080", "https:///"
+            if not parsed.hostname:
+                return False
+            return True
+        except Exception:
+            return False
+
     def close(self):
         self._client.close()
 
@@ -167,6 +191,9 @@ class FeedCollector:
             url = src.get("url", "")
             if not url:
                 logger.warning("[%s] URL пустой, пропускаем", name)
+                continue
+            if not self._validate_url(url):
+                logger.warning("[%s] URL недопустим (scheme/host): %s", name, url)
                 continue
 
             result = self._fetch_feed(name, url)

@@ -12,8 +12,12 @@ setup(
     include_package_data=True,
     python_requires=">=3.8",
     install_requires=[
-        "feedparser>=6.0.10",
-        "httpx>=0.27.0",
-        "PyYAML>=6.0.1",
+        # Запиненные версии (pip show в текущем окружении):
+        #   feedparser==6.0.12
+        #   httpx==0.28.1
+        #   PyYAML==6.0.3
+        "feedparser==6.0.12",
+        "httpx==0.28.1",
+        "PyYAML==6.0.3",
     ],
 )

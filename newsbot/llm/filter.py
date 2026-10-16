@@ -2,6 +2,7 @@
 LLM-фильтр новостей.
 """
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
@@ -11,6 +12,7 @@ from .prompts import (
     SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT,
     build_feedback_block, build_batch_user_message, sanitize_item_field,
     DEDUP_SYSTEM_PROMPT, build_dedup_user_message,
+    MAX_PROMPT_TITLE_CHARS, MAX_PROMPT_SUMMARY_CHARS,
 )
 
 logger = logging.getLogger("newsbot.llm.filter")
@@ -87,8 +89,10 @@ def route(
 
     Логика при push_urgent_only=True:
         urgent AND score>=push_threshold → "push"
-        score>=digest_threshold           → "digest"
-        иначе                            → "skip"
+        urgent AND score<push_threshold  → "digest"   (urgent ниже push-порога → дайджест, не skip)
+        not urgent AND score>=push_threshold → "digest"  (без urgent → digest, НЕ push)
+        not urgent AND score>=digest_threshold → "digest"
+        иначе → "skip"
 
     Логика при push_urgent_only=False (обратная совместимость):
         score>=push_threshold            → "push"
@@ -96,14 +100,21 @@ def route(
         иначе                            → "skip"
     """
     if push_urgent_only:
-        # пуш ТОЛЬКО если urgent + достаточно высокий score (вторичная защита
-        # от перестарания модели: даже срочное с score<push_threshold → digest)
-        if urgent and score >= push_threshold:
-            return "push"
-        elif score >= digest_threshold:
-            return "digest"
+        if urgent:
+            # urgent НИКОГДА не skip — даже при очень низком score.
+            # Нижняя граница для urgent = digest (не skip).
+            if score >= push_threshold:
+                return "push"
+            else:
+                return "digest"
         else:
-            return "skip"
+            # не-urgent — стандартная логика по score
+            if score >= push_threshold:
+                return "digest"  # push_urgent_only=True: без urgent → digest, не push
+            elif score >= digest_threshold:
+                return "digest"
+            else:
+                return "skip"
     else:
         # прежнее поведение: score — единственный гейт
         if score >= push_threshold:
@@ -355,7 +366,6 @@ class LLMFilter:
                 if 1 <= raw_id <= expected_count:
                     parsed_id = raw_id
             elif isinstance(raw_id, float):
-                import math
                 if math.isfinite(raw_id) and float(int(raw_id)) == raw_id:
                     candidate = int(raw_id)
                     if 1 <= candidate <= expected_count:
@@ -391,7 +401,6 @@ class LLMFilter:
             elif isinstance(raw_score, int) and not isinstance(raw_score, bool):
                 score = raw_score
             elif isinstance(raw_score, float):
-                import math
                 if (math.isfinite(raw_score)
                         and float(int(raw_score)) == raw_score
                         and 0 <= raw_score <= 10):
@@ -484,10 +493,16 @@ class LLMFilter:
                 parts.append(feedback_block)
                 parts.append("")  # пустая строка как разделитель
 
-        parts.append(f"# Заголовок\n{sanitize_item_field(item.title)}")
+        title = sanitize_item_field(item.title)
+        if len(title) > MAX_PROMPT_TITLE_CHARS:
+            title = title[:MAX_PROMPT_TITLE_CHARS - 3] + "..."
+        parts.append(f"# Заголовок\n{title}")
 
         if item.summary:
-            parts.append(f"# Содержание\n{sanitize_item_field(item.summary)}")
+            summary = sanitize_item_field(item.summary)
+            if len(summary) > MAX_PROMPT_SUMMARY_CHARS:
+                summary = summary[:MAX_PROMPT_SUMMARY_CHARS - 3] + "..."
+            parts.append(f"# Содержание\n{summary}")
 
         if item.source:
             parts.append(f"# Источник: {sanitize_item_field(item.source)}")
@@ -530,7 +545,6 @@ class LLMFilter:
             score = raw_score
         elif isinstance(raw_score, float):
             # float: принимаем если целочисленный и в диапазоне 0..10
-            import math
             if (math.isfinite(raw_score)
                     and float(int(raw_score)) == raw_score
                     and 0 <= raw_score <= 10):
