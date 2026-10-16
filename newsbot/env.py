@@ -106,10 +106,17 @@ def _parse_env(path: Path) -> Dict[str, str]:
 
         # B9-фикс: posix=False чтобы не съедались бэкслэши (Windows-пути).
         # posix=False сохраняет кавычки вокруг значения → снимаем их вручную.
-        try:
-            parts = shlex.split(rest, posix=False)
-            raw_value = parts[0] if parts else rest.strip()
-        except ValueError:
+        # m2-фикс: shlex.split() для unquoted-значений с пробелами ("a b c")
+        # возвращает ['a','b','c'] — берём parts[0]='a' (обрезает). Лечим:
+        # используем shlex.split() только для кавыченных значений.
+        if rest.lstrip().startswith(('"', "'")):
+            try:
+                parts = shlex.split(rest, posix=False)
+                raw_value = parts[0] if parts else rest.strip()
+            except ValueError:
+                raw_value = rest.strip()
+        else:
+            # Unquoted: берём rest.strip() целиком (пробелы сохраняются)
             raw_value = rest.strip()
         # снимаем внешние кавычки (одинарные и двойные)
         value = raw_value.strip('"').strip("'")

@@ -1041,6 +1041,7 @@ def _run_tests():
         TestBuildFeedbackBlock,
         TestFilterWithFeedbackContext,
         TestPipelineFeedbackIntegration,
+        TestScoreScaleCriteria,
     ]
     total = 0
     passed = 0
@@ -1067,6 +1068,121 @@ def _run_tests():
     else:
         print(" -- ALL GREEN")
         return 0
+
+
+# ─────────────────────────────────────────────────────────────────
+# 4. Тесты: новая шкала score — рутина без последствий → низкий score
+# ─────────────────────────────────────────────────────────────────
+
+class TestScoreScaleCriteria:
+    """Проверяем, что SYSTEM_PROMPT и BATCH_SYSTEM_PROMPT содержат
+    детальную шкалу критериев score с акцентом на рутину без последствий."""
+
+    def _phrase_in_both(self, phrase: str):
+        """phrase должна быть в обоих промптах (single + batch)."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        assert phrase in SYSTEM_PROMPT, \
+            f"'{phrase}' отсутствует в SYSTEM_PROMPT"
+        assert phrase in BATCH_SYSTEM_PROMPT, \
+            f"'{phrase}' отсутствует в BATCH_SYSTEM_PROMPT"
+
+    def _phrase_in_system_only(self, phrase: str):
+        """phrase — только в SYSTEM_PROMPT."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT
+        assert phrase in SYSTEM_PROMPT, \
+            f"'{phrase}' отсутствует в SYSTEM_PROMPT"
+
+    def test_high_score_victims(self):
+        """7–10: жертвы (погибшие/раненые) — высокий score."""
+        self._phrase_in_both("жертвы")
+
+    def test_high_score_massive_destruction(self):
+        """7–10: крупные разрушения / материальный ущерб."""
+        self._phrase_in_both("разрушения")
+
+    def test_high_score_mass_evacuation(self):
+        """7–10: массовая эвакуация."""
+        self._phrase_in_both("эвакуация")
+
+    def test_high_score_national_scale(self):
+        """7–10: события национального/мирового масштаба."""
+        self._phrase_in_both("национального/мирового масштаба")
+
+    def test_routine_without_consequences(self):
+        """1–3: РУТИНА БЕЗ ПОСЛЕДСТВИЙ."""
+        self._phrase_in_both("РУТИНА БЕЗ ПОСЛЕДСТВИЙ")
+
+    def test_routine_drones_shots(self):
+        """1–3: сводки «сбито N дронов/БПЛА» без пострадавших."""
+        self._phrase_in_both("сбито")
+
+    def test_routine_no_casualties_phrase(self):
+        """1–3: БЕЗ пострадавших и разрушений."""
+        self._phrase_in_both("БЕЗ пострадавших")
+
+    def test_routine_not_reported(self):
+        """1–3: «потери/пострадавшие/детали не сообщаются» → низкий score."""
+        self._phrase_in_both("не сообщаются")
+
+    def test_routine_no_details(self):
+        """1–3: «другие детали не приводятся» → низкий score."""
+        self._phrase_in_both("не приводятся")
+
+    def test_routine_no_consequences_is_not_high_score(self):
+        """Явное отсутствие последствий — НЕ повод для высокого score."""
+        self._phrase_in_both("это НЕ повод для высокого score")
+
+    def test_routine_statements_forecasts(self):
+        """1–3: общие заявления ведомств, прогнозы, мнения."""
+        self._phrase_in_both("прогнозы")
+
+    def test_do_not_boost_for_loud_tone(self):
+        """Не поднимать score из-за «громкого» тона / источника / эмоциональности."""
+        self._phrase_in_both("громкого")
+
+    def test_scale_is_shared_via_constant(self):
+        """Критерий 7–10 есть в _SCORE_SCALE (константа, не дублирование строк)."""
+        from newsbot.llm.prompts import _SCORE_SCALE, SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        # Ключевой маркер новой шкалы — в константе
+        assert "ШКАЛА ОЦЕНКИ RELEVANCE" in _SCORE_SCALE
+        # Обе шкалы содержат маркер 7-10 из _SCORE_SCALE
+        assert "7-10" in SYSTEM_PROMPT
+        assert "7-10" in BATCH_SYSTEM_PROMPT
+        # Низкий score (1-3) — в обеих
+        assert "1-3" in SYSTEM_PROMPT
+        assert "1-3" in BATCH_SYSTEM_PROMPT
+        # Средний (4-6) — в обеих
+        assert "4-6" in SYSTEM_PROMPT
+        assert "4-6" in BATCH_SYSTEM_PROMPT
+
+    def test_mid_score_political_economic(self):
+        """4–6: политико-экономические решения, санкции, сделки."""
+        self._phrase_in_both("политико-экономические")
+
+    def test_mid_score_releases(self):
+        """4–6: релизы, анонсы."""
+        self._phrase_in_both("релизы, анонсы")
+
+    def test_no_source_status_boost(self):
+        """Не поднимать score из-за статуса источника."""
+        self._phrase_in_both("статуса источника")
+
+    def test_no_emotional_heading_boost(self):
+        """Не поднимать score из-за эмоциональности заголовка."""
+        self._phrase_in_both("эмоциональности заголовка")
+
+    def test_urgent_criteria_unchanged(self):
+        """urgent-критерии НЕ изменены (остались как есть)."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        for phrase in [
+            "немедленными катастрофическими последствиями",
+            "объявленная мобилизация",
+            "массовыми жертвами (десятки+",
+            "ядерный или радиационный инцидент",
+            "При сомнении → false",
+        ]:
+            assert phrase in SYSTEM_PROMPT, f"'{phrase}' удалён из SYSTEM_PROMPT"
+            assert phrase in BATCH_SYSTEM_PROMPT, f"'{phrase}' удалён из BATCH_SYSTEM_PROMPT"
 
 
 if __name__ == "__main__":

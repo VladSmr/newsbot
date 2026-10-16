@@ -558,6 +558,155 @@ class TestBatchSanitization:
 
 
 # ─────────────────────────────────────────────────────────────────
+# m2-фикс: лимиты на размер полей во входе промпта
+# ─────────────────────────────────────────────────────────────────
+
+from newsbot.llm.prompts import (
+    build_batch_user_message,
+    build_dedup_user_message,
+    MAX_PROMPT_SUMMARY_CHARS,
+    MAX_PROMPT_TITLE_CHARS,
+)
+
+
+class TestPromptFieldCapping:
+    """m2-фикс: summary/title обрезаются на входе промпта."""
+
+    def test_long_summary_truncated_in_batch_message(self):
+        """Длинный summary обрезается до MAX_PROMPT_SUMMARY_CHARS."""
+        from newsbot.collector import NewsItem
+
+        # summary > MAX_PROMPT_SUMMARY_CHARS → должен быть обрезан
+        long_text = "A" * 2000
+        item = NewsItem(
+            source="Test",
+            url="https://x.com/1",
+            title="Test Title",
+            summary=long_text,
+            published="01.01.2025",
+            published_parsed=None,
+        )
+
+        msg = build_batch_user_message([item])
+
+        # Полный текст (2000 A's) не должен присутствовать — был обрезан
+        assert long_text not in msg, \
+            "Полный summary (2000 A's) не должен присутствовать — должен быть обрезан"
+
+        # Текст ДО капа: 797 A's (max-3) — это начало capped-текста, должен быть
+        assert long_text[:MAX_PROMPT_SUMMARY_CHARS - 3] in msg, \
+            f"Начало summary (первые {MAX_PROMPT_SUMMARY_CHARS - 3} A's) должно быть в сообщении"
+
+    def test_long_title_truncated_in_batch_message(self):
+        """Длинный title обрезается до MAX_PROMPT_TITLE_CHARS."""
+        from newsbot.collector import NewsItem
+
+        long_title = "B" * 500  #远超 200
+        item = NewsItem(
+            source="Test",
+            url="https://x.com/1",
+            title=long_title,
+            summary="Short",
+            published="01.01.2025",
+            published_parsed=None,
+        )
+
+        msg = build_batch_user_message([item])
+
+        # Полный title не должен присутствовать
+        assert long_title not in msg, \
+            "Полный title (500 B's) не должен присутствовать — должен быть обрезан"
+
+        # Начало title должно быть
+        assert long_title[:MAX_PROMPT_TITLE_CHARS - 3] in msg, \
+            f"Начало title (первые {MAX_PROMPT_TITLE_CHARS - 3} B's) должно быть в сообщении"
+
+    def test_long_title_truncated_in_dedup_message(self):
+        """Длинный title обрезается в build_dedup_user_message."""
+        from newsbot.collector import NewsItem
+
+        long_title = "C" * 500
+        item = NewsItem(
+            source="Test",
+            url="https://x.com/1",
+            title=long_title,
+            summary="Short",
+            published="01.01.2025",
+            published_parsed=None,
+        )
+
+        msg = build_dedup_user_message([item], [])
+
+        assert long_title not in msg, \
+            "Полный title не должен присутствовать в dedup-сообщении"
+        assert long_title[:MAX_PROMPT_TITLE_CHARS - 3] in msg, \
+            "Начало title должно быть в dedup-сообщении"
+
+    def test_short_fields_unchanged(self):
+        """Короткие summary/title проходят без обрезки."""
+        from newsbot.collector import NewsItem
+
+        short_title = "Short Title"
+        short_summary = "Short summary text"
+
+        item = NewsItem(
+            source="Test",
+            url="https://x.com/1",
+            title=short_title,
+            summary=short_summary,
+            published="01.01.2025",
+            published_parsed=None,
+        )
+
+        msg = build_batch_user_message([item])
+
+        assert short_title in msg, "Короткий title должен быть в сообщении"
+        assert short_summary in msg, "Короткий summary должен быть в сообщении"
+        assert "..." not in msg, "Короткие поля не должны обрезаться"
+
+    def test_batch_10_under_token_budget(self):
+        """batch_size=10: суммарный summary ≤ 10 × MAX_PROMPT_SUMMARY_CHARS (8000)."""
+        from newsbot.collector import NewsItem
+
+        # Используем РАЗНЫЕ суффиксы, чтобы точно отследить объём
+        items = [
+            NewsItem(
+                source=f"Source{i}",
+                url=f"https://x.com/{i}",
+                title=f"Title {i}",
+                summary=f"X" * 300 + f"END{i}___" + "A" * 1500,  # длинный, уникальный
+                published="01.01.2025",
+                published_parsed=None,
+            )
+            for i in range(10)
+        ]
+
+        msg = build_batch_user_message(items)
+
+        # Каждый item: 300 X's + END{i}___ + 1500 A's = 1803 символа summary
+        # После капа (800): 797 A's + "..."
+        # Проверяем: уникальный суффикс END{i}___ присутствует (начало summary не потеряно)
+        # и нет 1000+ символов подряд (доказывает что кап сработал)
+        for i in range(10):
+            assert f"END{i}___" in msg, f"Item {i} не обрезан целиком — суффикс END{i}___ пропущен"
+
+        # Максимальная последовательность A's (проверка капа)
+        max_run = 0
+        current_run = 0
+        for ch in msg:
+            if ch == "A":
+                current_run += 1
+                max_run = max(max_run, current_run)
+            else:
+                current_run = 0
+
+        # После капа: макс. 797 A's + "..." может дать ≤ 800 A's подряд
+        # Если без капа: 1500 A's подряд > 800
+        assert max_run <= MAX_PROMPT_SUMMARY_CHARS + 3, \
+            f"Макс. последовательность A's = {max_run}, ожидалось ≤ {MAX_PROMPT_SUMMARY_CHARS + 3} (cap + '...')"
+
+
+# ─────────────────────────────────────────────────────────────────
 # Тесты: pipeline использует batch
 # ─────────────────────────────────────────────────────────────────
 

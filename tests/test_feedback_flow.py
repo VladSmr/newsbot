@@ -756,8 +756,8 @@ class TestDigestKeyboard:
         # 2 ряда (по одному на item)
         assert len(payload["reply_markup"]["inline_keyboard"]) == 2
 
-    def test_send_digest_row_format_url_thumbs(self):
-        """Каждый ряд: [URL] [👍] [👎]."""
+    def test_send_digest_row_format_thumbs_only(self):
+        """Каждый ряд: только [👍] [👎] (URL в тексте, не дублируется кнопкой)."""
         td = TelegramDelivery(token="test_token", chat_id="123456")
         item_buttons = [
             {"url": "https://ex.com/news1", "target_id": 5},
@@ -769,14 +769,12 @@ class TestDigestKeyboard:
         payload = mock_api.call_args[0][1]
         kb = payload["reply_markup"]["inline_keyboard"]
         row = kb[0]
-        # 3 кнопки: URL + 👍 + 👎
-        assert len(row) == 3
-        assert row[0]["text"] == "🔗"
-        assert row[0]["url"] == "https://ex.com/news1"
-        assert row[1]["text"] == "👍"
-        assert row[1]["callback_data"] == "fb:5:u"
-        assert row[2]["text"] == "👎"
-        assert row[2]["callback_data"] == "fb:5:d"
+        # 2 кнопки: только 👍 + 👎 (URL НЕ дублируется кнопкой — он в тексте)
+        assert len(row) == 2
+        assert row[0]["text"] == "👍"
+        assert row[0]["callback_data"] == "fb:5:u"
+        assert row[1]["text"] == "👎"
+        assert row[1]["callback_data"] == "fb:5:d"
 
     def test_send_digest_row_without_url_only_thumbs(self):
         """Item без URL: ряд с только 👍/👎."""
@@ -796,8 +794,8 @@ class TestDigestKeyboard:
         assert row[1]["callback_data"] == "fb:7:d"
         assert all("url" not in btn for btn in row)
 
-    def test_send_digest_row_without_target_only_url(self):
-        """Item с URL но без target_id: только URL-кнопка."""
+    def test_send_digest_row_without_target_skipped(self):
+        """Item без target_id: ряд пропускается, reply_markup отсутствует."""
         td = TelegramDelivery(token="test_token", chat_id="123456")
         item_buttons = [
             {"url": "https://ex.com/noid", "target_id": None},
@@ -807,11 +805,10 @@ class TestDigestKeyboard:
             td.send_digest("Digest text", item_buttons)
 
         payload = mock_api.call_args[0][1]
-        kb = payload["reply_markup"]["inline_keyboard"]
-        row = kb[0]
-        assert len(row) == 1
-        assert row[0]["text"] == "🔗"
-        assert row[0]["url"] == "https://ex.com/noid"
+        # При отсутствии target_id строк нет → reply_markup отсутствует
+        assert "reply_markup" not in payload, (
+            "reply_markup не должно быть при отсутствии target_id"
+        )
 
     def test_send_digest_empty_item_buttons_no_keyboard(self):
         """item_buttons=[] — reply_markup отсутствует (нет новостей с кнопками)."""
@@ -824,9 +821,8 @@ class TestDigestKeyboard:
         assert "reply_markup" not in payload
 
     def test_send_digest_callback_data_under_64_bytes(self):
-        """callback_data ≤ 64 байт (Telegram limit)."""
+        """callback_data ≤ 64 байт (Telegram limit). URL в item_button игнорируется."""
         td = TelegramDelivery(token="test_token", chat_id="123456")
-        # Большой id
         item_buttons = [
             {"url": "https://ex.com/large", "target_id": 9_999_999},
         ]
@@ -856,7 +852,7 @@ class TestDigestKeyboard:
         assert "link_preview_options" in payload
 
     def test_send_digest_skips_rows_with_no_url_and_no_target(self):
-        """Ряд без URL и без target_id пропускается."""
+        """Ряд без target_id пропускается (URL в тексте)."""
         td = TelegramDelivery(token="test_token", chat_id="123456")
         item_buttons = [
             {"url": "https://ex.com/1", "target_id": 1},
@@ -870,7 +866,7 @@ class TestDigestKeyboard:
         payload = mock_api.call_args[0][1]
         kb = payload["reply_markup"]["inline_keyboard"]
         assert len(kb) == 2
-        assert len(kb[0]) == 3  # URL + 👍 + 👎
+        assert len(kb[0]) == 2  # только 👍 + 👎
         assert len(kb[1]) == 2  # только 👍 + 👎
 
     def test_send_digest_returns_false_on_error(self):
@@ -889,17 +885,14 @@ class TestDigestKeyboard:
         result = td.send_digest("Digest", [{"url": "https://ex.com/1", "target_id": 1}])
         assert result is False
 
-    def test_send_digest_url_whitelist_rejects_non_http(self):
-        """m1 (T2): невалидные URL в кнопке отбрасываются (http/https whitelist)."""
+    def test_send_digest_url_field_ignored(self):
+        """Поле 'url' в item_buttons игнорируется (URL уже в тексте дайджеста).
+        Кнопки — только 👍/👎 по target_id."""
         td = TelegramDelivery(token="test_token", chat_id="123456")
         item_buttons = [
-            # http → URL-кнопка должна быть
             {"url": "http://example.com/ok", "target_id": 1},
-            # javascript → URL-кнопка НЕ должна быть, 👍/👎 остаются
             {"url": "javascript:alert(1)", "target_id": 2},
-            # tg:// → URL-кнопка НЕ должна быть
             {"url": "tg://resolve?domain=foo", "target_id": 3},
-            # ftp → URL-кнопка НЕ должна быть
             {"url": "ftp://files.example.com/file", "target_id": 4},
         ]
         mock_api = MagicMock(return_value={})
@@ -908,17 +901,9 @@ class TestDigestKeyboard:
 
         payload = mock_api.call_args[0][1]
         kb = payload["reply_markup"]["inline_keyboard"]
-        # 4 ряда: item1 (url+thumbs), item2–4 (thumbs only)
         assert len(kb) == 4, f"Expected 4 rows, got {len(kb)}"
-
-        # Ряд 1: URL + 👍 + 👎
-        assert len(kb[0]) == 3
-        assert kb[0][0]["url"] == "http://example.com/ok"
-        assert kb[0][1]["callback_data"] == "fb:1:u"
-        assert kb[0][2]["callback_data"] == "fb:1:d"
-
-        # Ряды 2–4: только 👍 + 👎 (URL-клнопок нет)
-        for i, row in enumerate(kb[1:], start=2):
+        for i, row in enumerate(kb, start=1):
+            # Каждый ряд: только 👍 + 👎, URL-полей нет
             assert len(row) == 2, f"Row {i}: expected 2 thumbs, got {len(row)}"
             assert all("url" not in btn for btn in row), f"Row {i}: не должно быть URL-кнопки"
             assert all("callback_data" in btn for btn in row), f"Row {i}: должны быть thumbs"
@@ -942,3 +927,139 @@ class TestDigestKeyboardConsoleCompatibility:
         cd = ConsoleDelivery()
         result = cd.send_digest("Empty digest", [])
         assert result is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# M3: URL-whitelist — не-http схемы и control-символы не попадают в кнопку
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestUrlButtonSchemeWhitelist:
+    """URL-кнопка добавляется ТОЛЬКО для http:// / https://, без control-символов."""
+
+    def _parts(self, url):
+        """Build message parts for item with given URL, no feedback_target_id."""
+        td = TelegramDelivery(token="test_token", chat_id="123456")
+        item = NewsItem(
+            source="S",
+            url=url,
+            title="Title",
+            summary="Summary",
+            published="2026",
+            published_parsed=None,
+        )
+        return td._build_message_parts(item)
+
+    def _has_url_btn(self, parts):
+        """True если в inline_keyboard есть кнопка с полем 'url'."""
+        if "reply_markup" not in parts[-1]:
+            return False
+        for row in parts[-1]["reply_markup"]["inline_keyboard"]:
+            for btn in row:
+                if "url" in btn:
+                    return True
+        return False
+
+    def test_http_url_button_added(self):
+        """http:// — кнопка должна быть."""
+        parts = self._parts("http://example.com/article")
+        assert self._has_url_btn(parts), "http:// URL должен добавлять кнопку"
+
+    def test_https_url_button_added(self):
+        """https:// — кнопка должна быть."""
+        parts = self._parts("https://example.com/article")
+        assert self._has_url_btn(parts), "https:// URL должен добавлять кнопку"
+
+    def test_mailto_no_button(self):
+        """mailto: — кнопка НЕ добавляется, сообщение отправляется."""
+        parts = self._parts("mailto:user@example.com")
+        assert not self._has_url_btn(parts), "mailto: не должен добавлять кнопку"
+
+    def test_tg_scheme_no_button(self):
+        """tg:// — кнопка НЕ добавляется."""
+        parts = self._parts("tg://resolve?domain=somebot")
+        assert not self._has_url_btn(parts), "tg:// не должен добавлять кнопку"
+
+    def test_newline_in_url_no_button(self):
+        """URL с \\n — кнопка НЕ добавляется."""
+        parts = self._parts("https://example.com/art\nicle")
+        assert not self._has_url_btn(parts), "URL с \\n не должен добавлять кнопку"
+
+    def test_carriage_return_in_url_no_button(self):
+        """URL с \\r — кнопка НЕ добавляется."""
+        parts = self._parts("https://example.com/art\r\nicle")
+        assert not self._has_url_btn(parts), "URL с \\r не должен добавлять кнопку"
+
+    def test_tel_scheme_no_button(self):
+        """tel: — кнопка НЕ добавляется."""
+        parts = self._parts("tel:+79001234567")
+        assert not self._has_url_btn(parts), "tel: не должен добавлять кнопку"
+
+    def test_whitespace_trimmed_no_button(self):
+        """URL с whitespace-ом по краям — не добавляется."""
+        parts = self._parts("  https://example.com/  ")
+        assert not self._has_url_btn(parts), "URL с whitespace не должен добавлять кнопку"
+
+    def test_empty_url_no_button(self):
+        """Пустой URL — кнопки нет."""
+        parts = self._parts("")
+        assert not self._has_url_btn(parts), "Пустой URL не должен добавлять кнопку"
+
+    def test_relative_url_no_button(self):
+        """/path/to/page — относительный URL без схемы не добавляется."""
+        parts = self._parts("/path/to/page")
+        assert not self._has_url_btn(parts), "Относительный URL не должен добавлять кнопку"
+
+    def test_url_stripped_of_whitespace_in_button(self):
+        """
+        URL с leading/trailing whitespace — кнопка НЕ добавляется.
+        is_valid_http_url отвергает такие URL (url != url.strip()).
+        """
+        td = TelegramDelivery(token="test_token", chat_id="123456")
+        item = NewsItem(
+            source="S",
+            url="  https://example.com/article  ",
+            title="T",
+            summary="B",
+            published="2026",
+            published_parsed=None,
+        )
+        parts = td._build_message_parts(item)
+        # кнопка НЕ добавляется (URL отвергнут как невалидный)
+        assert "reply_markup" not in parts[-1]
+
+    def test_http_button_still_works_with_feedback_id(self):
+        """http:// + feedback_target_id — URL-кнопка + 👍/👎."""
+        td = TelegramDelivery(token="test_token", chat_id="123456")
+        item = NewsItem(
+            source="S",
+            url="http://example.com/article",
+            title="Title",
+            summary="Summary",
+            published="2026",
+            published_parsed=None,
+        )
+        item.feedback_target_id = 42
+        parts = td._build_message_parts(item)
+        kb = parts[-1]["reply_markup"]["inline_keyboard"]
+        url_btns = [btn for row in kb for btn in row if "url" in btn]
+        cb_btns = [btn for row in kb for btn in row if "callback_data" in btn]
+        assert len(url_btns) == 1
+        assert url_btns[0]["url"] == "http://example.com/article"
+        assert len(cb_btns) == 2
+
+    def test_internal_space_in_url_no_button(self):
+        """
+        URL с внутренним пробелом ('https://ex.com/a b') — кнопка НЕ добавляется.
+        is_valid_http_url отвергает через " " in url.
+        """
+        td = TelegramDelivery(token="test_token", chat_id="123456")
+        item = NewsItem(
+            source="S",
+            url="https://example.com/article with space",
+            title="T",
+            summary="B",
+            published="2026",
+            published_parsed=None,
+        )
+        parts = td._build_message_parts(item)
+        assert "reply_markup" not in parts[-1]

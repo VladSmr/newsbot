@@ -109,12 +109,13 @@ def test_build_digest_single_message():
 
 
 def test_build_digest_max_per_message():
-    """При max_per_message=2 трёхэлементный список → 2 сообщения."""
+    """При max_per_message=2 трёхэлементный список → 2 сообщения (кумулятивный header)."""
     items = [_mk_item(title=f"Item {i}", url=f"https://ex.com/{i}") for i in range(3)]
     groups, all_items = build_digest_messages(items, max_items_per_message=2)
     assert len(groups) == 2
-    assert "2 из 3 новостей" in groups[0][0]
-    assert "1 из 3 новостей" in groups[1][0]
+    # Кумулятивный: msg1 items 1–2 → "1–2 из 3", msg2 item 3 → "3 из 3"
+    assert "1–2 из 3" in groups[0][0]
+    assert "3 из 3" in groups[1][0]
     assert len(all_items) == 3
 
 
@@ -232,14 +233,32 @@ def test_build_digest_source_included():
 
 
 def test_build_digest_count_in_header_matches_items():
-    """Заголовок N из total соответствует фактическому числу items."""
+    """Заголовок N из total соответствует фактическому числу items (кумулятивный)."""
     items = [_mk_item(title=f"Item {i}", url=f"https://ex.com/{i}") for i in range(7)]
     groups, all_items = build_digest_messages(items, max_items_per_message=3)
-    # 7 items, max=3 → 3 msgs (3, 3, 1)
+    # 7 items, max=3 → 3 msgs: 1–3, 4–6, 7
     assert len(groups) == 3
-    assert "3 из 7" in groups[0][0]
-    assert "3 из 7" in groups[1][0]
-    assert "1 из 7" in groups[2][0]
+    # Кумулятивный формат: "1–3 из 7" / "4–6 из 7" / "7 из 7"
+    assert "1–3" in groups[0][0] and "из 7" in groups[0][0]
+    assert "4–6" in groups[1][0] and "из 7" in groups[1][0]
+    assert "7 из 7" in groups[2][0]
+
+
+def test_build_digest_cumulative_header_two_messages():
+    """При разбиении на 2 сообщения: msg1=N из total, msg2=(N+1) из total."""
+    items = [_mk_item(title=f"Item {i}", url=f"https://ex.com/{i}") for i in range(1, 11)]
+    groups, _ = build_digest_messages(items, max_items_per_message=20)
+    # 10 items, max=20 → всё влезает в одно сообщение → header "1–10 из 10"
+    assert len(groups) == 1
+    assert "1–10 из 10" in groups[0][0]
+
+    # При лимите 5 items/message: 2 сообщения
+    groups2, _ = build_digest_messages(items, max_items_per_message=5)
+    assert len(groups2) == 2
+    # msg1: items 1–5 → "1–5 из 10"
+    assert "1–5 из 10" in groups2[0][0]
+    # msg2: items 6–10 → "6–10 из 10"
+    assert "6–10 из 10" in groups2[1][0]
 
 
 # =============================================================================
@@ -1272,7 +1291,7 @@ def test_pipeline_run_digest_creates_feedback_targets(tmp_path):
         "database": {"path": str(db_path)},
         "telegram": {"token": "test", "chat_id": "123"},
         "llm": {"enabled": False},
-        "feedback": {"enabled": True},
+        "feedback": {"enabled": True, "digest_enabled": True},
     }
 
     with patch.object(TelegramDelivery, "_api_call", return_value={}):
@@ -1309,7 +1328,7 @@ def test_pipeline_run_digest_idempotent_targets(tmp_path):
         "database": {"path": str(db_path)},
         "telegram": {"token": "test", "chat_id": "123"},
         "llm": {"enabled": False},
-        "feedback": {"enabled": True},
+        "feedback": {"enabled": True, "digest_enabled": True},
     }
 
     with patch.object(TelegramDelivery, "_api_call", return_value={}):

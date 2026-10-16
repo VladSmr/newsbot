@@ -1,6 +1,6 @@
 # newsbot — персональный новостной бот
 
-> Конвейер: сбор RSS → дедупликация → LLM-фильтр (DeepSeek) → доставка в Telegram.
+> Конвейер: сбор RSS → дедупликация → LLM-фильтр (DeepSeek) → доставка в Telegram (httpx + Bot API).
 > Обратная связь: 👍/👎 → few-shot адаптация фильтра.
 > Дайджест: отложенные новости (score 5–6) отправляются по расписанию 2×/день.
 > При падении LLM — fallback: все новости доставляются непрофильтрованными.
@@ -14,7 +14,7 @@ cd newsbot
 # На GitHub основная ветка — main (если git checkout не переключил автоматически):
 git checkout main
 
-# 1. Виртуальное окружение (Python 3.8+)
+# 1. Виртуальное окружение (Python 3.12)
 python -m venv venv
 source venv/bin/activate      # Linux/macOS
 .\venv\Scripts\activate       # Windows
@@ -76,7 +76,7 @@ newsbot/                  ← проектный корень
 ├── requirements.txt
 ├── setup.py
 ├── MANIFEST.in
-├── tests/                # 333 теста (9 файлов, запуск: python -m pytest tests -q)
+├── tests/                # 689 тестов (18 файлов, запуск: python -m pytest tests -q)
 └── data/                 # newsbot.db, newsbot.db-wal, newsbot.db-shm
 ```
 
@@ -317,7 +317,7 @@ telegram:
 ```yaml
 digest:
   enabled: true                       # вкл/выкл автоматический дайджест
-  times: ["09:00", "21:00"]          # HH:MM в ЛОКАЛЬНОЙ tz
+  times: ["08:00", "20:00"]          # HH:MM в ЛОКАЛЬНОЙ tz
   max_items: 30                       # ≤30 самых важных (сортировка: score DESC)
   max_items_per_message: 20           # новостей на одно сообщение
   on_empty: skip                      # "skip" — не слать пустой дайджест
@@ -370,8 +370,7 @@ RSS-сбор → `state='new'` (продолжается) → LLM-фильтр, 
 
 Предфильтр: `MAX_LEN_DIFF=15` слов, `MIN_TOKEN_INTERSECTION=0.3`,
 `MAX_FUZZY_CANDIDATES=200`. Новые параметры: `dedup.threshold` (0.95),
-`dedup.token_threshold` (0.8). Семантические перефразы НЕ ловятся (embeddings/LLM
-— отдельный этап). При `cross_source=false` fuzzy игнорируется (per-source
+`dedup.token_threshold` (0.8). При `cross_source=false` fuzzy игнорируется (per-source
 поведение сохранено).
 
 **Всегда:**
@@ -379,8 +378,15 @@ RSS-сбор → `state='new'` (продолжается) → LLM-фильтр, 
 - **Заголовок** — нормализованный (strip, collapse spaces, lowercase, remove punctuation,
   срез префиксов `Reuters:`, `Bloomberg:`, `Источник:` и т.п.) + `source`, TTL 30 дней.
 
-**NOTE:** семантические перефразы (одна и та же новость, разными словами)
-**НЕ ловятся** — для этого нужны embeddings или LLM. Решается отдельно.
+**Уровень 3 — LLM-дедуп (семантическая группировка «одно событие»):**
+`llm.llm_dedup: true` (дефолт True). Отдельный лёгкий вызов (только заголовки) **ДО**
+LLM-скоринга. Критерий: «одно и то же событие, разные слова, язык, формулировки чисел».
+Примеры: RU — «сбили 80 дронов» ↔ «сбили 80 БПЛА»; EN — «34 children killed» ↔ «dozens killed».
+Промпт: специализированный (`DEDUP_SYSTEM_PROMPT`), делимитеры `<|данные:N|>` защищают от injection.
+Чанкование по 40 кандидатов; `recent` (до 20 недавних новостей из БД) подмешивается в каждый чанк.
+При **сбое LLM** — безопасный пропуск (пустое множество, ни один дубль не проходит).
+Битые/несуществующие индексы в ответе игнорируются. При `<2` кандидатов вызов не делается.
+Дубли → `skipped` (URL-дедуп в следующих циклах) + исключаются из дальнейшей обработки.
 
 ## Конфигурация
 
@@ -397,13 +403,15 @@ RSS-сбор → `state='new'` (продолжается) → LLM-фильтр, 
 | `llm.batch_size`             | ≤N новостей одним LLM-вызовом (1=поштучно) | 10              |
 | `llm.max_tokens`            | Лимит completion tokens (≈4000 для батча 10) | 4096           |
 | `llm.off_peak_only`           | LLM только в off-peak часы DeepSeek   | false                 |
+| `llm.llm_dedup`               | Семантическая дедупликация LLM (группировка «одно событие») | true          |
+| `dedup.llm_recent_limit`      | Сколько недавних заголовков подмешивать в LLM-дедуп | 20         |
 | `logging.level`               | DEBUG / INFO / WARNING               | INFO                  |
 | `telegram.token`              | Bot token от @BotFather              | из `.env`             |
 | `telegram.chat_id`            | Привязанный chat_id владельца        | из `.env`             |
 | `telegram.poll_timeout`        | seconds для long-poll               | 25                    |
 | `llm.model`                   | Модель DeepSeek                      | `deepseek-flash` (pro — альтернатива) |
 | `digest.enabled`              | Автоматический дайджест              | true                  |
-| `digest.times`                | HH:MM в локальной tz                 | `["09:00","21:00"]`   |
+| `digest.times`                | HH:MM в локальной tz                 | `["08:00","20:00"]`   |
 | `feedback.enabled`            | Приём обратной связи                 | true                  |
 | `feedback.max_examples`       | Примеров в few-shot                 | 10                    |
 | `dedup.cross_source`          | Глобальный точный дедуп по title_hash (без source) | true          |
@@ -450,12 +458,13 @@ feedback: id, target_id UNIQUE, url, source, title, summary, llm_score,
 ```bash
 python -m pytest tests -q
 ```
-**564 теста, 12 файлов:** все тесты `test_llm_filter_mocks` (включая
-urgent/route/parse), `test_pipeline_llm` (включая маршрутизацию с urgent),
-`test_llm_batch` (19 новых тестов: happy path, per-item fallback, pipeline-интеграция),
-`test_core_reliability`, `test_delivery_security`, `test_digest`,
+**689 тестов, 18 файлов:** `test_llm_batch`, `test_llm_filter_mocks`
+(urgent/route/parse), `test_pipeline_llm`, `test_core_reliability`,
+`test_delivery_security`, `test_digest`, `test_digest_feedback`,
 `test_feedback_storage`, `test_feedback_flow`, `test_telegram_poller`,
-`test_feedback_prompt`, `test_dedup`, `test_pause`. Все зелёные.
+`test_feedback_prompt`, `test_dedup`, `test_dedup_llm`, `test_offpeak`,
+`test_pause`, `test_config_env_collector`, `test_log_sanitizer`,
+`test_digest_schedule`. Запуск: `python -m pytest tests -q -p no:randomly`.
 
 ## Известные ограничения
 
@@ -471,7 +480,7 @@ urgent/route/parse), `test_pipeline_llm` (включая маршрутизац�
 
 ## Требования
 
-- Python 3.8+
+- Python 3.12
 
 ## Деплой на VPS (Docker)
 

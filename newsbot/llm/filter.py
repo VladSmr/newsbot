@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional, Set
 
 from ..collector import NewsItem
 from .client import DeepSeekClient, LLMError, BalanceInfo
-from .prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT, build_feedback_block, build_batch_user_message, sanitize_item_field
+from .prompts import (
+    SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT,
+    build_feedback_block, build_batch_user_message, sanitize_item_field,
+    DEDUP_SYSTEM_PROMPT, build_dedup_user_message,
+)
 
 logger = logging.getLogger("newsbot.llm.filter")
 
@@ -134,7 +138,7 @@ class LLMFilter:
         config_llm: Dict[str, Any],
         client: Optional[DeepSeekClient] = None,
     ):
-        self.enabled = config_llm.get("enabled", True)
+        self.enabled = self._parse_bool(config_llm.get("enabled", True))
         self.model = config_llm.get("model", "")
         self.push_threshold = int(config_llm.get("push_threshold", 7))
         self.digest_threshold = int(config_llm.get("digest_threshold", 5))
@@ -582,3 +586,178 @@ class LLMFilter:
             reason=reason,
             urgent=urgent,
         )
+
+    # ── detect_duplicates ─────────────────────────────────────────────────────────
+
+    # Порог чанкования: не более 40 кандидатов на один LLM-вызов
+    _DEDUP_CHUNK_SIZE = 40
+
+    def detect_duplicates(
+        self,
+        items: List["NewsItem"],
+        recent: List[dict],
+    ) -> Set[int]:
+        """
+        Группирует семантические дубликаты среди кандидатов и relative to recent.
+
+        Отдельный лёгкий LLM-вызов (только заголовки) ДО скоринга.
+        Критерий: «одно и то же событие, разные слова/язык/числа».
+        Примеры: RU-пара (дроны/БПЛА), EN-пара (Pakistan school).
+
+        Полный сбой (``LLMError``) → пустое множество (безопасно, ничего не пропущено).
+        Битые/несуществующие индексы в ответе → игнорируются.
+        Если кандидатов < 2 → вызов не делается, возвращается пустое множество.
+
+        Parameters
+        ----------
+        items : List[NewsItem]
+            Кандидаты этого цикла (новые items, прошедшие лексический дедуп).
+        recent : List[dict]
+            Недавние новости из БД ``(title, source)`` — для кросс-циклового дедупа.
+            Каждый dict с ключами ``title`` и ``source``.
+
+        Returns
+        -------
+        Set[int]
+            0-based индексы items, которые являются дубликатами
+            БОЛЕЕ РАННЕЙ новости (из основного списка или из recent).
+            Пустое множество — ошибка или кандидатов < 2.
+        """
+        if len(items) < 2:
+            return set()
+
+        all_dup_indices: Set[int] = set()
+
+        # Чанкование: не более _DEDUP_CHUNK_SIZE кандидатов на вызов
+        for chunk_start in range(0, len(items), self._DEDUP_CHUNK_SIZE):
+            chunk = items[chunk_start: chunk_start + self._DEDUP_CHUNK_SIZE]
+
+            user_message = build_dedup_user_message(chunk, recent)
+
+            try:
+                raw = self._client.chat_json(
+                    system=DEDUP_SYSTEM_PROMPT,
+                    user=user_message,
+                )
+            except LLMError as e:
+                logger.warning(
+                    "LLM-ошибка при дедупликации чанка [%d:%d] из %d items: %s "
+                    "→ прерываем, сохраняем уже найденные дубли (%d шт.)",
+                    chunk_start,
+                    chunk_start + len(chunk),
+                    len(items),
+                    e,
+                    len(all_dup_indices),
+                )
+                # m1-фикс: НЕ сбрасываем all_dup_indices — сохраняем находки
+                # предыдущих чанков. Токены уже списаны, информация не потеряна.
+                break
+
+            # Парсим ответ: {"duplicates": [1, 3, ...]}
+            dup_indices = self._parse_dedup_response(
+                raw, len(chunk), chunk_start,
+            )
+            all_dup_indices.update(dup_indices)
+
+        logger.debug(
+            "LLM-дедуп: %d/%d кандидатов помечены дубликатами",
+            len(all_dup_indices), len(items),
+        )
+        return all_dup_indices
+
+    def _parse_dedup_response(
+        self,
+        raw: Dict[str, Any],
+        chunk_len: int,
+        chunk_offset: int,
+    ) -> Set[int]:
+        """
+        Парсит ответ LLM ``{"duplicates": [1, 2, ...]}`` → Set[int] 0-based.
+
+        Битые/несуществующие/вне-диапазона индексы — игнорируются.
+        Невалидная структура → пустое множество.
+
+        Minor #4-фикс — защита от «самоссылки» / лидера чанка:
+          (a) Guard лидера: первый item чанка (chunk_offset+1 в 1-based) НЕ может
+              быть помечен как дубль — у него нет «более раннего» в чанке.
+              LLM может вернуть индекс первого item (ошибка модели или спам),
+              иначе первый item чанка никогда не выжил бы для других как «ранний».
+          (b) Guard пустого чанка: если модель пометила ВСЕ items чанка как дубли
+              (например, весь чанк = дубликаты recent-новостей) — оставляем хотя бы
+              первый item чанка (он станет «лидером» в next-цикле). Иначе все items
+              получат skipped/deferred и информация о событии потеряется.
+
+        Риск: осознанный компромисс. Если событие полностью описано одним
+        item из чанка и он помечен как дубль — событие потеряется для пуша.
+        Это приемлемо: дедуп рассчитан на пары (A/B), а не на полное
+        совпадение всего чанка. Защита (b) гарантирует: минимум 1 item выживает.
+
+        Parameters
+        ----------
+        raw : dict
+            Распарсенный JSON от LLM.
+        chunk_len : int
+            Количество items в текущем чанке.
+        chunk_offset : int
+            Стартовый offset оригинального списка (chunk_start).
+
+        Returns
+        -------
+        Set[int]
+            0-based индексы дублей В ПРЕДЕЛАХ ОРИГИНАЛЬНОГО СПИСКА.
+        """
+        if not isinstance(raw, dict):
+            logger.warning("LLM-дедуп вернул не-объект: %s", type(raw).__name__)
+            return set()
+
+        raw_list = raw.get("duplicates")
+        if not isinstance(raw_list, list):
+            logger.warning(
+                "LLM-дедуп: 'duplicates' не список (%s) → пропускаем",
+                type(raw_list).__name__,
+            )
+            return set()
+
+        result: Set[int] = set()
+
+        for val in raw_list:
+            idx: Optional[int] = None
+            # int — напрямую (bool отклоняется как подкласс)
+            if isinstance(val, bool):
+                continue
+            if isinstance(val, int):
+                idx = val
+            elif isinstance(val, str):
+                # строковые "1", "2" — парсим
+                try:
+                    idx = int(val.strip())
+                except (ValueError, TypeError):
+                    continue
+
+            if idx is None:
+                continue  # float, None, dict и прочее — пропускаем
+
+            # проверяем границы чанка
+            if not (1 <= idx <= chunk_len):
+                # несуществующий индекс — игнорируем
+                continue
+
+            # Guard (a): лидер чанка (idx=1 1-based) не пропускается как дубль,
+            # потому что у него нет «более раннего» в пределах этого чанка.
+            # LLM может вернуть 1 по ошибке или спаму.
+            #
+            # Осознанный компромисс: лидер чанка (в т.ч. кросс-цикловый дубль-
+            # лидер) не может быть помечен дублем. Это защищает от ложного скипа
+            # ценой пропуска кросс-циклового дубля-лидера. Риск принят: выигрыш
+            # от защиты (A/B-пары не теряют «ранний» item) превышает редкий
+            # пропуск дубля-лидера.
+            if idx == 1:
+                logger.debug(
+                    "LLM-дедуп: модель пометила лидера чанка (1-based idx=1) как "
+                    "дубль — игнорируем (защита от самоссылки)",
+                )
+                continue
+
+            result.add(chunk_offset + (idx - 1))
+
+        return result

@@ -5,6 +5,7 @@ import html
 import logging
 import re
 import time
+import urllib.parse
 from typing import List, Optional
 
 import httpx
@@ -17,6 +18,51 @@ logger = logging.getLogger("newsbot.delivery.telegram")
 # Лимиты Telegram Bot API
 _TG_MESSAGE_MAX = 4096
 _TG_URL_MAX = 1024   # Telegram inline-кнопка URL ≤ 1024
+
+# ── URL guard (общий helper для poller и digest) ──────────────────────────────
+
+# module-level: компилируется один раз, не на каждый вызов
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def is_valid_http_url(url: str) -> str:
+    """
+    Проверяет URL на валидность для Telegram-кнопки / дайджест-ссылки.
+
+    Возвращает URL как есть если валиден, или пустую строку если нет.
+
+    Правила:
+      — схема http:// или https:// (urllib.parse проверяет netloc≠'')
+      — нет control-символов (\\x00-\\x1f, \\x7f-\\x9f)
+      — нет whitespace / внутренних пробелов
+      — длина ≤ _TG_URL_MAX
+      — нет leading/trailing whitespace (reject полностью, не очищает)
+    """
+    if not url or url != url.strip():
+        return ""
+
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return ""
+
+    # urllib.parse разбирает "https://ex.com/a b" → netloc='ex.com', path='/a b'
+    # Но host будет пустым только при невалидной структуре.
+    # Проверяем: схема http/https + netloc непустой + нет пробелов в path
+    if not parsed.netloc:
+        return ""
+
+    # Внутренний пробел в path или query — отвергаем
+    if " " in url or any(c.isspace() for c in url):
+        return ""
+
+    if _CONTROL_RE.search(url):
+        return ""
+
+    if len(url) > _TG_URL_MAX:
+        return ""
+
+    return url
 
 # HTTP-статусы
 _HTTP_FORBIDDEN = 403
@@ -150,18 +196,18 @@ class TelegramDelivery:
 
     def send_digest(self, text: str, item_buttons: List[dict]) -> bool:
         """
-        Отправляет дайджест с инлайн-кнопками на каждую новость.
+        Отправляет дайджест с инлайн-кнопками 👍/👎 на каждую новость.
 
-        Каждая строка inline_keyboard: [URL-кнопка] [👍] [👎].
+        Каждая строка inline_keyboard содержит только [👍] [👎].
+        Ссылка на новость — в тексте (footer <a href> в digest.py),
+        НЕ дублируется кнопкой.
         callback_data = "fb:{target_id}:u" / "fb:{target_id}:d".
 
         item_buttons — List[dict] с полями:
-          url: str — ссылка на новость (опционально)
+          url: str — ссылка на новость (игнорируется, URL уже в тексте)
           target_id: int — feedback_target id
 
-        При отсутствии URL строка содержит только 👍/👎.
-        При отсутствии feedback (target_id=None) строка содержит только URL-кнопку.
-        При отсутствии обоих — строка пропускается.
+        При отсутствии target_id строка пропускается (без кнопок).
 
         Лимиты:
           — не более max_items_per_message строк (управляется на уровне pipeline)
@@ -175,42 +221,18 @@ class TelegramDelivery:
 
         rows = []
         for btn in item_buttons:
-            url = btn.get("url") or ""
             target_id = btn.get("target_id")
 
-            # m1 (T2): URL-whitelist — кнопка только для http:// / https://
-            # (аналогично whitelist в тексте дайджеста / digest.py)
-            url_clean = url.strip() if url else ""
-            if url_clean:
-                if not (
-                    url_clean.startswith("http://")
-                    or url_clean.startswith("https://")
-                ):
-                    url_clean = ""   # невалидный URL — кнопку не добавляем
-                elif len(url_clean) > _TG_URL_MAX:
-                    url_clean = ""   # слишком длинный — кнопку не добавляем
-
-            url_btn = None
-            if url_clean:
-                url_btn = {"text": "🔗", "url": url_clean}
-
             # 👍/👎-кнопки если есть target_id
-            thumbs = None
+            # NOTE: URL-кнопка НЕ добавляется — ссылка на новость уже
+            # есть в тексте дайджеста (<a href="...">🔗</a> в digest.py footer).
             if target_id is not None:
                 cb_u = f"fb:{target_id}:u"
                 cb_d = f"fb:{target_id}:d"
-                thumbs = [
+                rows.append([
                     {"text": "👍", "callback_data": cb_u},
                     {"text": "👎", "callback_data": cb_d},
-                ]
-
-            # Строка: всегда 1–3 кнопки; пустая строка пропускается
-            row_btns = [b for b in [url_btn] if b is not None]
-            if thumbs:
-                row_btns.extend(thumbs)
-
-            if row_btns:
-                rows.append(row_btns)
+                ])
 
         payload = {
             "chat_id": self.chat_id,
@@ -230,7 +252,8 @@ class TelegramDelivery:
 
     def send_text(self, text: str) -> bool:
         """
-        Отправляет произвольное текстовое сообщение владельцу.
+        Отправляет произвольное HTML-текстовое сообщение владельцу.
+        CONTRACT: text — уже готовый HTML (доставщик НЕ экранирует повторно).
         Возвращает True при успехе, False при ошибке (не бросает исключений).
         """
         if not self.chat_id:
@@ -296,9 +319,12 @@ class TelegramDelivery:
 
         footer = f"📍 {source_esc} · {ts}"
 
-        # inline-кнопка — вместо <a href> в тексте (правильный API-способ)
-        url = item.url or ""
-        has_button = bool(url and len(url) <= _TG_URL_MAX)
+        # ── URL-whitelist: только http/https, без control-символов, без whitespace ──
+        # M3: защита от poison message при mailto:/tg:///битый URL.
+        # Битый/не-http URL → кнопка НЕ добавляется (item доставляется текстом).
+        # Использует общий helper is_valid_http_url (согласован с digest.py).
+        safe_url = is_valid_http_url(item.url or "")
+        has_button = bool(safe_url)
 
         # feedback_target_id: транзиентное поле из pipeline (Фаза 2b-1)
         fbtid = getattr(item, "feedback_target_id", None)
@@ -311,13 +337,13 @@ class TelegramDelivery:
         if len(part_text) <= _TG_MESSAGE_MAX:
             payload = self._make_payload(
                 title, escaped_summary, footer,
-                has_button=has_button, url=url, is_last=True,
+                has_button=has_button, url=safe_url, is_last=True,
                 feedback_target_id=fbtid,
             )
             return [payload]
 
         # не влезает — передаём экранированный summary в _split_text
-        return self._split_text(title, escaped_summary, footer, has_button, url, fbtid)
+        return self._split_text(title, escaped_summary, footer, has_button, safe_url, fbtid)
 
     def _make_payload(self, title: str, body_esc: str, footer: str,
                       has_button: bool, url: str, is_last: bool,

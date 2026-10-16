@@ -26,3 +26,6 @@ data/*.db-shm
 # OS files
 .DS_Store
 Thumbs.db
+
+# Temporary / untracked junk (m3-фикс: не попадают в коммит)
+temp_*.txt

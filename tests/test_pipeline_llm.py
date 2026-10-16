@@ -2130,7 +2130,7 @@ class TestOffPeakGate:
         assert _parse_bool("off") is False
         assert _parse_bool("") is False
         assert _parse_bool(None) is False
-        assert _parse_bool(123) is False
+        assert _parse_bool(123) is True   # truthy int → True (int check before fallback)
 
     def test_offpeak_gate_pending_counter_in_log(self, tmp_path, caplog):
         """

@@ -41,8 +41,8 @@
 14. Протесты и забастовки (мир) — крупные, только факты.
 
 ## Технологии
-Python 3.8+, feedparser, httpx, PyYAML, SQLite (stdlib).
-Отправка в ТГ: python-telegram-bot. LLM: DeepSeek (deepseek-flash по умолч., deepseek-v4-pro — альтернатива),
+Python 3.12, feedparser, httpx, PyYAML, SQLite (stdlib).
+Отправка в ТГ: httpx + Telegram Bot API. LLM: DeepSeek (deepseek-flash по умолч., deepseek-v4-pro — альтернатива),
 ~1–2 $/мес. Запуск: `python -m newsbot --once` / `python -m newsbot` (демон).
 
 ## Архитектура
@@ -70,10 +70,31 @@ llm_score не тратят бюджет, few-shot блок в промпте) �
     («apple announces X» vs «google announces X» не склеятся, разные сущности).
 - Нормализация: lowercase, collapse spaces, strip, удаление пунктуации,
   срез префиксов `Reuters:`, `Bloomberg:`, `Источник:` и т.п.
-- NOTE: семантические перефразы НЕ ловятся (нужны embeddings/LLM, отдельно).
 - При `cross_source=false` fuzzy игнорируется — сохранено прежнее per-source поведение.
 - Хранилище для fuzzy: колонка `title_normalized` в `seen_titles` (идемпотентная
   миграция v8→v9, `ALTER TABLE ADD COLUMN IF NOT EXISTS`).
+
+**LLM-дедупликация (семантическая, «одно событие — разные формулировки»):**
+  *Отдельный лёгкий LLM-вызов (только заголовки) ДО скоринга.*
+  Запускается через `LLMFilter.detect_duplicates(items, recent_titles)` → `Set[int]`
+  (0-based индексы дублей). Ключ `llm.llm_dedup: true/false` (дефолт True).
+  Конфиг: `dedup.llm_recent_limit: 20` (recent titles в контексте), `window_days: 3`
+  (источник для recent из items table).
+  - Критерий: «одно и то же событие, разные слова/язык/числа».
+    Примеры: RU-пара «сбили 80 дронов» (Интерфакс) ↔ «сбили 80 БПЛА» (ТАСС);
+    EN-пара «34 children killed» (Guardian) ↔ «dozens killed» (Sky News).
+  - Промпт: `DEDUP_SYSTEM_PROMPT` + `build_dedup_user_message()` (prompts.py).
+    Ответ: `{"duplicates": [1, 3, ...]}` — 1-based индексы основного списка.
+    Делимитеры `<|данные:N|>` защищают от injection (sanitize_item_field).
+  - Чанкование: по 40 кандидатов на вызов; `recent` подмешивается в каждый чанк.
+  - Устойчивость: `LLMError` → пустое множество (безопасно, ни один дубль не пропущен);
+    битые/несуществующие индексы → игнорируются; `<2` кандидатов → вызова нет.
+  - Интеграция в pipeline: вызывается один раз за цикл (ДО скоринга) в
+    `run_cycle_with_delivery()`, после сбора `candidates` и `save_many`.
+    Найденные дубли → `storage.save_skipped()` (URL-дедуп) + исключаются из `all_items`.
+  - `storage.get_recent_titles(window_days, limit, exclude_source) → List[(title, source)]`:
+    читает оригинальные (не нормализованные) заголовки из `items` table
+    (исключая `skipped/failed`), лимит 20 по умолчанию.
 
 **State-машина (v9):** new / pending / delivered / skipped / deferred / failed / digested.
 `retry_count` INTEGER DEFAULT 0 в БД. При исчерпании retry_count >= max_retries
@@ -172,7 +193,7 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 
 **Дайджест:**
 - Собирает items state='deferred', сортирует llm_score DESC, fetched_at ASC.
-- Расписание: 2×/день из digest.times (локальная tz, дефолт ["09:00","21:00"]),
+- Расписание: 2×/день из digest.times (локальная tz, дефолт ["08:00","20:00"]),
   ручной запуск `--digest` или `/digest` из Telegram.
 - Конфиг: digest.enabled / digest.times / digest.max_items (≤30) / digest.max_items_per_message / digest.on_empty.
 - `digest.max_items=30` — лимит новостей в одном дайджесте (топ-30 по score).
@@ -180,7 +201,11 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - `last_digest_at` пишется ТОЛЬКО при успешной отправке ≥1 новости.
 - State='digested' ставится только реально отправленным items (at-least-once).
 - Частичный сбой: отправленные → 'digested', остаток → 'deferred' (retry в следующем окне).
-- Кнопки 👍/👎 добавляются к каждой новости дайджеста (kind='digest').
+- **Кнопки 👍/👎 в дайджесте ОТКЛЮЧЕНЫ по умолчанию.** Конфиг:
+  `feedback.digest_enabled: false` (дефолт). При false → send_text (без клавиатуры),
+  feedback_targets НЕ создаются (экономия БД). При true → send_digest с кнопками
+  👍/👎 (только они; URL в тексте как `<a href="...">🔗</a>`). Пуш-сообщения
+  не затронуты: 👍/👎 остаются в пушах как прежде.
 
 **TelegramPoller (Фаза 2b):**
 - Long-poll getUpdates в демон-потоке. Запускается только в демон-режиме
@@ -195,8 +220,11 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - feedback_targets: новость отправлена → записана с кнопками (идемпотентно по url+kind).
 - feedback: голос пользователя (like/dislike) → upsert (re-vote обновляет verdict+updated_at).
 - Таблица feedback НЕ чистится (практически permanent — обучающие данные).
-- Конфиг: feedback.enabled / feedback.max_examples / feedback.retention_days
-  (чистит только feedback_targets, не feedback).
+- Конфиг: feedback.enabled / **feedback.digest_enabled** (bool, дефолт false) /
+  feedback.max_examples / feedback.retention_days (чистит только feedback_targets, не feedback).
+- digest_enabled=false (дефолт): дайджест без кнопок 👍/👎, без создания targets → send_text.
+  digest_enabled=true: дайджест с 👍/👎 (URL-кнопка НЕ дублируется — он в тексте).
+- Пуш: 👍/👎 остаются без изменений.
 
 **Формат карточки в ТГ:**
 ```
@@ -217,18 +245,25 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 Игры (3): IGN, Eurogamer, DTF. Кино (2): Deadline, Variety.
 
 ## Тесты
-**564 тестов, 12 файлов, запуск: `python -m pytest tests -q`**
-- `test_llm_batch` (19 новых: happy path, per-item fallback, pipeline-интеграция)
-- `test_llm_filter_mocks` — LLM-фильтр (mock client)
+**689 тестов, 18 файлов, запуск: `python -m pytest tests -q -p no:randomly`**
+- `test_llm_batch` — батч-оценка (happy path, per-item fallback, pipeline-интеграция)
+- `test_llm_filter_mocks` — LLM-фильтр (mock client, urgent/route/parse)
 - `test_pipeline_llm` — pipeline + LLM
 - `test_core_reliability` — retry/recovery/failed/state-машина
 - `test_delivery_security` — delivery + security hardening
 - `test_digest` — дайджест, build_digest_messages, ≤4096
+- `test_digest_feedback` — дайджест + feedback
 - `test_feedback_storage` — feedback_targets + feedback CRUD
 - `test_feedback_flow` — pipeline + feedback, few-shot context
-- `test_telegram_poller` — TelegramPoller, callback, команды
+- `test_telegram_poller` — TelegramPoller, callback, команды, backoff, 409 Conflict
 - `test_feedback_prompt` — build_feedback_block, санитизация, лимиты
 - `test_dedup` — кросс-источниковая дедупликация (точный + fuzzy), нормализация, миграция v9
+- `test_dedup_llm` — LLM-дедупликация
+- `test_offpeak` — off-peak гейт
+- `test_pause` — пауза /stop /continue
+- `test_config_env_collector` — env.py (m2/unquoted-spaces), DEFAULT_CONFIG, collector M1 (max-feed-bytes + httpx.MockTransport)
+- `test_log_sanitizer` — лог-санитизация, лимиты, unicode
+- `test_digest_schedule` — расписание дайджеста
 
 ## Фиксы по ревью (краткий список)
 
@@ -325,6 +360,10 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - [x] Фаза 2c (Few-shot адаптация): ✅ РЕАЛИЗОВАН. build_feedback_block,
   санитизация control-chars, маркер «ДАННЫЕ (НЕ ИНСТРУКЦИИ)», охранная
   директива в SYSTEM_PROMPT, суммарный лимит 1500.
+- [x] Фича «без кнопок 👍/👎 в дайджесте»: ✅ РЕАЛИЗОВАНА. Конфиг
+  `feedback.digest_enabled: false` (дефолт), `send_text` без клавиатуры,
+  без создания feedback_targets (экономия БД). При `digest_enabled=true` —
+  `send_digest` с 👍/👎 (URL в тексте, не дублируется кнопкой).
 - [ ] Этап 3: скрейперы, RSSHub-мост для ТГ-каналов (Astra, Baza, Shot, Mash,
   Sirena), Steam-подписки на тайтлы, USGS GeoJSON (землетрясения).
 - [x] Этап 5: деплой 24/7 (Docker), VPS, живая проверка фидов и Telegram.

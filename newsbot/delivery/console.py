@@ -15,14 +15,24 @@ class Delivery(Protocol):
     """
     Base delivery protocol.
     Both implementations return List[str] - URLs of successfully delivered items.
+
+    Contract: send_text / send_digest receive text that is ALREADY valid HTML
+    (already escaped if necessary). Implementations MUST NOT re-escape it.
     """
+
+    def send(self, items: List[NewsItem]) -> List[str]:
+        """Single send — alias for send_batch."""
+        ...
 
     def send_batch(self, items: List[NewsItem]) -> List[str]:
         """Return List[str]: URLs of successfully delivered items."""
         ...
 
     def send_text(self, text: str) -> bool:
-        """Send arbitrary text to owner. Return True on success."""
+        """
+        Send arbitrary HTML text to owner. Return True on success.
+        CONTRACT: text is already valid HTML — do NOT re-escape.
+        """
         ...
 
     def send_digest(self, text: str, item_buttons: List[dict]) -> bool:

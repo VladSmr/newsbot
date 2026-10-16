@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import List, Tuple
 
 from .delivery import Delivery, format_time_utc
+from .delivery.telegram import is_valid_http_url
 
 # Тип для кнопок одной новости в дайджесте
 DigestItemButtons = List[dict]  # [{url, target_id}, ...]
@@ -82,13 +83,10 @@ def _render_item_raw(item: NewsItem) -> Tuple[str, str, str, str]:
     pub_parsed = getattr(item, "published_parsed", None)
     time_str = format_time_utc(pub_parsed, item.fetched_at)
 
-    # URL-whitelist: только http/https
-    url = item.url or ""
-    url_clean = url.strip()
-    if url_clean and not (
-        url_clean.startswith("http://") or url_clean.startswith("https://")
-    ):
-        url_clean = ""
+    # URL-whitelist: использует общий helper (согласован с telegram.py).
+    # is_valid_http_url: схема http/https, нет control-символов, нет whitespace,
+    # нет leading/trailing, длина ≤ 1024.
+    url_clean = is_valid_http_url(item.url or "")
 
     if url_clean:
         # M1'-фикс: cap по ESCAPED длине — "&"/'"' раздуваются в 6 раз.
@@ -184,25 +182,34 @@ def build_digest_messages(
     # Текущее сообщение
     cur_entries: List[Tuple[str, NewsItem]] = []   # (entry_html, item)
     cur_raw: List[Tuple[str, str, str, str]] = []  # (title, source, body, footer)
+    msg_start_index: int = 0   # 1-based start item number для текущего msg
 
-    def _make_header(cnt: int) -> str:
+    def _make_header(start: int, end: int) -> str:
+        if start == end:
+            return (
+                f"📰 Дайджест — {start} из {total} новостей — {time_str}\n"
+                + "─" * 40 + "\n"
+            )
         return (
-            f"📰 Дайджест — {cnt} из {total} новостей — {time_str}\n"
+            f"📰 Дайджест — {start}–{end} из {total} новостей — {time_str}\n"
             + "─" * 40 + "\n"
         )
 
     def _emit() -> None:
         """Формирует и сохраняет текущее сообщение."""
-        nonlocal message_groups, all_included, cur_entries, cur_raw
+        nonlocal message_groups, all_included, cur_entries, cur_raw, msg_start_index
         if not cur_entries:
             return
-        header = _make_header(len(cur_entries))
+        start = msg_start_index + 1
+        end = msg_start_index + len(cur_entries)
+        header = _make_header(start, end)
         body = "\n\n".join(html for html, _ in cur_entries)
         msg = header + "\n" + body
         message_groups.append((msg, [item for _, item in cur_entries]))
         all_included.extend(item for _, item in cur_entries)
         cur_entries = []
         cur_raw = []
+        msg_start_index = end
 
     def _assemble_entry(title_r: str, source_r: str, body_r: str,
                        footer_r: str, usable: int) -> str:
@@ -257,7 +264,7 @@ def build_digest_messages(
 
         if cur_entries:
             # Есть накопленные: считаем бюджет
-            header = _make_header(len(cur_entries) + 1)
+            header = _make_header(msg_start_index + 1, msg_start_index + len(cur_entries) + 1)
             used = len(header)
             for t, s, b, f in cur_raw:
                 used += _entry_size(t, s, b, f) + 2
@@ -268,7 +275,7 @@ def build_digest_messages(
 
         if not cur_entries:
             # Fresh message: считаем budget для одного entry
-            header = _make_header(1)
+            header = _make_header(msg_start_index + 1, msg_start_index + 1)
             usable = _TG_MESSAGE_MAX - len(header) - _MARGIN
             entry_html = _assemble_entry(
                 title_r, source_r, body_r, footer_r, usable

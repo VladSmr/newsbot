@@ -147,7 +147,7 @@ class TestTokenSanitizer:
             "Bot token is bot1234567890:AbCdEfGhIjKlMnOpQrStUvWxYz", (), None
         )
         flt.filter(record)
-        assert "bot***:" in record.msg
+        assert "***REDACTED***" in record.msg
         assert "AbCdEfGhIjKlMnOp" not in record.msg
         assert "bot1234567890:" not in record.msg
 
@@ -175,7 +175,7 @@ class TestTokenSanitizer:
         assert "bot99:" not in str(record.args[0])
         # После подстановки msg % args токена тоже нет
         assembled = record.msg % record.args
-        assert "bot***:" in assembled
+        assert "***REDACTED***" in assembled
         assert "Token1234567890XYZ" not in assembled
 
 
@@ -544,7 +544,7 @@ class TestTokenSanitizerMappingArgs:
         flt.filter(record)
         # getMessage() не падает
         message = record.getMessage()
-        assert "bot***:" in message
+        assert "***REDACTED***" in message
         assert "AbCdEfGhIjKlMnOp" not in message
 
     def test_dict_args_token_masked(self):
@@ -563,7 +563,7 @@ class TestTokenSanitizerMappingArgs:
         )
         flt.filter(record)
         message = record.getMessage()
-        assert "bot***:" in message
+        assert "***REDACTED***" in message
         assert "TOKENSEcretPart" not in message
 
     def test_tuple_with_dict_inside_no_type_error(self):
@@ -577,5 +577,5 @@ class TestTokenSanitizerMappingArgs:
         )
         flt.filter(record)
         message = record.getMessage()
-        assert "bot***:" in message
+        assert "***REDACTED***" in message
         assert "TOKENSEcretExtra1" not in message

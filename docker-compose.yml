@@ -3,6 +3,13 @@ services:
     build: .
     # ── secrets ──────────────────────────────────────────────────────
     env_file: .env
+    # ── logging: ограничение роста логов (M3-фикс) ───────────────────
+    # json-file: ротация по size. max-size 10 MB × max-file 3 ≈ 30 MB на сервис.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # ── restart policy ────────────────────────────────────────────────
     restart: unless-stopped
     # ── volumes: БД, конфиг, .env (для --set-chat-id) ────────────────

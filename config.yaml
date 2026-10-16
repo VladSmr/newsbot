@@ -122,6 +122,7 @@ database:
   path: data/newsbot.db
   retention_days: 90       # удалять delivered/skipped/failed/digested + 'new' items старше N дней
   retry_threshold_sec: 60 # pending считается зависшим через N секунд
+  max_retries: 8           # лимит retry попыток → state=failed
   deferred_retention_days: 14  # удалять старые deferred-items старше N дней (не попали в digest)
                                   # 14 дней = окно между дайджестами × запас;
                                   # критично для VPS с 1 GB RAM (deferred копились бесконечно)
@@ -145,7 +146,7 @@ telegram:
 # одним блоком. После успешной отправки получают state='digested'.
 digest:
   enabled: true                       # вкл/выкл автоматический дайджест
-  times: ["09:00", "21:00"]         # HH:MM в ЛОКАЛЬНОЙ tz; совпадает с format_time_utc
+  times: ["08:00", "20:00"]         # HH:MM в ЛОКАЛЬНОЙ tz; совпадает с format_time_utc
   max_items: 30                      # лимит новостей в одном дайджесте (≤30 самых важных, сортировка: score DESC, fetched_at ASC).
                                    # При 40 deferred-items в дайджест попадают только топ-30 (т.к. get_deferred_items LIMIT 30).
   max_items_per_message: 20         # новостей на одно Telegram-сообщение (не более 4096 символов)
@@ -157,6 +158,8 @@ digest:
 # сама таблица feedback хранится практически вечно — это обучающие данные.
 feedback:
   enabled: true                  # вкл/выкл приём фидбэка
+  digest_enabled: false          # вкл/выкл 👍/👎 кнопок в дайджесте (дефолт false;
+                                 # ссылка на новость остаётся в тексте как <a href>)
   max_examples: 10               # сколько последних вердиктов подмешивать в few-shot
   retention_days: 180             # удалять feedback_targets старше N дней
                                  # (сама таблица feedback не чистится —
@@ -181,11 +184,17 @@ dedup:
   threshold: 0.95                # порог SequenceMatcher ratio (0..1)
   token_threshold: 0.8           # порог Jaccard значащих токенов (0..1)
   window_days: 3                # окно сравнения для fuzzy и cross_source (в днях)
+  llm_recent_limit: 20          # сколько недавних заголовков подмешивать в LLM-дедуп
 
 # --- LLM-фильтр ---
 llm:
   enabled: true
   provider: deepseek
+  # llm_dedup: семантическая дедупликация через LLM (группировка «одно событие»).
+  #   Дополняет лексический дедуп (cross_source/fuzzy) для перефразировок,
+  #   межъязыковых дублей, разных формулировок чисел.
+  #   При сбое LLM — безопасный пропуск (безопасно: ни один дубль не проходит).
+  llm_dedup: true
   base_url: https://api.deepseek.com
   model: deepseek-flash          # ⚠️ проверить id живым ключом: python -m newsbot --check-llm
                                   #   При 4xx/404 — fallback (все новости без фильтра).

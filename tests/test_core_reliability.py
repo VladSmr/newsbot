@@ -395,10 +395,19 @@ class TestBrokenFeedResilience(unittest.TestCase):
 
         collector = FeedCollector(_FakeSources.BAD)
 
-        # Ловим TooManyRedirects — наследует HTTPError, не RequestError
+        # K2-фикс: _fetch_feed теперь использует .stream() (не .get()).
+        # Мокаем .stream() чтобы бросал exception — тело глотается в generic Exception.
+        class FailingContext:
+            def __init__(self, exc):
+                self._exc = exc
+            def __enter__(self):
+                raise self._exc
+            def __exit__(self, *args):
+                return False
+
         with patch.object(
-            collector._client, "get",
-            side_effect=Exception("Unexpected exception")
+            collector._client, "stream",
+            side_effect=Exception("Unexpected exception from stream")
         ):
             name, result = next(collector.collect())
             self.assertFalse(result.ok)
@@ -408,11 +417,27 @@ class TestBrokenFeedResilience(unittest.TestCase):
 
     def test_feed_collector_graceful_on_network_error(self):
         """Сеть недоступна — FeedResult(ok=False, items=[])."""
+        # K2-фикс: мокаем .stream() для httpx.ConnectError (RequestError).
+        # Раньше тест ходил в localhost:9999 и "зеленел" случайно.
+        from unittest.mock import MagicMock
+        from newsbot.collector import FeedResult
+
         collector = FeedCollector(_FakeSources.BAD)
-        # httpx.ConnectError наследует RequestError — уже ловился, проверим
-        name, result = next(collector.collect())
-        # Может упасть или вернуть ok=False
-        self.assertIsInstance(result, FeedResult)
+
+        # Имитируем контекстный менеджер, бросающий RequestError
+        import httpx
+
+        class NetworkErrorContext:
+            def __enter__(self):
+                raise httpx.ConnectError("Connection refused")
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(collector._client, "stream", return_value=NetworkErrorContext()):
+            name, result = next(collector.collect())
+            self.assertIsInstance(result, FeedResult)
+            self.assertFalse(result.ok)
+
         collector.close()
 
 

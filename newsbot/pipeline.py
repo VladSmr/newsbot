@@ -27,7 +27,8 @@ deferred-items (до max_items сообщений с ретраями Telegram A
 
 
 import logging
-from datetime import datetime, timezone as tz
+import math
+from datetime import datetime, timedelta, timezone as tz
 from typing import List, Optional, Set
 
 from .collector import FeedCollector, FeedResult, NewsItem
@@ -47,11 +48,14 @@ def _parse_bool(value) -> bool:
     """
     Явный парсер bool-значений из конфига.
     - bool: как есть
+    - int: 1 → True, 0 → False (bool подкласс int → check ПЕРЕД int)
     - str: "true","1","yes","on" (case-insensitive) → True; всё остальное → False
     - прочее: False
     """
     if isinstance(value, bool):
         return value
+    if isinstance(value, int):
+        return bool(value)
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "on")
     return False
@@ -85,6 +89,9 @@ class NewsPipeline:
 
         # кеш фидбэка для few-shot (Фаза 2c); fetched один раз за цикл
         self._feedback_context: Optional[tuple] = None
+
+        # URLs, помеченные LLM-дедупом как дубли (сбрасываются каждый цикл)
+        self._llm_dedup_skipped_urls: Set[str] = set()
 
     def _resolve_db_path(self, config: dict) -> str:
         """
@@ -145,7 +152,8 @@ class NewsPipeline:
         Гейт: feedback.enabled == True. При отключении — ничего не делает.
         Ошибки получения фидбэка — best-effort (не ломают фильтрацию).
         """
-        if not self.config.get("feedback", {}).get("enabled", True):
+        # Minor T4-фикс: _parse_bool для консистентности с __main__.py и run_digest.
+        if not _parse_bool(self.config.get("feedback", {}).get("enabled", True)):
             self._feedback_context = None
             return
 
@@ -180,6 +188,120 @@ class NewsPipeline:
         else:
             self._feedback_context = (dislikes, likes)
 
+    def llm_dedup_enabled(self) -> bool:
+        """
+        Проверяет флаг llm_dedup в конфиге.
+        Дефолт True, парсинг bool из конфига (безопасный, как _parse_bool).
+        """
+        raw = self.config.get("llm", {}).get("llm_dedup", True)
+        return _parse_bool(raw)
+
+    def _run_llm_dedup(self, candidates: List[NewsItem]) -> int:
+        """
+        Выполняет LLM-дедупликацию для candidates.
+
+        Вызывается ОДИН раз за цикл, ПОСЛЕ гейтов паузы и off-peak,
+        ДО скоринга/оценки. Берёт recent titles из БД (кросс-цикловый дедуп).
+        Для найденных дублей:
+          (a) устанавливает state='skipped' через set_state (для дублей, которые
+              УЖЕ в БД со state='new' — корректная перезапись; не спамит новыми
+              INSERT при повторном вызове в том же цикле)
+          (б) ИСКЛЮЧАЕТ из дальнейшей обработки (не скорится/не доставляется)
+
+        При полном сбое LLM → 0 (безопасный пропуск: ничего не пропущено).
+        При llm_dedup=false или <2 кандидатов → 0, вызов не делается.
+
+        Бюджет (max_per_cycle):
+            — Детекция использует ceil(N/40) вызовов detect_duplicates.
+            — Каждый чанк списывается из _llm_calls_left (1 вызов = 1 списание).
+            — Если бюджета недостаточно — дедуп пропускается (безопасный fallback).
+            — Семантика: бюджет покрывает и дедуп, и скоринг; приоритет у скоринга
+              (retry и свежие кандидаты важнее дедупа).
+
+        NOTE (Minor #6): recovered-items (из прошлого цикла) НЕ проходят
+        LLM-дедуп как кандидаты — это осознанно. Они уже получили
+        минимальную оценку при первой обработке; повторный дедуп в рамках
+        того же «события» не даст новой информации, а токены потратит.
+        Кросс-цикловый дедуп относительно recent-новостей покрывает их
+        опосредованно (recent включает delivered/deferred/etc. из прошлых циклов).
+
+        Returns:
+            Количество отсеянных LLM-дублей.
+        """
+        if not candidates:
+            return 0
+
+        # Инициализируем множество, если атрибут отсутствует (тесты через __new__)
+        if not hasattr(self, '_llm_dedup_skipped_urls'):
+            self._llm_dedup_skipped_urls: Set[str] = set()
+
+        dedup_cfg = self.config.get("dedup", {})
+        window_days = int(dedup_cfg.get("window_days", 3))
+        recent_limit = int(dedup_cfg.get("llm_recent_limit", 20))
+
+        # Major #3-фикс: оцениваем стоимость дедупа ДО вызова.
+        # detect_duplicates → ceil(N/40) чанков = ceil(N/40) вызовов.
+        # Если бюджета недостаточно — пропускаем (безопасный fallback).
+        num_chunks = math.ceil(len(candidates) / self.llm_filter._DEDUP_CHUNK_SIZE)
+        if self._llm_calls_left < num_chunks:
+            logger.info(
+                "LLM-дедуп: бюджет %d < %d (нужно %d чанков) — пропускаем, "
+                "бюджет сохранён для скоринга (%d items)",
+                self._llm_calls_left, num_chunks, num_chunks, len(candidates),
+            )
+            return 0
+        # Списываем бюджет заранее (до вызова — списываемое == ceil(N/40)).
+        # Детектор сам глотает LLMError и возвращает пустое множество,
+        # поэтому реальных сбоев после списания почти не бывает —
+        # возврат через except почти недостижим. Но guard оставлен
+        # для устойчивости к непредвиденным исключениям (сбой сети и т.п.).
+        self._llm_calls_left -= num_chunks
+
+        # Собираем recent titles из БД
+        recent = self.storage.get_recent_titles(
+            window_days=window_days,
+            limit=recent_limit,
+        )
+        # Преобразуем в формат, ожидаемый detect_duplicates
+        recent_list = [{"title": t, "source": s} for t, s in recent]
+
+        try:
+            dup_0based = self.llm_filter.detect_duplicates(candidates, recent_list)
+        except Exception as e:
+            # Возврат при непредвиденном сбое (LLMError уже обработан внутри
+            # detect_duplicates, но на случай непредвиденных исключений — возврат).
+            self._llm_calls_left += num_chunks
+            logger.warning("_run_llm_dedup: исключение: %s — пропускаем (безопасно)", e)
+            return 0
+
+        if not dup_0based:
+            return 0
+
+        # Собираем URLs дублей
+        dup_urls = [candidates[idx].url for idx in sorted(dup_0based) if idx < len(candidates)]
+
+        # Critical #2-фикс: устанавливаем state='skipped' РЕАЛЬНОЙ перезаписью.
+        # Для дублей, которые УЖЕ в БД со state='new' (через save_many):
+        #   save_skipped = INSERT OR IGNORE → rowcount=0 → state остаётся 'new'
+        #   → K1-recovery подхватит их в след.цикле или они застрянут навсегда.
+        # set_state — UPDATE, который РЕАЛЬНО меняет state='new' → 'skipped'.
+        if dup_urls:
+            marked = self.storage.set_state(dup_urls, "skipped")
+            logger.debug(
+                "LLM-дедуп: set_state('skipped') для %d дублей → %d строк обновлено",
+                len(dup_urls), marked,
+            )
+
+        # (б) запоминаем для исключения из дальнейшей обработки
+        self._llm_dedup_skipped_urls.update(dup_urls)
+
+        logger.info(
+            "LLM-дедуп: отсеяно %d/%d кандидатов (семантические дубли «одно событие»), "
+            "бюджет списан: %d (дедуп) + далее скоринг",
+            len(dup_urls), len(candidates), num_chunks,
+        )
+        return len(dup_urls)
+
     def _build_delivery(self, config: dict) -> Delivery:
         token = config.get("telegram", {}).get("token", "") or ""
         chat_id = config.get("telegram", {}).get("chat_id", "") or ""
@@ -197,7 +319,7 @@ class NewsPipeline:
         Без ключа — логирует warning, возвращает None.
         """
         llm_cfg = config.get("llm") or {}
-        if not llm_cfg.get("enabled"):
+        if not _parse_bool(llm_cfg.get("enabled", True)):
             logger.info("LLM-фильтр выключен в конфиге")
             return None
 
@@ -369,6 +491,23 @@ class NewsPipeline:
             self._run_delivery_side_effects()
             self._cleanup()
             return  # ← выходим из цикла; LLM не вызывается
+
+        # ── LLM-дедупликация: семантическая группировка «одно событие» ──
+        # Critical #1-фикс: вызов ПОСЛЕ гейтов паузы и off-peak.
+        # На паузе и в off-peak LLM-дедуп НЕ вызывается — экономия платных токенов.
+        # Кандидаты уже сохранены в БД (state='new'), лексический дедуп и seen_titles
+        # также уже выполнены (до гейтов) — сохранность данных обеспечена.
+        # При сбое LLM — безопасный пропуск: ни один дубль не проходит.
+        llm_dedup_skipped = 0
+        if self.llm_dedup_enabled() and self.llm_filter is not None:
+            llm_dedup_skipped = self._run_llm_dedup(candidates)
+            # Исключаем LLM-дубли из дальнейшей обработки
+            if llm_dedup_skipped > 0:
+                skipped_urls = getattr(self, '_llm_dedup_skipped_urls', set())
+                all_items = [i for i in all_items if i.url not in skipped_urls]
+            if getattr(self, '_llm_dedup_skipped_urls', None):
+                # Очищаем после использования
+                self._llm_dedup_skipped_urls.clear()
 
         # ── B13: retry-очередь обрабатывается ПЕРЕД кандидатами ──
         # резервируем не менее половины бюджета под retry при наличии таковых
@@ -611,8 +750,9 @@ class NewsPipeline:
         # F3: kind из item._feedback_kind ('push' или 'fallback').
         # best-effort: ошибка создания target НЕ ломает доставку.
         from .delivery import TelegramDelivery
+        # Minor T4-фикс: _parse_bool для консистентности с __main__.py и run_digest.
         should_feedback = bool(
-            self.config.get("feedback", {}).get("enabled", True)
+            _parse_bool(self.config.get("feedback", {}).get("enabled", True))
             and isinstance(self.delivery, TelegramDelivery)
         )
         if should_feedback:
@@ -784,10 +924,12 @@ class NewsPipeline:
         (может отправить пустой дайджест). force=False + пустой список
         → пропускает (on_empty=skip в конфиге).
 
-        Feedback (Фаза 2b-2b): для каждого отправляемого item создаётся
-        feedback_target (kind='digest') через get_or_create_feedback_target_from_item
-        (идемпотентно). Кнопки 👍/👎 добавляются в сообщение дайджеста.
-        Создание target — best-effort, ошибка не ломает дайджест.
+        Feedback (Фаза 2b-2b): при feedback.digest_enabled=true для каждого
+        отправляемого item создаётся feedback_target (kind='digest') через
+        get_or_create_feedback_target_from_item (идемпотентно). Кнопки 👍/👎
+        добавляются в сообщение дайджеста. Создание target — best-effort,
+        ошибка не ломает дайджест. При digest_enabled=false (дефолт) —
+        feedback_targets НЕ создаются, отправляется send_text (без клавиатуры).
 
         Args:
             force: если True — работает даже при digest.enabled=false
@@ -797,7 +939,7 @@ class NewsPipeline:
             Количество отправленных новостей (0 если пропущен/ошибка).
         """
         digest_cfg = self.config.get("digest", {}) or {}
-        enabled = digest_cfg.get("enabled", True)
+        enabled = _parse_bool(digest_cfg.get("enabled", True))
 
         # M3: --digest (force) работает независимо от enabled
         if not enabled and not force:
@@ -808,23 +950,27 @@ class NewsPipeline:
         max_items_per_message = int(digest_cfg.get("max_items_per_message", 20))
         on_empty = digest_cfg.get("on_empty", "skip")
 
-        # Проверяем, есть ли что отправлять
-        deferred = self.storage.get_deferred_items(limit=1)
-        if not deferred and not force:
+        # Nit T4-фикс: одно чтение вместо двух (ранее было limit=1 + limit=max_items).
+        # Deferred items читаем ОДИН раз, используем для обеих проверок.
+        deferred_items = self.storage.get_deferred_items(limit=max_items)
+        if not deferred_items and not force:
             if on_empty == "skip":
                 logger.debug("Дайджест: нет отложенных новостей, пропускаем.")
                 return 0
 
         # ── Feedback targets + передача готовых groups в digest ──
-        # F2: только при TelegramDelivery + feedback.enabled
+        # F2: только при TelegramDelivery + feedback.enabled + digest_enabled.
+        # digest_enabled=false (дефолт): не создаём targets (экономия БД-записей),
+        # item_buttons_per_msg=None → send_text (без клавиатуры).
         # m2-фикс: единый источник — groups строятся ОДИН раз в pipeline,
-        # передаются в digest._run_digest_with_groups (без пересчёта).
+        # передаются в run_digest() (без пересчёта).
         # Порядок кнопок СТРОГО соответствует порядку новостей в groups.
-        should_feedback = bool(
-            self.config.get("feedback", {}).get("enabled", True)
+        feedback_cfg = self.config.get("feedback", {})
+        should_feedback = (
+            _parse_bool(feedback_cfg.get("enabled", True))
+            and _parse_bool(feedback_cfg.get("digest_enabled", False))
             and isinstance(self.delivery, TelegramDelivery)
         )
-        deferred_items = self.storage.get_deferred_items(limit=max_items)
 
         groups, _ = build_digest_messages(
             deferred_items,
@@ -834,7 +980,7 @@ class NewsPipeline:
         # R1-фикс: НЕ выходи раньше если on_empty="send" и deferred пуст.
         # on_empty="send" должен отправить уведомление "нет новых новостей"
         # даже когда groups пустые (и deferrred пустой).
-        if not groups and not (not deferred and on_empty == "send"):
+        if not groups and not (not deferred_items and on_empty == "send"):
             logger.info("Дайджест: нет сообщений для отправки.")
             return 0
 
@@ -854,10 +1000,11 @@ class NewsPipeline:
                             item.title[:60], e,
                         )
                         target_id = None
-                    # m1 (T2): URL-whitelist для кнопки — http/https проверяется в telegram.py,
-                    # здесь передаём как есть (None если пустой)
+                    # NOTE: поле "url" намеренно НЕ передаётся — send_digest()
+                    # использует только target_id. Ссылка на новость уже в тексте
+                    # дайджеста (<a href> в digest.py footer); дублирование
+                    # кнопкой отключено (URL-кнопка сломала бы экранирование).
                     item_buttons.append({
-                        "url": item.url or None,
                         "target_id": target_id,
                     })
                 item_buttons_per_msg.append(item_buttons)
@@ -882,7 +1029,7 @@ class NewsPipeline:
                 "last_digest_at",
                 datetime.now(tz.utc).isoformat(),
             )
-        elif not deferred and on_empty == "send":
+        elif not deferred_items and on_empty == "send":
             # on_empty=send: отправляем пустое уведомление
             empty_msg = "📰 Дайджест — нет новых новостей."
             try:
@@ -904,20 +1051,23 @@ class NewsPipeline:
         """
         Проверяет расписание дайджеста (digest.times в локальной tz).
 
-        M1: логика «наступило/просрочено». Для каждого времени t из times:
-          1. scheduled = ближайший запланированный момент t сегодня
-             (или вчера, если now < t и вчера ещё не обработан).
-          2. Окно считается «необработанным», если:
-               — last_digest_at < scheduled И
-               — last_digest_at < (scheduled + 30 мин)
-             т.е. дайджест ещё НЕ отправлялся для этого scheduled-окна.
-          3. Если now >= scheduled И окно не обработано → запускаем.
+        T4-фикс (docstring ↔ код): актуальная логика:
 
-        Это гарантирует: нет пропусков (цикл в любую минуту после scheduled
-        отработает) и нет дублей (last_digest_at блокирует повтор).
+          1. Для каждого времени t из times:
+               scheduled сегодня или вчера (ближайший <= now).
+          2. Окно «необработано» если:
+               — last_digest_at < scheduled  (по timestamp)
+          3. Если now >= scheduled И окно не обработано → запускаем.
+             НА СВЕЖЕЙ БД (last_digest_at пуст): дайджест отправляется
+             только если текущее время >= scheduled. Раньше scheduled
+             — не отправляется (catch-up до scheduled не выполняется).
+
+          Это гарантирует: нет пропусков (цикл в любую минуту после
+          scheduled отработает) и нет дублей (last_digest_at блокирует
+          повтор).
         """
         digest_cfg = self.config.get("digest", {}) or {}
-        if not digest_cfg.get("enabled", True):
+        if not _parse_bool(digest_cfg.get("enabled", True)):
             return
 
         times = digest_cfg.get("times", ["09:00", "21:00"])
@@ -944,25 +1094,34 @@ class NewsPipeline:
             sched_today = now_local.replace(
                 hour=sched_hour, minute=sched_min, second=0, microsecond=0
             )
-            # Вчерашний scheduled момент: для случая когда now ещё не наступил
-            # сегодня, но вчерашнее окно ещё не обработано.
-            from datetime import timedelta
-            sched_yesterday = sched_today - timedelta(days=1)
 
-            # Выбираем ближайший scheduled момент, который <= now_local
-            candidates = [c for c in [sched_today, sched_yesterday] if c <= now_local]
-            if not candidates:
-                # Будущее время — пропускаем
-                continue
+            # ── Выбор окна для отправки ────────────────────────────
+            # (1) Свежая БД (last_digest is None): только сегодняшние уже
+            #     прошедшие окна. Вчерашние НЕ рассматриваются — не шлём
+            #     дайджест «на всякий случай» до первого scheduled.
+            # (2) Непустой last_digest: catch-up пропущенных окон — ищем
+            #     ближайший прошедший момент (today или yesterday), который
+            #     старше last_digest. Это покрывает пропущенные циклы
+            #     и задержанные запуски (now > scheduled).
+            if last_digest is None:
+                # Свежая БД: только сегодняшние уже прошедшие окна
+                if sched_today > now_local:
+                    continue  # будущее — пропускаем
+                actual_scheduled = sched_today
+            else:
+                # Catch-up: вчерашнее и/или сегодняшнее, whichever <= now_local
+                sched_yesterday = sched_today - timedelta(days=1)
+                candidates = [c for c in [sched_today, sched_yesterday] if c <= now_local]
+                if not candidates:
+                    continue
+                actual_scheduled = max(candidates)
 
-            # Берём самый поздний из прошедших (actual_scheduled)
-            actual_scheduled = max(candidates)
             sched_key = actual_scheduled.strftime("%H:%M")
 
             # Окно обработано если last_digest_at >= actual_scheduled.
             # Сравниваем через timestamp() — корректно работает с разными tzinfo.
-            if (last_digest is not None
-                    and last_digest.timestamp() >= actual_scheduled.timestamp()):
+            if last_digest is not None and \
+                    last_digest.timestamp() >= actual_scheduled.timestamp():
                 logger.debug(
                     "Дайджест: scheduled=%s уже обработан (last=%s)",
                     sched_key, last_raw,
@@ -1010,7 +1169,7 @@ class NewsPipeline:
         При низком балансе отправляет алерт владельцу.
         """
         balance_cfg = self.config.get("llm", {}).get("balance") or {}
-        if not balance_cfg.get("enabled", True):
+        if not _parse_bool(balance_cfg.get("enabled", True)):
             return
 
         if self.llm_filter is None:

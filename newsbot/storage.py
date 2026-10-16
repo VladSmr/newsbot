@@ -1731,6 +1731,60 @@ class Storage:
         ).fetchall()
         return [(r[0], r[1], r[2], r[3]) for r in rows]
 
+    def get_recent_titles(
+        self,
+        window_days: int,
+        limit: int = 20,
+        exclude_source: Optional[str] = None,
+    ) -> List[tuple]:
+        """
+        Возвращает недавние новости из БД с читаемыми заголовками
+        (для LLM-дедупликации, кросс-цикловый дедуп).
+
+        M1-фикс: возвращает ТОЛЬКО новости, которые УЖЕ УШЛИ — сохранены,
+        отправлены или отложены в ПРОШЛЫХ циклах. Состояния
+        ('delivered', 'deferred', 'digested') — это прошедшие обработку,
+        они не потеряются при пометке их дубликатами.
+
+        НЕ возвращаются: 'new' (кандидаты текущего цикла, ещё не обработаны),
+        'pending' (в процессе обработки), 'skipped'/'failed' (отклонены ранее).
+
+        Это гарантирует: кандидат текущего цикла (state='new') не может быть
+        помечен дубликатом самого себя или другого кандидата из того же цикла.
+        При этом cross-cycle дедуп сохраняется полностью.
+
+        Returns:
+            List[(title, source)].
+
+        Args:
+            window_days: окно в днях
+            limit: лимит возвращаемых записей (default 20)
+            exclude_source: исключить конкретный source
+        """
+        conn = self._connect()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=window_days)
+        ).isoformat()
+
+        params: list = [cutoff]
+        source_filter = ""
+        if exclude_source:
+            source_filter = " AND source != ?"
+            params.append(exclude_source)
+
+        rows = conn.execute(
+            f"""
+            SELECT title, source
+            FROM items
+            WHERE state_at > ?{source_filter}
+              AND state IN ('delivered', 'deferred', 'digested')
+            ORDER BY state_at DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     def save_skipped(self, item: NewsItem) -> bool:
         """
         Сохраняет item в items со state='skipped' (кросс-источниковый дубль).

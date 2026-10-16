@@ -1,6 +1,17 @@
 # ── Runtime image ─────────────────────────────────────────────────────
 FROM python:3.12-slim
 
+# Устанавливаем tzdata ДО ENV TZ — python:3.12-slim не содержит tzdata.
+# Без этого TZ=Europe/Moscow игнорируется и часы уезжают на UTC.
+# ENV DEBIAN_FRONTEND=noninteractive: нет интерактивного диалога tzselect.
+# cp /usr/share/zoneinfo + echo в /etc/timezone — гарантирует tz вне зависимости
+# от переменной TZ (belt-and-suspenders).
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && cp /usr/share/zoneinfo/Europe/Moscow /etc/localtime \
+    && echo "Europe/Moscow" > /etc/timezone
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     # TZ нужен для корректного расписания дайджеста (digest.times в локальной tz)

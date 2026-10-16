@@ -62,6 +62,7 @@ def _strip_source_prefix(title: str) -> str:
     return result
 
 FETCH_TIMEOUT = 15  # секунд
+MAX_FEED_BYTES = 10 * 1024 * 1024  # 10 MB — защита от gzip-бомбы / гигантского фида
 USER_AGENT = (
     "Mozilla/5.0 (compatible; NewsBot/1.0; +https://github.com/newsbot) "
     "Python/3.8/httpx"
@@ -179,11 +180,36 @@ class FeedCollector:
         (в т.ч. пустой список если фид легитимно пуст).
         Возвращает FeedResult(ok=False, items=[]) при любой ошибке.
         """
-        # ── HTTP ──
+        # ── HTTP: лимит по РАСПАКОВАННОМУ телу — защита от gzip-бомбы / гигантского фида ──
         try:
             logger.debug("[%s] GET %s", name, url)
-            resp = self._client.get(url)
-            resp.raise_for_status()
+
+            # Быстрый отказ по Content-Length (РАЗМЕР СЖАТОГО тела, не точный).
+            # Не заменяет счётчик распакованных байтов — тот ниже.
+            cl_str = ""
+            with self._client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                cl_str = resp.headers.get("content-length", "")
+                try:
+                    cl = int(cl_str)
+                    if cl > MAX_FEED_BYTES * 3:
+                        # Даже сжимаемый фид в 30 MB — подозрительно, отказ без итераций.
+                        logger.warning("[%s] Content-Length %d >> limit %d, пропускаем",
+                                       name, cl, MAX_FEED_BYTES)
+                        return FeedResult(ok=False, items=[])
+                except (ValueError, TypeError):
+                    pass  # Content-Length нет или невалиден
+
+                # Читаем поток, считая РАСПАКОВАННЫЕ байты (httpx декодирует автоматически).
+                # resp.iter_bytes() — декодированные куски; bytearray растёт по распакованному размеру.
+                buf = bytearray()
+                for chunk in resp.iter_bytes(chunk_size=65536):
+                    buf.extend(chunk)
+                    if len(buf) > MAX_FEED_BYTES:
+                        logger.warning("[%s] Feed too large (%d bytes): %s",
+                                       name, len(buf), url)
+                        return FeedResult(ok=False, items=[])
+                raw = bytes(buf)
         except httpx.TimeoutException:
             logger.warning("[%s] Таймаут (%d с)", name, FETCH_TIMEOUT)
             return FeedResult(ok=False, items=[])
@@ -203,9 +229,9 @@ class FeedCollector:
             logger.warning("[%s] Неожиданная ошибка сбора фида: %s", name, e)
             return FeedResult(ok=False, items=[])
 
-        # ── Парсинг: resp.content (bytes) — корректная автодекодировка XML ──
+        # ── Парсинг: raw (bytes) — автодекодировка XML по XML Declaration ──
         try:
-            parsed = feedparser.parse(resp.content)
+            parsed = feedparser.parse(raw)
         except Exception as e:
             logger.warning("[%s] feedparser ошибка парсинга: %s", name, e)
             return FeedResult(ok=False, items=[])

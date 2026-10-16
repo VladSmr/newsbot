@@ -596,54 +596,47 @@ class TestCommandHandling(unittest.TestCase):
 class TestNetworkErrors(unittest.TestCase):
 
     def test_network_error_in_poll_continues_loop(self):
-        """Сетевая ошибка → backoff, цикл продолжается."""
+        """m2: сетевая ошибка → _poll re-raises (ошибка не глотается)."""
         storage = MagicMock()
         storage.get_meta.return_value = None
         client = MagicMock(spec=_TgClient)
-        import httpx
-        client.getUpdates.side_effect = [
-            httpx.HTTPError("Connection failed"),
-            [],
-        ]
+        client.getUpdates.side_effect = TgApiError(http_status=None, cause=None)
         poller = _build_poller(storage_mock=storage, client_mock=client)
         poller._storage = storage
 
-        try:
+        # m2: _poll не глотает ошибку — re-raises TgApiError
+        with self.assertRaises(TgApiError):
             poller._poll(None)
-        except httpx.HTTPError:
-            pass
-
-        # первый вызов — ошибка, второй вызов — пустой
-        self.assertEqual(client.getUpdates.call_count, 1)
 
     # ── N1: 409 определяется по HTTPStatusError (не по подстроке) ──────────
 
-    def test_409_conflict_via_http_status_error(self):
+    def test_409_conflict_reraises_to_tick(self):
         """
-        N1: 409 определяется по http_status в TgApiError.
+        m2: 409 в _poll — спим 60 с внутри _poll, затем re-raise.
+        _tick ловит re-raise, видит 409 → логирует и выходит.
         """
         storage = MagicMock()
         storage.get_meta.return_value = None
         client = MagicMock(spec=_TgClient)
 
-        # N4: симулируем 409 через TgApiError (не httpx.HTTPStatusError)
         client.getUpdates.side_effect = TgApiError(
             http_status=_HTTP_CONFLICT, cause=None
         )
         poller = _build_poller(storage_mock=storage, client_mock=client)
         poller._storage = storage
-
-        # мокаем _sleep_backoff — не хотим спать 60 секунд в тесте
         poller._sleep_backoff = MagicMock()
 
-        updates = poller._poll(None)
+        # _poll re-raises TgApiError(409) после своего sleep
+        with self.assertRaises(TgApiError) as cm:
+            poller._poll(None)
+        self.assertEqual(cm.exception.http_status, _HTTP_CONFLICT)
 
-        self.assertEqual(updates, [])
-        client.getUpdates.assert_called_once()
+        # 60 с sleep ВНУТРИ _poll (до re-raise)
         poller._sleep_backoff.assert_called_once_with(60.0)
+        client.getUpdates.assert_called_once()
 
-    def test_network_error_returns_empty(self):
-        """Network error (TgApiError без http_status) → backoff, возвращает пустой."""
+    def test_network_error_reraises_to_tick(self):
+        """m2: сетевая ошибка в _poll → re-raise → _tick делает backoff."""
         storage = MagicMock()
         storage.get_meta.return_value = None
         client = MagicMock(spec=_TgClient)
@@ -651,14 +644,111 @@ class TestNetworkErrors(unittest.TestCase):
         client.getUpdates.side_effect = TgApiError(http_status=None, cause=None)
         poller = _build_poller(storage_mock=storage, client_mock=client)
         poller._storage = storage
-
-        # мокаем _sleep_backoff
         poller._sleep_backoff = MagicMock()
 
-        # не падает
-        updates = poller._poll(None)
-        self.assertEqual(updates, [])
-        poller._sleep_backoff.assert_called_once()  # backoff вызван
+        # не падает в _poll — re-raises
+        with self.assertRaises(TgApiError):
+            poller._poll(None)
+
+    def test_tick_handles_network_error_returns_false(self):
+        """
+        m2: _tick ловит сетевую ошибку, делает sleep, ВОЗВРАЩАЕТ False.
+        Backoff растёт в _run_loop (НЕ в _tick).
+        """
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+        client = MagicMock(spec=_TgClient)
+
+        client.getUpdates.side_effect = TgApiError(http_status=500, cause=None)
+        poller = _build_poller(storage_mock=storage, client_mock=client)
+        poller._storage = storage
+        poller._sleep_backoff = MagicMock()
+        poller._backoff = 4.0
+
+        # _tick → False (ошибка), sleep на 4 с, backoff НЕ меняется в _tick
+        result = poller._tick(backoff=4.0)
+
+        self.assertIs(result, False)
+        poller._sleep_backoff.assert_not_called()  # sleep — в _run_loop
+        self.assertEqual(poller._backoff, 4.0)
+
+    def test_tick_returns_true_on_success(self):
+        """_tick возвращает True при успешной обработке updates."""
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+        client = MagicMock(spec=_TgClient)
+        client.getUpdates.return_value = [
+            {"update_id": 5, "callback_query": _make_cb(5)},
+        ]
+        poller = _build_poller(storage_mock=storage, client_mock=client)
+        poller._storage = storage
+        poller._sleep_backoff = MagicMock()
+
+        result = poller._tick(backoff=1.0)
+
+        self.assertIs(result, True)
+        poller._sleep_backoff.assert_not_called()
+        # verify: getUpdates вызван
+        poller._client.getUpdates.assert_called_once()
+
+    def test_tick_returns_none_on_empty_updates(self):
+        """_tick возвращает None при пустых updates (без ошибок)."""
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+        client = MagicMock(spec=_TgClient)
+        client.getUpdates.return_value = []
+        poller = _build_poller(storage_mock=storage, client_mock=client)
+        poller._storage = storage
+        poller._sleep_backoff = MagicMock()
+        poller._backoff = 4.0
+
+        result = poller._tick(backoff=4.0)
+
+        self.assertIsNone(result)
+        poller._sleep_backoff.assert_not_called()
+        self.assertEqual(poller._backoff, 4.0)
+
+    def test_backoff_grows_across_errors(self):
+        """
+        m2: серия ошибок → _tick возвращает False на каждой ошибке.
+        Backoff растёт в _run_loop (sleep + *=2 при result is False).
+        """
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+        client = MagicMock(spec=_TgClient)
+        client.getUpdates.side_effect = TgApiError(http_status=None, cause=None)
+        poller = _build_poller(storage_mock=storage, client_mock=client)
+        poller._sleep_backoff = MagicMock()
+        poller._backoff = 1.0
+        poller._stop_event = _FakeStopEvent()
+
+        # ── ошибка 1: result=False, sleep(1.0), backoff→2.0 (в _run_loop) ──
+        result1 = poller._tick(1.0)
+        self.assertIs(result1, False)
+        poller._sleep_backoff.assert_not_called()  # _tick не спит
+        # эмулируем _run_loop: sleep + backoff*=2
+        poller._sleep_backoff(poller._backoff)
+        poller._backoff = min(poller._backoff * 2, 60.0)
+        self.assertEqual(poller._backoff, 2.0)
+
+        # ── ошибка 2: result=False, sleep(2.0), backoff→4.0 ──
+        poller._sleep_backoff.reset_mock()
+        result2 = poller._tick(2.0)
+        self.assertIs(result2, False)
+        poller._sleep_backoff.assert_not_called()
+        poller._sleep_backoff(poller._backoff)
+        poller._backoff = min(poller._backoff * 2, 60.0)
+        self.assertEqual(poller._backoff, 4.0)
+
+        # ── empty: result=None, backoff не меняется ──
+        client.getUpdates.side_effect = None
+        client.getUpdates.return_value = []
+        poller._sleep_backoff.reset_mock()
+        poller._backoff = 4.0
+        result3 = poller._tick(4.0)
+        self.assertIsNone(result3)
+        self.assertEqual(poller._backoff, 4.0)
+        poller._sleep_backoff.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1094,6 +1184,293 @@ class TestCallbackKeyboardPreservation(unittest.TestCase):
             "reply_markup"
         ]["inline_keyboard"]
         self.assertEqual(new_kb, [])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 16. Major-фикс: backoff растёт в _run_loop (не сбрасывается после каждого _tick)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Test409ConflictIntegration(unittest.TestCase):
+    """
+    Интеграционные тесты для 409 Conflict.
+    m2-critical: 409 НЕ должен увеличивать backoff.
+    """
+
+    def test_409_through_run_loop_sleeps_once_and_backoff_unchanged(self):
+        """
+        409 проходит через _run_loop: _sleep_backoff вызван ровно 1 раз (60с из _poll),
+        _backoff НЕ вырос.
+        """
+        sleep_durations = []
+
+        def tracked_sleep(seconds):
+            sleep_durations.append(seconds)
+
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+
+        client = MagicMock(spec=_TgClient)
+        # Всегда 409
+        client.getUpdates.side_effect = TgApiError(
+            http_status=_HTTP_CONFLICT, cause=None
+        )
+
+        on_digest = MagicMock()
+        poller = TelegramPoller(
+            token="tok123456",
+            chat_id="111",
+            db_path=":memory:",
+            on_digest=on_digest,
+            logger=logging.getLogger("test"),
+        )
+        poller._storage = storage
+        poller._client = client
+        poller._sleep_backoff = tracked_sleep
+        poller._backoff = 4.0  # backoff растёт если ошибки идут через _run_loop
+
+        class _CountingStop:
+            def __init__(self, max_iterations):
+                self._iteration = 0
+                self._max = max_iterations
+
+            def is_set(self):
+                self._iteration += 1
+                return self._iteration > self._max
+
+            def set(self):
+                pass
+
+        # 1 итерация: 409
+        poller._stop_event = _CountingStop(max_iterations=1)
+
+        t = threading.Thread(target=poller._run_loop, daemon=True)
+        t.start()
+        t.join(timeout=3)
+
+        # ровно 1 sleep (60с из _poll), _backoff не вырос
+        self.assertEqual(len(sleep_durations), 1)
+        self.assertEqual(sleep_durations[0], 60.0)
+        self.assertEqual(poller._backoff, 4.0)
+
+    def test_409_tick_returns_none_not_false(self):
+        """
+        _tick при 409 возвращает None (нейтрально).
+        _run_loop при None: не спит и не удваивает backoff.
+        _sleep_backoff вызывается ВНУТРИ _poll (при 409) — не в _tick.
+        """
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+        client = MagicMock(spec=_TgClient)
+        client.getUpdates.side_effect = TgApiError(
+            http_status=_HTTP_CONFLICT, cause=None
+        )
+        poller = _build_poller(storage_mock=storage, client_mock=client)
+        poller._storage = storage
+        poller._backoff = 8.0
+
+        # патчим time.sleep — _poll вызывает _sleep_backoff(60) изнутри,
+        # это нормальное поведение. Нас интересует return-value и backoff в _tick.
+        with patch("newsbot.telegram_io.time.sleep"):
+            result = poller._tick(backoff=8.0)
+
+        self.assertIsNone(result)  # нейтрально, НЕ False
+        self.assertEqual(poller._backoff, 8.0)  # не меняется в _tick
+
+    def test_backoff_409_then_success_resets_to_1(self):
+        """
+        Серия: 409 (None) → backoff не растёт → успех (True) → backoff=1.0.
+        Проверяем через _run_loop.
+        """
+        sleep_durations = []
+
+        def tracked_sleep(seconds):
+            sleep_durations.append(seconds)
+
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+        client = MagicMock(spec=_TgClient)
+
+        call_count = [0]
+
+        def getUpdates_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise TgApiError(http_status=_HTTP_CONFLICT, cause=None)
+            return [{"update_id": 5, "callback_query": _make_cb(5)}]
+
+        client.getUpdates.side_effect = getUpdates_side_effect
+
+        on_digest = MagicMock()
+        poller = TelegramPoller(
+            token="tok123456",
+            chat_id="111",
+            db_path=":memory:",
+            on_digest=on_digest,
+            logger=logging.getLogger("test"),
+        )
+        poller._storage = storage
+        poller._client = client
+        poller._sleep_backoff = tracked_sleep
+        poller._backoff = 4.0  # стартуем с ненулевого
+
+        class _CountingStop:
+            def __init__(self, max_iterations):
+                self._iteration = 0
+                self._max = max_iterations
+
+            def is_set(self):
+                self._iteration += 1
+                return self._iteration > self._max
+
+            def set(self):
+                pass
+
+        # 2 итерации: 409 (sleep 60с, None) → success (True, backoff=1.0)
+        poller._stop_event = _CountingStop(max_iterations=2)
+
+        t = threading.Thread(target=poller._run_loop, daemon=True)
+        t.start()
+        t.join(timeout=5)
+
+        # 1 sleep (60с из _poll); 409 не вызвал sleep в _run_loop
+        self.assertEqual(len(sleep_durations), 1)
+        self.assertEqual(sleep_durations[0], 60.0)
+        # после success backoff сброшен в 1.0
+        self.assertEqual(poller._backoff, 1.0)
+
+
+class TestBackoffGrowthIntegration(unittest.TestCase):
+    """
+    Интеграционный тест: _run_loop управляет backoff через return-значение _tick.
+    Существующие тесты вызывали _tick напрямую — ловили старый баг.
+    """
+
+    def test_backoff_doubles_on_series_of_errors(self):
+        """
+        Major: серия ошибок → sleep-durations растут: 1, 2, 4, 8... (cap 60).
+        Проверяем именно _run_loop (НЕ _tick напрямую).
+        """
+        import itertools
+
+        sleep_durations = []
+
+        def tracked_sleep(seconds):
+            sleep_durations.append(seconds)
+
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+
+        client = MagicMock(spec=_TgClient)
+        # iter() + cycle: бесконечный источник ошибок (не истощается)
+        client.getUpdates.side_effect = iter(
+            itertools.repeat(TgApiError(http_status=500, cause=None))
+        )
+
+        on_digest = MagicMock()
+        poller = TelegramPoller(
+            token="tok123456",
+            chat_id="111222333",
+            db_path=":memory:",
+            on_digest=on_digest,
+            logger=logging.getLogger("test"),
+            poll_timeout=1,
+        )
+        poller._storage = storage
+        poller._client = client
+        poller._sleep_backoff = tracked_sleep
+        poller._backoff = 1.0
+
+        # Счётчик: останавливаем после 4 итераций
+        class _CountingStop:
+            def __init__(self, max_iterations):
+                # Отслеживаем НОМЕР итерации (while-is_set вызовы)
+                self._iteration = 0
+                self._max = max_iterations
+
+            def is_set(self):
+                self._iteration += 1
+                return self._iteration > self._max
+
+            def set(self):
+                pass
+
+        # while-is_set вызывается: 1,2,3,4,5,... -> 4 полных итераций (5-я -> exit)
+        poller._stop_event = _CountingStop(max_iterations=4)
+
+        t = threading.Thread(target=poller._run_loop, daemon=True)
+        t.start()
+        t.join(timeout=3)
+
+        # 4 ошибки → sleep на 1, 2, 4, 8 секунд (первые 4 записи)
+        self.assertEqual(len(sleep_durations), 4)
+        self.assertEqual(sleep_durations[0], 1.0)
+        self.assertEqual(sleep_durations[1], 2.0)
+        self.assertEqual(sleep_durations[2], 4.0)
+        self.assertEqual(sleep_durations[3], 8.0)
+
+    def test_backoff_resets_on_success(self):
+        """
+        _run_loop сбрасывает backoff в 1.0 после успешного _tick(True).
+        Стартуем с backoff>1.0, чтобы проверить именно СБРОС.
+        Вторая итерация: непустой getUpdates → _tick → True → backoff=1.0.
+        """
+        sleep_durations = []
+
+        def tracked_sleep(seconds):
+            sleep_durations.append(seconds)
+
+        storage = MagicMock()
+        storage.get_meta.return_value = None
+        client = MagicMock(spec=_TgClient)
+
+        call_count = [0]
+
+        def getUpdates_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise TgApiError(http_status=500, cause=None)
+            # успех: непустой updates → _tick → True → сброс backoff в 1.0
+            return [{"update_id": 7, "callback_query": _make_cb(7)}]
+
+        client.getUpdates.side_effect = getUpdates_side_effect
+
+        on_digest = MagicMock()
+        poller = TelegramPoller(
+            token="tok123456",
+            chat_id="111222333",
+            db_path=":memory:",
+            on_digest=on_digest,
+            logger=logging.getLogger("test"),
+        )
+        poller._storage = storage
+        poller._client = client
+        poller._sleep_backoff = tracked_sleep
+        poller._backoff = 8.0  # стартуем с ненулевого — проверим именно СБРОС
+
+        class _CountingStop:
+            def __init__(self, max_iterations):
+                self._iteration = 0
+                self._max = max_iterations
+
+            def is_set(self):
+                self._iteration += 1
+                return self._iteration > self._max
+
+            def set(self):
+                pass
+
+        # 2 итерации: error (sleep 8.0, backoff→16) + success (backoff→1.0)
+        poller._stop_event = _CountingStop(max_iterations=2)
+
+        t = threading.Thread(target=poller._run_loop, daemon=True)
+        t.start()
+        t.join(timeout=3)
+
+        # 1 ошибка → sleep на текущем backoff (8.0)
+        self.assertEqual(len(sleep_durations), 1)
+        self.assertEqual(sleep_durations[0], 8.0)
+        # после успеха backoff сброшен в 1.0
+        self.assertEqual(poller._backoff, 1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

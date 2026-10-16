@@ -17,7 +17,7 @@ from .config import load_config
 from .env import telegram_token, deepseek_api_key, _write_env
 from .log import setup_logging
 from .llm import DeepSeekClient, LLMError
-from .pipeline import NewsPipeline
+from .pipeline import NewsPipeline, _parse_bool
 from .telegram_io import TelegramPoller
 
 _run = True
@@ -211,7 +211,8 @@ def _maybe_start_poller(config: dict, pipeline: NewsPipeline, logger) -> None:
     tg_cfg = config.get("telegram", {})
     fb_cfg = config.get("feedback", {})
     # n3: дефолт из config (default True в DEFAULT_CONFIG)
-    feedback_enabled = fb_cfg.get("enabled", True)
+    # Minor T4-фикс: парсим через _parse_bool — bool("false")==True
+    feedback_enabled = _parse_bool(fb_cfg.get("enabled", True))
 
     token = tg_cfg.get("token", "") or ""
     chat_id = tg_cfg.get("chat_id", "") or ""

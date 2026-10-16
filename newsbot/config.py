@@ -66,7 +66,8 @@ _set_env_project_root(_PROJECT_ROOT)
 DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_minutes": 15,
     "database": {"path": "data/newsbot.db", "retention_days": 90, "retry_threshold_sec": 60,
-                   "deferred_retention_days": 14, "recovery_new_limit": 500},
+                   "deferred_retention_days": 14, "recovery_new_limit": 500,
+                   "max_retries": 8},
     "logging": {
         "level": "INFO",
         "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -74,7 +75,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "telegram": {"token": "", "chat_id": "", "poll_timeout": 25},
     "digest": {
         "enabled": True,
-        "times": ["09:00", "21:00"],
+        "times": ["08:00", "20:00"],
         "max_items": 30,
         "max_items_per_message": 20,
         "on_empty": "skip",
@@ -100,10 +101,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "off_peak_only": False,
         "batch_size": 10,
         "max_tokens": 4096,
+        "llm_dedup": True,
+        "push_urgent_only": True,
     },
     # Фаза 2: обратная связь (кнопки 👍/👎)
     "feedback": {
         "enabled": True,
+        "digest_enabled": False, # вкл/выкл фидбэк в дайджесте (дефолт false — нет кнопок 👍/👎 в дайджесте)
         "max_examples": 10,     # примеров в few-shot промпте
         "retention_days": 180,   # хранение feedback_targets (feedback хранится дольше)
     },
@@ -114,6 +118,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "threshold": 0.95,      # порог SequenceMatcher ratio (0..1, clamp автоматический)
         "token_threshold": 0.8,  # порог Jaccard значащих токенов (0..1, clamp автоматический)
         "window_days": 3,       # окно сравнения для fuzzy и cross_source
+        "llm_recent_limit": 20,  # недавних заголовков для LLM-дедупа
     },
 }
 

@@ -232,7 +232,9 @@ class TelegramPoller:
         self._storage = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        # m2: backoff как атрибут, чтобы _poll мог вызвать _sleep_backoff
+        # m2: backoff как атрибут, чтобы _poll мог вызвать _sleep_backoff.
+        # Инициализируется ОДИН раз в __init__ (НЕ в _run_loop) — это позволяет
+        # тестам устанавливать начальное значение перед стартом цикла.
         self._backoff: float = 1.0
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -261,6 +263,13 @@ class TelegramPoller:
         """
         Основной long-poll цикл (C1: Storage создаётся здесь, в poller thread).
         m2: Storage.close() вызывается ВНУТРИ poller thread (finally).
+
+        backoff-логика:
+          — успех (_tick → True): сброс в 1.0
+          — ошибка (_tick → False): backoff *= 2, sleep на текущем значении
+          — пустой тик / 409 (_tick → None): backoff не трогается
+          — 409 внутри _poll: _poll уже спит 60с, _tick возвращает None,
+            _run_loop НЕ спит и НЕ удваивает backoff
         """
         # C1: создаём Storage в poller thread — своё соединение, не main.
         try:
@@ -273,18 +282,18 @@ class TelegramPoller:
 
         # m2: Storage.close() в finally — гарантированно в poller thread.
         try:
-            self._backoff = 1.0
+            # m2-backoff: инициализируется в __init__ (self._backoff = 1.0).
+            # При успехе сбрасывается здесь: self._backoff = 1.0.
             while not self._stop_event.is_set():
-                try:
-                    self._tick(self._backoff)
-                    self._backoff = 1.0  # сброс на успехе
-                except Exception as e:
-                    self._log.error(
-                        "Unexpected error in poller tick (%s), backoff %.1f s: %s",
-                        type(e).__name__, self._backoff, e,
-                    )
+                result = self._tick(self._backoff)
+                if result is True:
+                    # успех — сброс backoff
+                    self._backoff = 1.0
+                elif result is False:
+                    # ошибка — растём, sleep на текущем значении
                     self._sleep_backoff(self._backoff)
                     self._backoff = min(self._backoff * 2, 60.0)
+                # result is None (empty updates): backoff не трогаем
         finally:
             # m2: закрываем наше соединение в poller thread (не в main)
             if self._storage is not None:
@@ -295,8 +304,17 @@ class TelegramPoller:
                     pass
                 self._storage = None
 
-    def _tick(self, backoff: float) -> None:
-        """Один виток: poll → process updates. Каждый шаг защищён."""
+    def _tick(self, backoff: float) -> Optional[bool]:
+        """
+        Один виток: poll → process updates. Каждый шаг защищён.
+
+        Returns:
+          True  — updates обработаны (успех)
+          False — ошибка (network/HTTP, кроме 409).
+                   _run_loop делает sleep + backoff*=2.
+          None  — пустой тик (empty updates) ИЛИ 409 Conflict
+                   (сбой другого потребителя). _run_loop НЕ спит и НЕ растёт.
+        """
         # C1: _load_offset может бросить (если storage ещё не создан)
         try:
             offset = self._load_offset()
@@ -307,27 +325,26 @@ class TelegramPoller:
         try:
             updates = self._poll(offset)
         except TgApiError as e:
-            # N1: 409 проверяется по http_status через TgApiError
+            # N1: 409 определяется по http_status через TgApiError.
+            # _poll уже сделал sleep 60с при 409 — нейтральный return.
             if e.http_status == _HTTP_CONFLICT:
                 self._log.error(
                     "409 Conflict: another getUpdates consumer active. Pause 60 s."
                 )
-                self._sleep_backoff(60.0)
-                return
-            # прочие HTTP-ошибки
+                # return None: _run_loop НЕ спит и НЕ удваивает backoff.
+                return None
+            # прочие HTTP-ошибки: backoff растёт в _run_loop
             self._log.warning(
                 "Network error during poll (HTTP %s), backoff %.1f s",
                 e.http_status, backoff,
             )
-            self._sleep_backoff(backoff)
-            return
+            return False
         except Exception as e:
             self._log.error("Poll error: %s", e)
-            self._sleep_backoff(backoff)
-            return
+            return False
 
         if not updates:
-            return
+            return None  # пустой тик, backoff не трогаем
 
         for upd in updates:
             # C2: каждый update защищён — ошибка не убивает поток
@@ -342,25 +359,32 @@ class TelegramPoller:
         # сохраняем offset
         max_id = max(u.get("update_id", 0) for u in updates)
         self._save_offset(max_id + 1)
+        return True  # успех: updates обработаны
 
     def _poll(self, offset: Optional[int]) -> List[dict]:
         """
         Один long-poll запрос.
-        TgApiError ловится — возвращает пустой список; вызывает backoff.
+        TgApiError НЕ ловится — всплывает в _tick, где есть обработка ошибок
+        и backoff. Это позволяет:
+          (a) ветке except TgApiError в _tick работать;
+          (b) backoff накапливаться при серии ошибок.
+        Исключение: 409 — здесь же логируем и спим 60с, затем re-raise.
+        _tick ловит re-raise и возвращает None (нейтрально, без backoff).
         """
         try:
-            updates = self._client.getUpdates(
+            return self._client.getUpdates(
                 offset=offset,
                 timeout=self._poll_timeout,
                 allowed_updates=["callback_query", "message"],
             )
         except TgApiError as e:
             if e.http_status == _HTTP_CONFLICT:
+                self._log.warning(
+                    "getUpdates: 409 Conflict — another consumer active. Pause 60 s."
+                )
                 self._sleep_backoff(60.0)
-            else:
-                self._sleep_backoff(self._backoff)
-            return []
-        return updates
+            # ошибка всплывает — _tick обработает общий случай
+            raise
 
     # ── update dispatch ───────────────────────────────────────────────────────
 

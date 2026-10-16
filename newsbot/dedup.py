@@ -248,6 +248,25 @@ def filter_new(
     # Множество ключей (normalized_title, source), встреченных в этом цикле.
     seen_in_cycle: Set[tuple] = set()
 
+    # M2-фикс: кэш запросов get_recent_normalized_titles по exclude_source.
+    # Таблица seen_titles не меняется в этом цикле — результат стабилен.
+    # Один запрос на уникальный exclude_source (а не O(N) запросов).
+    _recent_cache: dict = {}
+
+    # Предварительно собираем множество source'ов, которые встретятся
+    # в цикле, чтобы запросить их ДО начала основного цикла.
+    # Это позволяет сделать все запросы заранее, а не по требованию.
+    if cross_source or fuzzy_enabled:
+        for item in items:
+            if _is_meaningful_title(item):
+                src = item.source
+                if src not in _recent_cache:
+                    _recent_cache[src] = storage.get_recent_normalized_titles(
+                        window_days=window_days,
+                        limit=500,
+                        exclude_source=src,
+                    )
+
     for item in items:
         # (a) точный URL в БД
         if storage.is_duplicate(item):
@@ -270,16 +289,10 @@ def filter_new(
                 continue
             seen_in_cycle.add(cycle_key)
 
-        # ── Получаем кросс-источниковых кандидатов ОДИН раз ──
-        # Используется и для exact cross-source dedup (уровень 1),
-        # и для fuzzy dedup (уровень 2) — экономия запросов.
+        # ── Кросс-источниковые кандидаты — из кэша (O(1) lookup) ──
         recent: List[tuple] = []
         if (cross_source or fuzzy_enabled) and _is_meaningful_title(item):
-            recent = storage.get_recent_normalized_titles(
-                window_days=window_days,
-                limit=500,
-                exclude_source=item.source,
-            )
+            recent = _recent_cache.get(item.source, [])
 
         # ── Уровень 1: кросс-источниковый точный дедуп ──
         # Проверяется ЯВНО в filter_new (а не внутри is_duplicate), чтобы

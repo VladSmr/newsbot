@@ -1023,6 +1023,99 @@ class TestConfigSwitches(unittest.TestCase):
 
 
 # =============================================================================
+# M2: N+1 запрос к БД исправлен — get_recent_normalized_titles вынесен из цикла
+# =============================================================================
+
+class TestDedupNoNPlusOne(unittest.TestCase):
+    """M2-фикс: get_recent_normalized_titles вызывается O(unique_sources), не O(N)."""
+
+    def test_get_recent_called_once_per_source(self):
+        """
+        M2: выборка из БД вызывается один раз на уникальный source
+        (кандидаты с одинаковым source используют кэш).
+        """
+        path = _tmp_db()
+        try:
+            # Создаём items с тремя источниками
+            items = [
+                _mk_item(title=f"Item S1-{i}", url=f"s1-{i}", source="Source1")
+                for i in range(5)
+            ]
+            items += [
+                _mk_item(title=f"Item S2-{i}", url=f"s2-{i}", source="Source2")
+                for i in range(5)
+            ]
+            items += [
+                _mk_item(title=f"Item S3-{i}", url=f"s3-{i}", source="Source3")
+                for i in range(5)
+            ]
+
+            cfg = {"cross_source": True, "fuzzy": True, "window_days": 3}
+            st = Storage(Path(path), dedup_config=cfg)
+
+            # save_many чтобы items попали в БД (для get_recent_normalized_titles)
+            inserted = st.save_many(items)
+            # переводим в delivered чтобы они попали в get_recent_normalized_titles
+            st.set_state([i.url for i in inserted], "delivered")
+
+            # Мокаем get_recent_normalized_titles, чтобы считать вызовы
+            from unittest.mock import MagicMock, patch
+
+            mock_method = MagicMock(return_value=[])  # пустой список кандидатов
+
+            with patch.object(st, "get_recent_normalized_titles", mock_method):
+                new_items, total, dup = filter_new(items, st, dedup_config=cfg)
+
+            # Должно быть ровно 3 вызова (по одному на каждый уникальный source)
+            self.assertEqual(
+                mock_method.call_count, 3,
+                f"get_recent_normalized_titles должна вызываться 3 раза "
+                f"(3 уникальных source), вызвана {mock_method.call_count} раз. "
+                "Каждый source запрашивается один раз, затем кэшируется.",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_dedup_logic_unchanged(self):
+        """
+        M2 не меняет логику дедупа: те же дубли отклоняются, те же проходят.
+        """
+        path = _tmp_db()
+        try:
+            cfg = {"cross_source": True, "fuzzy": True, "threshold": 0.95,
+                   "token_threshold": 0.8, "window_days": 3}
+            st = Storage(Path(path), dedup_config=cfg)
+
+            # Прошлая новость: близкий заголовок (должен отфильтроваться по fuzzy)
+            past = _mk_item(
+                title="Российская армия сбила 34 дрона на юге страны",
+                source="Src2",
+                url="https://past.com/1",
+            )
+            st.save(past)
+            st.set_state([past.url], "delivered")
+
+            # Текущий кандидат: похожий заголовок
+            current = _mk_item(
+                title="Сбито 34 беспилотника в южных регионах РФ",
+                source="Src1",
+                url="https://current.com/1",
+            )
+            st.save(current)
+
+            new_items, total, dup = filter_new([current], st, dedup_config=cfg)
+
+            # fuzzy dedup с threshold=0.95 должен отклонить
+            # (те же числа "34", близкие токены, высокий ratio)
+            self.assertEqual(dup, 1, "Fuzzy дубль должен быть отклонён")
+            self.assertEqual(len(new_items), 0, "Новых items не осталось")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+
+# =============================================================================
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
