@@ -302,6 +302,62 @@ class NewsPipeline:
         )
         return len(dup_urls)
 
+    def _cluster_deferred_duplicates(self, items: List[NewsItem]) -> Set[str]:
+        """
+        Семантическая кластеризация deferred-новостей ПЕРЕД дайджестом.
+
+        Финальный сейф от дублей: новости одного события, накопленные
+        за несколько циклов сбора, группируются LLM; дублями считаются
+        все, кроме лидера — первого в текущем порядке выдачи
+        (наиболее приоритетного). Лидеры остаются в дайджесте.
+
+        Возвращает set URL'ов-дублей. При любой ошибке / отсутствии LLM /
+        выключенном флаге / пике DeepSeek — пустое множество
+        (безопасно: дубли уйдут как есть, ничего не теряется).
+        """
+        if not items or len(items) < 2:
+            return set()
+        digest_cfg = self.config.get("digest", {}) or {}
+        if not _parse_bool(digest_cfg.get("cluster_duplicates", True)):
+            return set()
+        # Cost-инвариант: в пик DeepSeek LLM не вызываем (как _run_llm_dedup).
+        off_peak_only = getattr(self, "_off_peak_only", False)
+        if off_peak_only and not is_llm_allowed_now(off_peak_only):
+            logger.info(
+                "Дайджест: кластеризация дублей пропущена (пик DeepSeek, off_peak_only)",
+            )
+            return set()
+        llm_filter = getattr(self, "llm_filter", None)
+        if llm_filter is None:
+            return set()
+        try:
+            dup_idx = llm_filter.detect_duplicates(list(items), [])
+        except Exception as e:
+            logger.warning("Дайджест: кластеризация дублей упала: %s", e)
+            return set()
+        if not isinstance(dup_idx, (set, frozenset)):
+            return set()
+        urls: Set[str] = set()
+        for i in dup_idx:
+            # Индекс 0 — лидер первой чанки: он не может быть дублем.
+            if i == 0:
+                continue
+            if isinstance(i, int) and 0 <= i < len(items):
+                urls.add(items[i].url)
+        # Инвариант: хотя бы один item (лидер) должен остаться в дайджесте.
+        if len(urls) >= len(items):
+            logger.warning(
+                "Дайджест: кластеризация пометила все %d items дублями — "
+                "игнорируем результат (лидер должен остаться)", len(items),
+            )
+            return set()
+        if urls:
+            logger.info(
+                "Дайджест: кластеризация отсеяла %d дублей из %d",
+                len(urls), len(items),
+            )
+        return urls
+
     def _build_delivery(self, config: dict) -> Delivery:
         token = config.get("telegram", {}).get("token", "") or ""
         chat_id = config.get("telegram", {}).get("chat_id", "") or ""
@@ -987,6 +1043,13 @@ class NewsPipeline:
         # Deferred items читаем ОДИН раз, используем для обеих проверок.
         deferred_items = self.storage.get_deferred_items(limit=max_items)
 
+        # ── Финальный сейф от дублей: семантическая кластеризация deferred ──
+        # Новости одного события, накопленные за несколько циклов, не должны
+        # уйти в дайджест пачкой. Лидер остаётся, дубли отсеиваются.
+        _dup_urls = self._cluster_deferred_duplicates(deferred_items)
+        if _dup_urls:
+            deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
+
         # M2-фикс: при пустом deferred + on_empty=skip пишем маркер ОКНА,
         # чтобы _maybe_run_digest не спамил в следующем цикле.
         if not deferred_items and not force:
@@ -1026,6 +1089,14 @@ class NewsPipeline:
             deferred_items,
             max_items_per_message=max_items_per_message,
         )
+
+        # Major 2: считаем сколько items реально уйдёт (для проверки полного успеха).
+        # total_to_send — items в groups (отфильтрованные дубли не попадают сюда).
+        # Критерий полного успеха дайджеста: все items из groups отправлены
+        # (sent_count >= total_to_send). При частичном сбое
+        # (sent_count < total_to_send) — лидер(ы) помечены digest.run_digest,
+        # дубли НЕ терминализируются (retry в след.окне).
+        total_to_send = sum(len(grp) for _, grp in groups)
 
         # R1-фикс: НЕ выходи раньше если on_empty="send" и deferred пуст.
         # on_empty="send" должен отправить уведомление "нет новых новостей"
@@ -1078,7 +1149,7 @@ class NewsPipeline:
         # (deferred_retention_days), но терминализация по retry НЕ применяется.
 
         # M2-фикс: last_digest_at пишется ПРИ ЛЮБОМ корректном завершении окна.
-        # (a) sent>0: items отправлены → digested, окно обработано.
+        # (a) sent>=total_to_send: все items отправлены → digested, дубли терминализированы.
         # (б) пустой deferred + on_empty=skip: окно корректно проверено,
         #     слать нечего → пишем маркер (не спамим в следующем цикле).
         # (в) пустой deferred + on_empty=send: пустое уведомление отправлено → окно обработано.
@@ -1086,9 +1157,31 @@ class NewsPipeline:
         # При транзиентном сбое (все отправки failed) окно НЕ помечается
         # обработанным — retry в следующем цикле, а не через 12ч.
         now_iso = datetime.now(tz.utc).isoformat()
-        if sent_count > 0:
+        # (a) sent_count >= total_to_send: все items дайджеста отправлены →
+        #     digest.run_digest уже пометил их 'digested' через sent_urls.
+        #     Терминализируем дубли (они не входят в groups) и пишем маркер окна.
+        # (б) частичный сбой (sent_count < total_to_send): лидеры, дошедшие до
+        #     получателя, помечены digest.run_digest; дубли НЕ трогаем — лидер
+        #     остаётся deferred и повторится в следующем окне (at-least-once).
+        if sent_count >= total_to_send and sent_count > 0:
             logger.info("Дайджест: %d новостей → 'digested'", sent_count)
             self.storage.set_meta("last_digest_at", now_iso)
+            if _dup_urls:
+                try:
+                    marked_dup = self.storage.set_digested(list(_dup_urls))
+                    if marked_dup < len(_dup_urls):
+                        logger.warning(
+                            "Дайджест: дубли помечены частично (%d из %d)",
+                            marked_dup, len(_dup_urls),
+                        )
+                    else:
+                        logger.info("Дайджест: %d дублей → 'digested'", marked_dup)
+                except Exception as e:
+                    # best-effort: не роняем дайджест. Дубли останутся deferred
+                    # и будут отфильтрованы кластеризацией в следующем окне.
+                    logger.warning(
+                        "Дайджест: не удалось пометить дубли digested: %s", e,
+                    )
         elif not deferred_items and on_empty == "skip":
             # M2: окно проверено, слать нечего → пишем маркер чтобы
             # _maybe_run_digest не запускал повторно в следующем цикле.
