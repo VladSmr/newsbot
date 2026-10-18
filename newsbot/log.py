@@ -6,6 +6,8 @@ import re
 import sys
 from collections.abc import Mapping
 
+from newsbot.version import __version__
+
 
 # ── Фильтр токена из логов (belt-and-suspenders) ──────────────────
 # T4-фикс: три паттерна:
@@ -91,6 +93,18 @@ class TokenSanitizer(logging.Filter):
         return True
 
 
+class VersionFilter(logging.Filter):
+    """
+    Внедряет атрибут version в каждый LogRecord.
+    Не перезаписывает существующий version (допускает override).
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "version", None) is None:
+            record.version = __version__
+        return True
+
+
 def setup_logging(cfg: dict) -> None:
     """
     Конфигурирует корневой логгер и обработчики.
@@ -100,7 +114,7 @@ def setup_logging(cfg: dict) -> None:
     level = getattr(logging, level_str, logging.INFO)
     fmt = cfg.get(
         "format",
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s",
     )
 
     # корневой handler — stderr
@@ -113,12 +127,14 @@ def setup_logging(cfg: dict) -> None:
     # подменить; санация на уровне format() (итоговая строка) решает проблему.
     class SanitizingFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
+            record.version = getattr(record, "version", None) or __version__
             text = super().format(record)
             return _sanitize(text)
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(level)
     handler.setFormatter(SanitizingFormatter(fmt))
+    handler.addFilter(VersionFilter())
     # фильтр токена — на уровне handler
     handler.addFilter(TokenSanitizer())
     root.addHandler(handler)

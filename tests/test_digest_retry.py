@@ -297,8 +297,31 @@ def test_digest_transient_failure_repeated_in_next_window(tmp_path):
     """
     Critical: после транзиентного сбоя deferred повторяются в следующем окне.
     """
+    import sqlite3
+    from datetime import datetime, timezone
+
     db_path = tmp_path / "test.db"
-    item = _mk_item(title="WillRetry", url="https://ex.com/willretry", llm_score=5)
+
+    # Инициализируем схему БД (Storage создаёт таблицы).
+    # Вставляем напрямую с явным fetched_at в ПРОШЛОМ.
+    # Storage.save() ставит NOW, что может совпасть с digest_started_iso
+    # первого вызова и сломать детерминированность (item не удалится).
+    # Явный fetched_at в 2025 г. гарантирует удаление при cleanup.
+    _ = Storage(str(db_path))  # создаёт схему items
+
+    fetched_at = "2025-01-01T12:00:00+00:00"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO items
+        (source, url, title, summary, published, fetched_at, state, state_at, llm_score)
+        VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?)
+        """,
+        ("TestSrc", "https://ex.com/willretry", "WillRetry",
+         "Test summary", "2025-01-01 12:00", fetched_at, fetched_at, 5),
+    )
+    conn.commit()
+    conn.close()
 
     config = {
         "sources": [],
@@ -310,8 +333,6 @@ def test_digest_transient_failure_repeated_in_next_window(tmp_path):
     }
 
     pipeline = NewsPipeline(config)
-    pipeline.storage.save(item)
-    pipeline.storage.set_state(["https://ex.com/willretry"], "deferred")
 
     delivery = MagicMock()
     call_num = [0]
@@ -331,8 +352,14 @@ def test_digest_transient_failure_repeated_in_next_window(tmp_path):
     count2 = pipeline.run_digest(force=True)
     assert count2 == 1, f"Ожидался 1 отправленный item, got {count2}"
 
-    rows_digested = pipeline.storage.get_all_by_state("digested")
-    assert len(rows_digested) == 1
+    # После успешного дайджеста ВСЁ окно удалено из БД.
+    # Item отправлен, но удалён delete_items_before (fetched_at в прошлом).
+    all_urls = set()
+    for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
+        all_urls.update(i.url for i in pipeline.storage.get_all_by_state(state))
+    assert "https://ex.com/willretry" not in all_urls, (
+        "Item должен быть удалён из БД после успешного дайджеста (окно очищено)"
+    )
     pipeline.close()
 
 

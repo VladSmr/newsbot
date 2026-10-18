@@ -65,12 +65,12 @@ _set_env_project_root(_PROJECT_ROOT)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_minutes": 15,
-    "database": {"path": "data/newsbot.db", "retention_days": 90, "retry_threshold_sec": 60,
-                   "deferred_retention_days": 14, "recovery_new_limit": 500,
+    "database": {"path": "data/newsbot.db", "retention_days": 1, "retry_threshold_sec": 60,
+                   "deferred_retention_days": 1, "recovery_new_limit": 500,
                    "max_retries": 8},
     "logging": {
         "level": "INFO",
-        "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        "format": "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s",
     },
     "telegram": {"token": "", "chat_id": "", "poll_timeout": 25},
     "digest": {
@@ -79,6 +79,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_items": 30,
         "max_items_per_message": 20,
         "on_empty": "skip",
+        "max_age_hours": 24,
+        "bootstrap_window_hours": 24,
     },
     "llm": {
         "enabled": True,

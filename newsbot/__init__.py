@@ -1,2 +1,2 @@
 # newsbot package
-__version__ = "1.0.0"
+from newsbot.version import __version__  # noqa: F401

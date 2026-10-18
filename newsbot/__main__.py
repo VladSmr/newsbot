@@ -19,6 +19,7 @@ from .log import setup_logging
 from .llm import DeepSeekClient, LLMError
 from .pipeline import NewsPipeline, _parse_bool
 from .telegram_io import TelegramPoller
+from .version import __version__
 
 _run = True
 
@@ -68,9 +69,18 @@ def main():
         action="store_true",
         help="Выполнить дайджест отложенных новостей (state='deferred') и выйти",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Показать версию приложения",
+    )
     args = parser.parse_args()
 
     # ── диагностические команды — без полного pipeline ──
+    if args.version:
+        print(f"newsbot {__version__}")
+        sys.exit(0)
+
     if args.check_telegram:
         _check_telegram()
         return
@@ -91,7 +101,7 @@ def main():
     setup_logging(config["logging"])
     logger = logging.getLogger("newsbot")
 
-    logger.info("=== newsbot запущен ===")
+    logger.info("newsbot v%s — запуск", __version__)
 
     pipeline = NewsPipeline(config)
 

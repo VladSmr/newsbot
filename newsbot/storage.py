@@ -64,6 +64,10 @@ class Storage:
     # Для VPS с 1 GB RAM это критично: низкоско́рые deferred накапливались
     # бесконечно (digest берёт топ-30, остаток копился вечно).
     DEFAULT_DEFERRED_RETENTION_DAYS = 14
+    # 'new' не прошли скоринг — держим их дольше, чтобы пауза/долгий цикл
+    # не уничтожил ещё не обработанные новости. Терминальные состояния
+    # чистятся по retention_days (сутки).
+    DEFAULT_NEW_RETENTION_DAYS = 7
 
     def __init__(self, db_path: Path, dedup_config: Optional[dict] = None):
         """
@@ -779,7 +783,7 @@ class Storage:
 
         Summary обрезается до MAX_SUMMARY_CHARS (6000) для защиты LLM-бюджета.
         """
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
         now_iso = now_utc.isoformat()
         expires_iso = (now_utc + timedelta(days=_TITLE_DEDUP_TTL_DAYS)).isoformat()
         normalized = item.title_normalized()
@@ -853,7 +857,7 @@ class Storage:
         if not items:
             return []
         MAX_SUMMARY_CHARS = 6000
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
         now_iso = now_utc.isoformat()
         expires_iso = (now_utc + timedelta(days=_TITLE_DEDUP_TTL_DAYS)).isoformat()
 
@@ -1178,23 +1182,45 @@ class Storage:
         ).fetchone()
         return row[0] if row else 0
 
-    def get_deferred_items(self, limit: Optional[int] = None) -> List[NewsItem]:
+    def get_deferred_items(
+        self, limit: Optional[int] = None,
+        since_iso: Optional[str] = None,
+        max_age_hours: Optional[int] = None,
+    ) -> List[NewsItem]:
         """
         Возвращает items со state='deferred', отсортированные:
           llm_score DESC (лучшие первыми), затем fetched_at ASC.
         Лимит опционален (для дайджеста: top-N по score).
+
+        Args:
+            limit: если задано — LIMIT в SQL.
+            since_iso: если задано — выборка ограничена fetched_at >= since_iso
+                       (ISO-8601, например fromisoformat() или datetime.isoformat()).
+            max_age_hours: если задано — выборка ограничена fetched_at >=
+                           now - max_age_hours. None означает «без ограничения».
+                           Приоритет: max_age_hours вычисляется из since_iso,
+                           если оба не заданы — ограничения по возрасту нет.
         """
         conn = self._connect()
+        params: list = []
         sql = """
             SELECT source, url, title, summary, published, fetched_at, state_at,
                    llm_score, llm_summary, llm_reason, llm_urgent
             FROM items
             WHERE state = 'deferred'
-            ORDER BY llm_score DESC, fetched_at ASC
         """
+        effective_since = since_iso
+        if max_age_hours is not None:
+            effective_since = (
+                datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+            ).isoformat()
+        if effective_since is not None:
+            sql += " AND julianday(fetched_at) >= julianday(?)"
+            params.append(effective_since)
+        sql += " ORDER BY llm_score DESC, fetched_at ASC"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
-        rows = conn.execute(sql).fetchall()
+        rows = conn.execute(sql, params).fetchall()
         return self._rows_to_items(rows)
 
     def set_digested(self, urls: List[str]) -> int:
@@ -1203,6 +1229,38 @@ class Storage:
         Возвращает количество обновлённых строк.
         """
         return self.set_state(urls, "digested")
+
+    def delete_items_before(self, cutoff_iso: str) -> int:
+        """
+        Удаляет items в терминальных состояниях (delivered/skipped/deferred/
+        digested/failed) с fetched_at < cutoff_iso.
+        'new' и 'pending' НЕ удаляются — они ещё не прошли скоринг и могут
+        попасть в следующее окно.
+        'deferred' включён: items, отправленные в текущем digest и оставшиеся
+        в БД, безопасно удаляются — они уже помечены как 'digested'.
+
+        Возвращает количество удалённых строк items.
+        """
+        with self._tx() as conn:
+            cur = conn.execute(
+                "DELETE FROM items "
+                "WHERE julianday(fetched_at) < julianday(?) "
+                "  AND state IN ('delivered','skipped','deferred','digested','failed')",
+                (cutoff_iso,),
+            )
+            return cur.rowcount
+
+    def get_oldest_unprocessed_fetched_at(self) -> Optional[str]:
+        """
+        Возвращает минимальный fetched_at среди items в состояниях
+        'new'/'pending' (ещё не прошедших скоринг) или None, если таких нет.
+        Нужен, чтобы не «потерять» их при закрытии окна дайджеста.
+        """
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT MIN(fetched_at) FROM items WHERE state IN ('new','pending')",
+        ).fetchone()
+        return row[0] if row and row[0] is not None else None
 
     def _rows_to_items(self, rows: List, with_retry_count: bool = False) -> List[NewsItem]:
         """
@@ -1407,9 +1465,9 @@ class Storage:
     ) -> int:
         """
         Удаляет items старше retention_days:
-          - 'new': необработанные новости (при долгой паузе/ошибке накапливаются
-            вечно; K1-recovery вызывает get_all_by_state('new') каждый цикл,
-            что может загрузить неограниченный объём в RAM).
+          - 'new': отдельное окно — не меньше DEFAULT_NEW_RETENTION_DAYS (7 дней),
+            чтобы пауза или долгий скоринг-цикл не уничтожили ещё не оценённые
+            новости, которые не попадали в дайджест.
           - 'deferred': старые отложенные, которые не попали ни в один дайджест
             (накапливались бесконечно при паузе или дайджест-окнах < max_items;
             digest берёт топ-30 по score, остаток копился вечно).
@@ -1430,20 +1488,37 @@ class Storage:
         deferred_cutoff = (
             datetime.now(timezone.utc) - timedelta(days=deferred_retention_days)
         ).isoformat()
+        # 'new' живут минимум DEFAULT_NEW_RETENTION_DAYS дней, даже если
+        # retention_days передан как 0 (например, из тестов).
+        new_retention_days = max(int(retention_days or 0), self.DEFAULT_NEW_RETENTION_DAYS)
+        cutoff_new = (
+            datetime.now(timezone.utc) - timedelta(days=new_retention_days)
+        ).isoformat()
 
         total_deleted = 0
         try:
             with self._tx() as conn:
-                # new + терминальные (retention_days)
+                # терминальные (retention_days)
                 cur = conn.execute(
                     """
                     DELETE FROM items
-                    WHERE state IN ('new', 'delivered', 'skipped', 'failed', 'digested')
+                    WHERE state IN ('delivered', 'skipped', 'failed', 'digested')
                       AND state_at < ?
                     """,
                     (cutoff,),
                 )
-                new_and_terminal = cur.rowcount
+                terminal_del = cur.rowcount
+
+                # new: отдельное окно (DEFAULT_NEW_RETENTION_DAYS, минимум 7 дней)
+                cur_new = conn.execute(
+                    """
+                    DELETE FROM items
+                    WHERE state = 'new'
+                      AND state_at < ?
+                    """,
+                    (cutoff_new,),
+                )
+                new_del = cur_new.rowcount
 
                 # deferred: отдельное окно (deferred_retention_days)
                 cur_def = conn.execute(
@@ -1456,11 +1531,13 @@ class Storage:
                 )
                 deferred_del = cur_def.rowcount
 
-                total_deleted = new_and_terminal + deferred_del
+                total_deleted = terminal_del + new_del + deferred_del
             if total_deleted:
                 parts = []
-                if new_and_terminal:
-                    parts.append(f"new+terminal={new_and_terminal}")
+                if terminal_del:
+                    parts.append(f"terminal={terminal_del}")
+                if new_del:
+                    parts.append(f"new={new_del}")
                 if deferred_del:
                     parts.append(f"deferred={deferred_del}")
                 logger.info("purge_items: удалено %s", " + ".join(parts))

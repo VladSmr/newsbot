@@ -120,19 +120,18 @@ poll_interval_minutes: 15
 # --- База данных ---
 database:
   path: data/newsbot.db
-  retention_days: 90       # удалять delivered/skipped/failed/digested + 'new' items старше N дней
+  retention_days: 1        # удалять delivered/skipped/failed/digested + 'new' items старше N дней
   retry_threshold_sec: 60 # pending считается зависшим через N секунд
   max_retries: 8           # лимит retry попыток → state=failed
-  deferred_retention_days: 14  # удалять старые deferred-items старше N дней (не попали в digest)
-                                  # 14 дней = окно между дайджестами × запас;
-                                  # критично для VPS с 1 GB RAM (deferred копились бесконечно)
+  deferred_retention_days: 1  # удалять старые deferred-items старше N дней (не попали в digest)
+                                  # 1 день = сутки хранения для дайджеста; старые очищаются при purge
   recovery_new_limit: 500     # макс. 'new'-items, загружаемых в RAM при K1-recovery за один цикл
                                   # (при долгой паузе 'new' накапливаются; лимит защищает RAM)
 
 # --- Логирование ---
 logging:
   level: INFO
-  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  format: "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s"
 
 # --- Telegram (заполняется на этапе 2) ---
 telegram:
@@ -151,7 +150,9 @@ digest:
                                    # При 40 deferred-items в дайджест попадают только топ-30 (т.к. get_deferred_items LIMIT 30).
   max_items_per_message: 20         # новостей на одно Telegram-сообщение (не более 4096 символов)
   on_empty: skip                    # "skip" — не слать пустой дайджест; другое — на будущее
-  cluster_duplicates: true      # финальная LLM-кластеризация deferred перед отправкой (убирает дубли одного события)
+  cluster_duplicates: true          # финальная LLM-кластеризация deferred перед отправкой (убирает дубли одного события)
+  max_age_hours: 24                 # выбирать deferred-items не старше N часов (суточное окно)
+  bootstrap_window_hours: 24        # окно начального наполнения дайджеста (сутки)
 
 # --- Фаза 2: обратная связь (👍/👎 после доставки новости) ---
 # Кнопки обрабатываются в Фазе 2b, few-shot в промпте — Фазе 2c.

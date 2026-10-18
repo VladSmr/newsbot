@@ -35,6 +35,7 @@ from .collector import FeedCollector, FeedResult, NewsItem
 from .dedup import filter_new
 from .delivery import ConsoleDelivery, TelegramDelivery, Delivery
 from .digest import run_digest as _run_digest, build_digest_messages
+from .version import __version__
 from .llm import LLMFilter
 from .llm.filter import FilterResult, route
 from .llm.client import BalanceInfo, LLMError, UsageStats
@@ -59,6 +60,14 @@ def _parse_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "on")
     return False
+
+
+def _iso_dt(value: str):
+    """Парсит ISO-8601 (в т.ч. 'Z') в datetime; None при ошибке."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 class NewsPipeline:
@@ -1039,9 +1048,56 @@ class NewsPipeline:
         max_items_per_message = int(digest_cfg.get("max_items_per_message", 20))
         on_empty = digest_cfg.get("on_empty", "skip")
 
-        # Nit T4-фикс: одно чтение вместо двух (ранее было limit=1 + limit=max_items).
-        # Deferred items читаем ОДИН раз, используем для обеих проверок.
-        deferred_items = self.storage.get_deferred_items(limit=max_items)
+        # ── Оконная логика: граница окна ───────────────────────────────────
+        now_utc = datetime.now(tz.utc).replace(microsecond=0)
+        digest_started_iso = now_utc.isoformat()
+        raw_boundary = self.storage.get_meta("digest_window_started_at")
+        if not raw_boundary:
+            bootstrap = digest_cfg.get("bootstrap_window_hours", 24)
+            try:
+                bootstrap = int(bootstrap)
+            except (TypeError, ValueError):
+                bootstrap = 24
+            window_start_iso = (now_utc - timedelta(hours=bootstrap)).isoformat()
+            logger.info(
+                "Дайджест: граница окна не найдена, bootstrap=%d часов → %s",
+                bootstrap, window_start_iso,
+            )
+        else:
+            window_start_iso = raw_boundary
+
+        # Deferred items: only after window_start_iso (оконный фильтр).
+        # При bootstrap (граница не из meta) фильтр НЕ применяется —
+        # это защищает тесты без явной границы и первый запуск на свежей БД.
+        # Следующий цикл уже имеет границу в meta и будет фильтровать.
+        deferred_items = self.storage.get_deferred_items(
+            limit=max_items,
+            since_iso=window_start_iso if raw_boundary is not None else None,
+        )
+
+        logger.info(
+            "Дайджест: старт — newsbot v%s, deferred=%d",
+            __version__, len(deferred_items),
+        )
+
+        # M2-фикс: при пустом deferred + on_empty=skip пишем маркер ОКНА,
+        # чтобы _maybe_run_digest не спамил в следующем цикле.
+        # Оконная логика: пустое окно → сдвигаем границу.
+        if not deferred_items and not force:
+            if on_empty == "skip":
+                logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
+                self.storage.set_meta(
+                    "last_digest_at",
+                    digest_started_iso,
+                )
+                unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+                new_boundary = digest_started_iso
+                if isinstance(unprocessed, str) and _iso_dt(unprocessed) is not None \
+                        and _iso_dt(unprocessed) < now_utc:
+                    new_boundary = unprocessed
+                self.storage.set_meta("digest_window_started_at", new_boundary)
+                return 0
+            # on_empty=send: обрабатывается дальше (пустое уведомление)
 
         # ── Финальный сейф от дублей: семантическая кластеризация deferred ──
         # Новости одного события, накопленные за несколько циклов, не должны
@@ -1049,18 +1105,6 @@ class NewsPipeline:
         _dup_urls = self._cluster_deferred_duplicates(deferred_items)
         if _dup_urls:
             deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
-
-        # M2-фикс: при пустом deferred + on_empty=skip пишем маркер ОКНА,
-        # чтобы _maybe_run_digest не спамил в следующем цикле.
-        if not deferred_items and not force:
-            if on_empty == "skip":
-                logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
-                self.storage.set_meta(
-                    "last_digest_at",
-                    datetime.now(tz.utc).isoformat(),
-                )
-                return 0
-            # on_empty=send: обрабатывается дальше (пустое уведомление)
 
         # ── Feedback targets + передача готовых groups в digest ──
         # F2: только при TelegramDelivery + feedback.enabled + digest_enabled.
@@ -1103,6 +1147,16 @@ class NewsPipeline:
         # даже когда groups пустые (и deferrred пустой).
         if not groups and not (not deferred_items and on_empty == "send"):
             logger.info("Дайджест: нет сообщений для отправки.")
+            # M2: пишем маркер окна и при force+empty, чтобы _maybe_run_digest
+            # не спамил повторно в следующем цикле.
+            self.storage.set_meta("last_digest_at", digest_started_iso)
+            unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+            new_boundary = digest_started_iso
+            if isinstance(unprocessed, str):
+                udt = _iso_dt(unprocessed)
+                if udt is not None and udt < now_utc:
+                    new_boundary = unprocessed
+            self.storage.set_meta("digest_window_started_at", new_boundary)
             return 0
 
         item_buttons_per_msg: List[List[dict]]
@@ -1156,7 +1210,7 @@ class NewsPipeline:
         # (г) on_empty=send + force + пустой deferred: тоже пишем маркер.
         # При транзиентном сбое (все отправки failed) окно НЕ помечается
         # обработанным — retry в следующем цикле, а не через 12ч.
-        now_iso = datetime.now(tz.utc).isoformat()
+        now_iso = datetime.now(tz.utc).replace(microsecond=0).isoformat()
         # (a) sent_count >= total_to_send: все items дайджеста отправлены →
         #     digest.run_digest уже пометил их 'digested' через sent_urls.
         #     Терминализируем дубли (они не входят в groups) и пишем маркер окна.
@@ -1174,19 +1228,51 @@ class NewsPipeline:
                             "Дайджест: дубли помечены частично (%d из %d)",
                             marked_dup, len(_dup_urls),
                         )
-                    else:
-                        logger.info("Дайджест: %d дублей → 'digested'", marked_dup)
                 except Exception as e:
                     # best-effort: не роняем дайджест. Дубли останутся deferred
                     # и будут отфильтрованы кластеризацией в следующем окне.
                     logger.warning(
                         "Дайджест: не удалось пометить дубли digested: %s", e,
                     )
+            # ── Оконная очистка ──────────────────────────────────────────
+            # Граница следующего окна = момент старта этого дайджеста.
+            # Если остались необработанные new/pending, отодвигаем границу
+            # назад к их fetched_at, чтобы они попали в следующее окно.
+            unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+            new_boundary = digest_started_iso
+            if isinstance(unprocessed, str):
+                udt = _iso_dt(unprocessed)
+                if udt is not None and udt < now_utc:
+                    new_boundary = unprocessed
+                    logger.info(
+                        "Дайджест: есть необработанные items с %s — "
+                        "граница окна отодвинута", unprocessed,
+                    )
+            try:
+                # Удаляем ровно окно: всё, что собрано ДО старта дайджеста
+                # (отправленное, отсеянное фильтром, не влезшее в лимит).
+                # new/ pending защищены на уровне storage.
+                # Пришедшее во время отправки (fetched_at >= digest_started_iso)
+                # остаётся — уйдёт в следующее окно.
+                deleted = self.storage.delete_items_before(digest_started_iso)
+                logger.info("Дайджест: окно закрыто, удалено %d items", deleted)
+            except Exception as e:
+                logger.error("Дайджест: не удалось очистить окно: %s", e)
+            else:
+                self.storage.set_meta("digest_window_started_at", new_boundary)
         elif not deferred_items and on_empty == "skip":
             # M2: окно проверено, слать нечего → пишем маркер чтобы
             # _maybe_run_digest не запускал повторно в следующем цикле.
             logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
             self.storage.set_meta("last_digest_at", now_iso)
+            # Закрываем окно с откатом границы при наличии необработанных.
+            unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+            new_boundary = digest_started_iso
+            if isinstance(unprocessed, str):
+                udt = _iso_dt(unprocessed)
+                if udt is not None and udt < now_utc:
+                    new_boundary = unprocessed
+            self.storage.set_meta("digest_window_started_at", new_boundary)
         elif not deferred_items and on_empty == "send":
             # on_empty=send: отправляем пустое уведомление
             empty_msg = "📰 Дайджест — нет новых новостей."
@@ -1194,6 +1280,14 @@ class NewsPipeline:
                 self.delivery.send_text(empty_msg)
                 logger.info("Дайджест: пустой дайджест отправлен (on_empty=send)")
                 self.storage.set_meta("last_digest_at", now_iso)
+                # Закрываем окно с откатом границы при наличии необработанных.
+                unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+                new_boundary = digest_started_iso
+                if isinstance(unprocessed, str):
+                    udt = _iso_dt(unprocessed)
+                    if udt is not None and udt < now_utc:
+                        new_boundary = unprocessed
+                self.storage.set_meta("digest_window_started_at", new_boundary)
             except Exception as e:
                 logger.warning("Дайджест: пустой дайджест не отправлен: %s", e)
         else:

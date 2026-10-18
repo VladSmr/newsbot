@@ -10,6 +10,7 @@
 Запуск: python -m pytest tests/test_digest_cluster.py -v
 """
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -59,6 +60,25 @@ def _tmp_db():
             os.unlink(path)
         except OSError:
             pass
+
+
+def _insert_deferred_item(db_path, title, url, published, fetched_at, score=6):
+    """
+    Вставляет deferred-item напрямую в БД с заданным fetched_at.
+    Storage.save() игнорирует item.fetched_at (всегда ставит NOW),
+    поэтому нужен прямой INSERT для контроля времени.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO items
+        (source, url, title, summary, published, fetched_at, state, state_at, llm_score)
+        VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?)
+        """,
+        ("TestSrc", url, title, "Test summary", published, fetched_at, fetched_at, score),
+    )
+    conn.commit()
+    conn.close()
 
 
 def _mk_pipeline_unit(llm_filter=None, digest_cfg=None, off_peak_only=False):
@@ -314,18 +334,33 @@ class TestRunDigestClusterIntegration(unittest.TestCase):
     def test_duplicates_filtered_and_digested_on_full_success(self):
         """
         Все items отправлены (sent_count == total_to_send):
-        лидер → digested, дубли → digested.
+        лидер → отправлен, дубли → отфильтрованы и не отправлены.
+        После успешного дайджеста ВСЁ окно удалено из БД.
         """
         with _tmp_db() as db_path:
+            # Инициализируем схему
             s = Storage(db_path)
-            leader = _mk_item(title="Лидер", url="https://ex.com/leader", llm_score=6)
-            s.save(leader)
-            s.set_state(["https://ex.com/leader"], "deferred")
-            for i in range(1, 3):
-                dup = _mk_item(title=f"Дубль{i}", url=f"https://ex.com/dup{i}", llm_score=6)
-                s.save(dup)
-                s.set_state([f"https://ex.com/dup{i}"], "deferred")
             s.close()
+
+            # Вставляем напрямую с явным fetched_at в ПРОШЛОМ.
+            # Storage.save() ставит NOW = digest_started_iso (обе обрезаны до секунды)
+            # → fetched_at < cutoff = False → items не удалятся.
+            leader_fetched = "2025-01-01T12:00:00+00:00"
+            _insert_deferred_item(
+                db_path,
+                title="Лидер", url="https://ex.com/leader",
+                published="2025-01-01 12:00",
+                fetched_at=leader_fetched,
+                score=6,
+            )
+            for i in range(1, 3):
+                _insert_deferred_item(
+                    db_path,
+                    title=f"Дубль{i}", url=f"https://ex.com/dup{i}",
+                    published="2025-01-01 12:00",
+                    fetched_at=leader_fetched,
+                    score=6,
+                )
 
             mock_filter = MagicMock()
             mock_filter.detect_duplicates.return_value = {1, 2}
@@ -338,17 +373,20 @@ class TestRunDigestClusterIntegration(unittest.TestCase):
             count = p.run_digest(force=True)
 
             self.assertEqual(count, 1)
+            # Проверяем отправку: лидер отправлен, дубли отфильтрованы
             send_args = delivery.send_text.call_args[0][0]
             self.assertIn("Лидер", send_args)
             self.assertNotIn("Дубль1", send_args)
             self.assertNotIn("Дубль2", send_args)
 
-            s = p.storage
-            digested_urls = {i.url for i in s.get_all_by_state("digested")}
-            self.assertIn("https://ex.com/leader", digested_urls)
-            self.assertIn("https://ex.com/dup1", digested_urls)
-            self.assertIn("https://ex.com/dup2", digested_urls)
-            s.close()
+            # После успешного дайджеста ВСЁ окно удалено из БД
+            # (лидер отправлен, дубли терминализированы — всё удалено delete_items_before)
+            all_urls = set()
+            for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
+                all_urls.update(i.url for i in p.storage.get_all_by_state(state))
+            self.assertNotIn("https://ex.com/leader", all_urls)
+            self.assertNotIn("https://ex.com/dup1", all_urls)
+            self.assertNotIn("https://ex.com/dup2", all_urls)
             p.close()
 
     def test_duplicates_not_digested_when_send_total_failure(self):
@@ -450,18 +488,44 @@ class TestRunDigestClusterIntegration(unittest.TestCase):
     def test_set_digested_error_logs_warning_does_not_crash(self):
         """
         При ошибке set_digested (pipeline-вызов для дублей) — warning,
-        run_digest НЕ падает. Лидер помечен digest, дубли остаются deferred
+        run_digest НЕ падает. Лидер отправлен, дубли остаются deferred
         (best-effort: fallback set_state убран).
         """
+        import sqlite3
         with _tmp_db() as db_path:
+            # Инициализируем схему
             s = Storage(db_path)
-            leader = _mk_item(title="Лидер", url="https://ex.com/lead2", llm_score=6)
-            dup = _mk_item(title="Дубль", url="https://ex.com/d2", llm_score=6)
-            s.save(leader)
-            s.save(dup)
-            s.set_state(["https://ex.com/lead2"], "deferred")
-            s.set_state(["https://ex.com/d2"], "deferred")
             s.close()
+
+            # Вставляем напрямую: явный fetched_at в ПРОШЛОМ гарантирует
+            # удаление при delete_items_before (fetched_at < digest_started_iso).
+            # Storage.save() ставит NOW, что совпадает с digest_started_iso
+            # (обе обрезаны до секунды) → fetched_at < cutoff = False → не удалится.
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO items
+                (source, url, title, summary, published, fetched_at, state, state_at, llm_score)
+                VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?)
+                """,
+                ("TestSrc", "https://ex.com/lead2", "Лидер",
+                 "Test summary", "2025-01-01 12:00",
+                 "2025-01-01T12:00:00+00:00",
+                 "2025-01-01T12:00:00+00:00", 6),
+            )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO items
+                (source, url, title, summary, published, fetched_at, state, state_at, llm_score)
+                VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?)
+                """,
+                ("TestSrc", "https://ex.com/d2", "Дубль",
+                 "Test summary", "2025-01-01 12:00",
+                 "2025-01-01T12:00:00+00:00",
+                 "2025-01-01T12:00:00+00:00", 6),
+            )
+            conn.commit()
+            conn.close()
 
             mock_filter = MagicMock()
             mock_filter.detect_duplicates.return_value = {1}  # dup = дубль
@@ -490,27 +554,40 @@ class TestRunDigestClusterIntegration(unittest.TestCase):
 
             # run_digest не упал
             self.assertEqual(count, 1)
+            # Лидер отправлен (дубли отфильтрованы из groups — они не попали в send_text)
+            send_args = delivery.send_text.call_args[0][0]
+            self.assertIn("Лидер", send_args)
+            self.assertNotIn("Дубль", send_args)
+
             # Переоткрываем соединение чтобы увидеть закоммиченные данные
             p.storage.close()
             s = Storage(db_path)
-            digested_urls = {i.url for i in s.get_all_by_state("digested")}
-            # Лидер помечен (digest), дубль — best-effort: остался deferred
-            self.assertIn("https://ex.com/lead2", digested_urls)
-            # Дубль НЕ помечен (fallback set_state убран)
-            self.assertNotIn("https://ex.com/d2", digested_urls)
-            deferred_urls = {i.url for i in s.get_all_by_state("deferred")}
-            self.assertIn("https://ex.com/d2", deferred_urls)
+            # Оба items удалены delete_items_before (fetched_at 2025 < digest_started_iso Oct 2026)
+            all_urls = set()
+            for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
+                all_urls.update(i.url for i in s.get_all_by_state(state))
+            self.assertNotIn("https://ex.com/lead2", all_urls)
+            self.assertNotIn("https://ex.com/d2", all_urls)
             s.close()
 
     def test_no_duplicates_means_all_sent(self):
         """detect_duplicates пустое → все items отправлены, ни один не помечен twice."""
         with _tmp_db() as db_path:
+            # Инициализируем схему
             s = Storage(db_path)
-            for i in range(3):
-                item = _mk_item(title=f"Item{i}", url=f"https://ex.com/i{i}", llm_score=6)
-                s.save(item)
-                s.set_state([f"https://ex.com/i{i}"], "deferred")
             s.close()
+
+            # Вставляем напрямую с явным fetched_at в ПРОШЛОМ.
+            # Storage.save() ставит NOW, что совпадает с digest_started_iso
+            # (обе обрезаны до секунды) → fetched_at < cutoff = False.
+            for i in range(3):
+                _insert_deferred_item(
+                    db_path,
+                    title=f"Item{i}", url=f"https://ex.com/i{i}",
+                    published="2025-01-01 12:00",
+                    fetched_at="2025-01-01T12:00:00+00:00",
+                    score=6,
+                )
 
             mock_filter = MagicMock()
             mock_filter.detect_duplicates.return_value = set()
@@ -523,10 +600,16 @@ class TestRunDigestClusterIntegration(unittest.TestCase):
             count = p.run_digest(force=True)
 
             self.assertEqual(count, 3)
-            s = p.storage
-            digested_urls = {i.url for i in s.get_all_by_state("digested")}
+            # Проверяем что отправлены все 3 items
             for i in range(3):
-                self.assertIn(f"https://ex.com/i{i}", digested_urls)
+                self.assertIn(f"Item{i}", delivery.send_text.call_args[0][0])
+            # После успешного дайджеста ВСЁ окно удалено из БД
+            s = p.storage
+            all_urls = set()
+            for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
+                all_urls.update(i.url for i in s.get_all_by_state(state))
+            for i in range(3):
+                self.assertNotIn(f"https://ex.com/i{i}", all_urls)
             s.close()
             p.close()
 
