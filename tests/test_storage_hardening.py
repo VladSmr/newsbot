@@ -60,7 +60,7 @@ def test_migration_v11_creates_indexes(tmp_path):
     conn.row_factory = None
     uv = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
-    assert uv == 11, f"expected user_version=11, got {uv}"
+    assert uv == Storage.SCHEMA_VERSION, f"expected user_version={Storage.SCHEMA_VERSION}, got {uv}"
 
     indexes = _read_indexes(db_path)
     assert "idx_seen_fetched" in indexes, \
@@ -123,7 +123,7 @@ def test_migration_v11_upgrades_existing_db(tmp_path):
     conn.row_factory = None
     uv = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
-    assert uv == 11
+    assert uv == Storage.SCHEMA_VERSION
 
     indexes = _read_indexes(db_path)
     assert "idx_seen_fetched" in indexes, f"idx_seen_fetched missing: {indexes}"
@@ -137,14 +137,14 @@ def test_migration_v11_idempotent(tmp_path):
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == Storage.SCHEMA_VERSION
     conn.close()
 
     # Второй Storage на той же БД — без ошибок.
     Storage(db_path)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == Storage.SCHEMA_VERSION
     conn.close()
 
 

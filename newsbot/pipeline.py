@@ -29,7 +29,7 @@ deferred-items (до max_items сообщений с ретраями Telegram A
 import logging
 import math
 from datetime import datetime, timedelta, timezone as tz
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from .collector import FeedCollector, FeedResult, NewsItem
 from .dedup import filter_new
@@ -60,6 +60,106 @@ def _parse_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "on")
     return False
+
+
+def _parse_tags(tags_str: Optional[str]) -> List[str]:
+    """Парсит JSON-массив тегов из БД."""
+    if not tags_str:
+        return []
+    try:
+        import json
+        return json.loads(tags_str)
+    except Exception:
+        return []
+
+def _infer_category(item) -> str:
+    """
+    Определяет категорию новости по source + tags.
+    categories: cinema, games, space, tech, cyber, science
+    """
+    source = (item.source or "").lower()
+    tags = _parse_tags(getattr(item, 'tags', None))
+    tags_lower = [t.lower() for t in tags]
+
+    # Кино
+    if source in ('deadline', 'variety'):
+        return 'cinema'
+    if any(t in tags_lower for t in ('film', 'movie', 'box office', 'reviews',
+                                      'oscars', 'cannes', 'streaming', 'tv', 'broadway')):
+        return 'cinema'
+
+    # Игры
+    if source in ('ign', 'eurogamer', 'dtf'):
+        return 'games'
+    if any(t in tags_lower for t in ('games', 'gaming', 'playstation', 'xbox', 'nintendo', 'steam')):
+        return 'games'
+
+    # Космос
+    if source in ('spacenews', 'nasa', 'nasaspaceflight'):
+        return 'space'
+    if any(t in tags_lower for t in ('space', 'nasa', 'rocket', 'satellite', 'astronaut')):
+        return 'space'
+
+    # Тех
+    if source in ('tom shardware', 'habr', 'techcrunch'):
+        return 'tech'
+    if any(t in tags_lower for t in ('technology', 'ai', 'tech', 'software', 'hardware')):
+        return 'tech'
+
+    # Кибербезопасность
+    if source in ('krebs on security', 'bleepingcomputer'):
+        return 'cyber'
+    if any(t in tags_lower for t in ('cyber', 'security', 'malware', 'hack', 'vulnerability')):
+        return 'cyber'
+
+    # Наука
+    if source in ('science daily', 'phys.org', 'n+1', 'naked science', 'statnews'):
+        return 'science'
+    if any(t in tags_lower for t in ('science', 'research', 'study', 'discovery', 'medical', 'health')):
+        return 'science'
+
+    return 'other'
+
+def _category_guarantee(
+    items: List[NewsItem],
+    category_min: Dict[str, int],
+) -> List[NewsItem]:
+    """
+    Гарантирует минимум новостей по категориям.
+    Алгоритм:
+    1. Сортируем все items по llm_score DESC
+    2. result = []
+    3. Для каждой категории в category_min: берём лучшие items этой категории,
+       которых ещё нет в result (до category_min[cat] штук)
+    4. Добиваем result оставшимися items по score до max_items
+    """
+    if not category_min or not items:
+        return items
+
+    result: List[NewsItem] = []
+    remaining = list(items)  # копия
+    used_ids = set()
+
+    # Приоритет по порядку в category_min (кино первый)
+    for cat, min_count in category_min.items():
+        candidates = [
+            i for i in remaining
+            if _infer_category(i) == cat and id(i) not in used_ids
+        ]
+        # сортируем по score DESC
+        candidates.sort(key=lambda x: x.llm_score or 0, reverse=True)
+        taken = candidates[:min_count]
+        for item in taken:
+            result.append(item)
+            used_ids.add(id(item))
+        # убираем из remaining только взятые
+        remaining = [i for i in remaining if id(i) not in used_ids]
+
+    # Добиваем оставшимися по score
+    remaining.sort(key=lambda x: x.llm_score or 0, reverse=True)
+    result += remaining
+
+    return result
 
 
 def _iso_dt(value: str):
@@ -800,6 +900,24 @@ class NewsPipeline:
             if llm_batch_records:
                 self.storage.update_llm_results_batch(llm_batch_records)
 
+            # ── Pre-LLM кластеризация: распределить максимальный score по кластеру ──
+            from collections import defaultdict
+            cluster_scores: Dict[str, float] = defaultdict(lambda: 0.0)
+            cluster_members: Dict[str, List[NewsItem]] = defaultdict(list)
+
+            for item in items:
+                if getattr(item, "cluster_key", None):
+                    cluster_members[item.cluster_key].append(item)
+                    if item.llm_score is not None and item.llm_score > cluster_scores[item.cluster_key]:
+                        cluster_scores[item.cluster_key] = float(item.llm_score)
+
+            # Распределить максимальный score обратно по кластеру
+            for key, members in cluster_members.items():
+                best_score = cluster_scores[key]
+                for item in members:
+                    if item.llm_score is None or item.llm_score < best_score:
+                        item.llm_score = int(best_score)
+
             # ── фиксируем state и логируем итоговые счётчики (одна INFO-строка) ──
             n_skipped = len(skipped_urls)
             n_deferred = len(deferred_urls)
@@ -1105,6 +1223,15 @@ class NewsPipeline:
         _dup_urls = self._cluster_deferred_duplicates(deferred_items)
         if _dup_urls:
             deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
+
+        # Применяем гарантию по категориям (до сортировки по score)
+        category_min = digest_cfg.get("category_min", {})
+        if category_min:
+            deferred_items = _category_guarantee(deferred_items, category_min)
+
+        # Сортируем и обрезаем
+        deferred_items.sort(key=lambda x: x.llm_score or 0, reverse=True)
+        deferred_items = deferred_items[:max_items]
 
         # ── Feedback targets + передача готовых groups в digest ──
         # F2: только при TelegramDelivery + feedback.enabled + digest_enabled.

@@ -50,7 +50,7 @@ class Storage:
     Идемпотентность: user_version выставляется ПОСЛЕ успешной миграции.
     """
 
-    SCHEMA_VERSION = 11
+    SCHEMA_VERSION = 12
     STATES = ("new", "pending", "delivered", "skipped", "deferred", "failed", "digested")
     DEFAULT_RETENTION_DAYS = 90
     DEFAULT_RETRY_THRESHOLD_SECONDS = 60
@@ -145,6 +145,8 @@ class Storage:
                 title       TEXT    NOT NULL,
                 summary     TEXT    NOT NULL,
                 published   TEXT,
+                tags        TEXT,
+                cluster_key TEXT,
                 fetched_at  TEXT    NOT NULL,
                 state       TEXT    NOT NULL DEFAULT 'new',
                 state_at    TEXT    NOT NULL,
@@ -447,12 +449,14 @@ class Storage:
                 except sqlite3.OperationalError:
                     pass
 
-            # (г) v4: llm_score, llm_summary, llm_reason, filtered_at
+            # (г) v4: llm_score, llm_summary, llm_reason, filtered_at, tags, cluster_key
             for col_name, col_def in (
                 ("llm_score", "INTEGER"),
                 ("llm_summary", "TEXT"),
                 ("llm_reason", "TEXT"),
                 ("filtered_at", "TEXT"),
+                ("tags", "TEXT"),
+                ("cluster_key", "TEXT"),
             ):
                 if col_name not in cols:
                     try:
@@ -475,11 +479,12 @@ class Storage:
             """)
             logger.info("Миграция v5: создана таблица meta")
 
-        # (е) v6: retry_count — только для существующих таблиц с версией < 6
+        # (е) v6: retry_count, cluster_key — только для существующих таблиц с версией < 6
         # cols читается выше, гарантированно определён.
         if from_version < 6 and "items" in existing_tables:
             for col_name, col_def in (
                 ("retry_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("cluster_key", "TEXT"),
             ):
                 if col_name not in cols:
                     try:
@@ -729,6 +734,23 @@ class Storage:
             except sqlite3.OperationalError:
                 pass  # конкурентный процесс уже создал
 
+        # (й) v12: cluster_key TEXT для кластеризации новостей.
+        # Идемпотентно: try/except для конкурентной миграции.
+        if "items" in existing_tables:
+            current_items_cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(items)"
+            ).fetchall()}
+            if "cluster_key" not in current_items_cols:
+                try:
+                    conn.execute(
+                        "ALTER TABLE items ADD COLUMN cluster_key TEXT"
+                    )
+                    logger.info("Миграция v12: добавлена колонка items.cluster_key")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+                    logger.info("v12: колонка cluster_key уже существует (конкурентный процесс)")
+
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -797,8 +819,9 @@ class Storage:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO items
-                    (source, url, title, summary, published, fetched_at, state, state_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'new', ?)
+                    (source, url, title, summary, published, tags, cluster_key,
+                     fetched_at, state, state_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
                     """,
                     (
                         item.source,
@@ -806,6 +829,8 @@ class Storage:
                         item.title,
                         summary,
                         item.published,
+                        getattr(item, "tags", None),
+                        getattr(item, "cluster_key", None),
                         now_iso,
                         now_iso,
                     ),
@@ -873,9 +898,9 @@ class Storage:
                     cur = conn.execute(
                         """
                         INSERT OR IGNORE INTO items
-                        (source, url, title, summary, published, fetched_at,
-                         state, state_at, retry_count)
-                        VALUES (?, ?, ?, ?, ?, ?, 'new', ?, 0)
+                        (source, url, title, summary, published, tags, cluster_key,
+                         fetched_at, state, state_at, retry_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, 0)
                         """,
                         (
                             item.source,
@@ -883,6 +908,8 @@ class Storage:
                             item.title,
                             summary,
                             item.published,
+                            getattr(item, "tags", None),
+                            getattr(item, "cluster_key", None),
                             now_iso,
                             now_iso,
                         ),
@@ -987,7 +1014,7 @@ class Storage:
         ).isoformat()
         rows = conn.execute(
             """
-            SELECT source, url, title, summary, published, fetched_at,
+            SELECT source, url, title, summary, published, tags, cluster_key, fetched_at,
                    llm_score, llm_summary, llm_reason, llm_urgent, retry_count
             FROM items
             WHERE state = 'pending'
@@ -1159,7 +1186,7 @@ class Storage:
     def get_all_by_state(self, state: str, limit: Optional[int] = None) -> List[NewsItem]:
         conn = self._connect()
         sql = """
-            SELECT source, url, title, summary, published, fetched_at, state_at,
+            SELECT source, url, title, summary, published, tags, cluster_key, fetched_at, state_at,
                    llm_score, llm_summary, llm_reason, llm_urgent
             FROM items
             WHERE state = ?
@@ -1204,7 +1231,7 @@ class Storage:
         conn = self._connect()
         params: list = []
         sql = """
-            SELECT source, url, title, summary, published, fetched_at, state_at,
+            SELECT source, url, title, summary, published, tags, cluster_key, fetched_at, state_at,
                    llm_score, llm_summary, llm_reason, llm_urgent
             FROM items
             WHERE state = 'deferred'
@@ -1318,13 +1345,28 @@ class Storage:
                 except Exception:
                     pass
 
+            # tags: может отсутствовать в старых записях (до добавления поля)
+            try:
+                tags_val = row["tags"]
+            except Exception:
+                tags_val = None
+
+            # cluster_key: может отсутствовать в старых записях (до v12)
+            cluster_key = None
+            try:
+                cluster_key = row["cluster_key"]
+            except Exception:
+                pass
+
             ni = NewsItem(
                 source=row["source"],
                 url=row["url"],
                 title=row["title"],
                 summary=row["summary"],
                 published=row["published"] or "—",
+                tags=tags_val,
                 published_parsed=None,
+                cluster_key=cluster_key,
                 fetched_at=fetched_at,
                 llm_score=llm_score,
                 llm_summary=llm_summary,
@@ -1999,9 +2041,9 @@ class Storage:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO items
-                    (source, url, title, summary, published, fetched_at,
-                     state, state_at, retry_count)
-                    VALUES (?, ?, ?, ?, ?, ?, 'skipped', ?, 0)
+                    (source, url, title, summary, published, tags, cluster_key,
+                     fetched_at, state, state_at, retry_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'skipped', ?, 0)
                     """,
                     (
                         item.source,
@@ -2009,6 +2051,8 @@ class Storage:
                         item.title,
                         summary,
                         item.published,
+                        getattr(item, "tags", None),
+                        getattr(item, "cluster_key", None),
                         now_iso,
                         now_iso,
                     ),

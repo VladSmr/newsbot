@@ -81,6 +81,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "on_empty": "skip",
         "max_age_hours": 24,
         "bootstrap_window_hours": 24,
+        "category_min": {
+            "cinema": 2,
+            "games": 1,
+            "space": 1,
+            "tech": 1,
+            "cyber": 1,
+            "science": 1,
+        },
     },
     "llm": {
         "enabled": True,

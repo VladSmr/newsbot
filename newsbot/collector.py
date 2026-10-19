@@ -8,6 +8,7 @@
   - пустые entry без link пропускаются
 """
 import calendar
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -82,7 +83,9 @@ class NewsItem:
     title: str
     summary: str
     published: str
-    published_parsed: Optional[datetime]
+    tags: Optional[str] = None                # JSON-массив тегов из <category>
+    published_parsed: Optional[datetime] = None
+    cluster_key: Optional[str] = None         # локация|stem_hash|день (для кластеризации)
     # --- результат LLM-фильтра (этап 2) ---
     llm_score: Optional[int] = None          # оценка 0..10
     llm_summary: Optional[str] = None       # выжимка от LLM
@@ -282,6 +285,25 @@ class FeedCollector:
             published_str = _format_pubdate(entry)
             pub_parsed = _parse_pubdate_utc(entry)
 
+            # Читаем <category> теги из фида
+            raw_tags = getattr(entry, "tags", []) or []
+            tags_list = []
+            for t in raw_tags:
+                term = getattr(t, "term", "") or ""
+                if term:
+                    tags_list.append(term)
+            tags_str = json.dumps(tags_list) if tags_list else None
+
+            # cluster_key: локация|stem_hash|день публикации
+            cluster_key = None
+            if title:
+                from .stemmer import stem_hash
+                from .locations import extract_location
+                location = extract_location(title)
+                stem = stem_hash(title)
+                pub_day = published_str[:10] if published_str and len(published_str) >= 10 else 'unknown'
+                cluster_key = f"{location}|{stem}|{pub_day}"
+
             news_items.append(NewsItem(
                 source=name,
                 url=link,
@@ -289,6 +311,8 @@ class FeedCollector:
                 summary=summary,
                 published=published_str,
                 published_parsed=pub_parsed,
+                tags=tags_str,
+                cluster_key=cluster_key,
             ))
 
         logger.info(

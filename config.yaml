@@ -154,6 +154,15 @@ digest:
   max_age_hours: 24                 # выбирать deferred-items не старше N часов (суточное окно)
   bootstrap_window_hours: 24        # окно начального наполнения дайджеста (сутки)
 
+  # Минимум новостей по категории (каждая учитывается по скорингу)
+  category_min:
+    cinema: 2    # Deadline + Variety
+    games: 1     # IGN + EuroGamer + DTF
+    space: 1     # SpaceNews + NASA
+    tech: 1      # Tom's Hardware + Habr
+    cyber: 1     # Krebs + BleepingComputer
+    science: 1   # ScienceDaily + Phys.org + N+1
+
 # --- Фаза 2: обратная связь (👍/👎 после доставки новости) ---
 # Кнопки обрабатываются в Фазе 2b, few-shot в промпте — Фазе 2c.
 # feedback_targets хранятся коротко (кнопки живут ~retention_days),
