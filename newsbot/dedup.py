@@ -65,17 +65,20 @@ def _stem_duplicate(item: NewsItem, storage: Storage, cutoff_hours: int = 2) -> 
 
 def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -> bool:
     """
-    Быстрый доменный дедуп: если тот же source уже выдавал новость
-    за последние `hours` — пропускаем как потенциальный дубль.
-    Без fuzzy-сравнения, только по факту наличия recent-записи.
+    Быстрый дедуп по cluster_key: если ОДИН cluster_key (тема+день)
+    уже был за последние hours — блокируем. Разные темы от одного
+    источника НЕ блокируются.
     """
+    cluster_key = getattr(item, 'cluster_key', None)
+    if not cluster_key:
+        return False
     from datetime import datetime, timedelta, timezone
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
         conn = storage._connect()
         row = conn.execute(
-            "SELECT 1 FROM items WHERE source=? AND fetched_at>=? LIMIT 1",
-            (item.source, cutoff),
+            "SELECT 1 FROM items WHERE cluster_key=? AND fetched_at>=? LIMIT 1",
+            (cluster_key, cutoff),
         ).fetchone()
         return row is not None
     except Exception:
