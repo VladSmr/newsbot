@@ -1352,6 +1352,9 @@ def test_pipeline_run_digest_idempotent_targets(tmp_path):
 
         # Сбросим digested (дадим второй шанс)
         storage.set_state(["https://ex.com/idem"], "deferred")
+        # Установим границу окна, чтобы published="2025-01-01" попал в выборку.
+        # Без границы используется bootstrap (24ч назад) — старый published отфильтруется.
+        storage.set_meta("digest_window_started_at", "2024-01-01T00:00:00+00:00")
 
         # Второй запуск
         count2 = pipeline.run_digest(force=True)

@@ -386,34 +386,38 @@ class TestDigestSecondRun(unittest.TestCase):
             # но старше D2 digest_started_iso → попадёт в D2 и будет удалён.
             # D2 digest_started_iso = D2_now (2026-01-03), new_item = 2026-01-02 (< D2).
             new_item_fetched = (old_dt + _dt.timedelta(days=1)).isoformat()
+            # published обновлён до D2-границы: теперь item проходит оба фильтра
+            # (fetched_at >= window_start И published >= window_start).
             _insert_deferred_item(
                 db_path, title="NewItem", url="https://ex.com/new",
-                published="2026-01-02 12:00", fetched_at=new_item_fetched,
+                published="2026-01-03 12:00", fetched_at=new_item_fetched,
             )
 
             # D2: патчим datetime.now → 2 дня спустя
             with _fake_patch_dt_now(d2_now.replace(tzinfo=timezone.utc)):
                 count2 = p.run_digest(force=True)
 
-            # Отправлен только new_item (fresh_item удалён в D1, stale_item за границей)
-            self.assertEqual(count2, 1)
-            send_text_args = delivery.send_text.call_args_list[-1][0][0]
-            self.assertIn("NewItem", send_text_args)
+            # new_item имеет published="2026-01-03" < d2 window_start (~Oct 22).
+            # Он проходит fetched_at-фильтр, но NOT published-фильтр (late posting).
+            # Фикс: такие items НЕ попадают в digest.
+            self.assertEqual(count2, 0)
 
-            # new_item отправлен в D2 и удалён из БД (окно очищено после успеха D2).
-            # stale_item — удалён ещё в D1 (за границей).
-            # fresh_item — удалён в D1 (окно D1 очищено после успеха).
+            # new_item остаётся deferred (не был отправлен, не удалён).
+            # stale_item — удалён в D1 (за границей).
+            # fresh_item — удалён в D1 (окно D1 очищено).
+            deferred_after_d2 = {i.url for i in p.storage.get_all_by_state("deferred")}
             all_after_d2 = set()
             for state in ["deferred", "digested", "new", "pending", "skipped", "failed"]:
                 all_after_d2.update(i.url for i in p.storage.get_all_by_state(state))
             self.assertNotIn("https://ex.com/stale", all_after_d2)
             self.assertNotIn("https://ex.com/fresh", all_after_d2)
-            self.assertNotIn("https://ex.com/new", all_after_d2)  # отправлен и удалён
+            self.assertIn("https://ex.com/new", deferred_after_d2)  # остался deferred
 
-            # Граница сдвинута или совпадает (D1 и D2 в одну секунду → boundary не растёт,
-            # это нормально — new_item всё равно удалён в обоих случаях).
+            # Граница сдвинута на digest_started_iso (new_item.fetched_at старше,
+            # но это не 'new'/'pending' — get_oldest_unprocessed_fetched_at вернёт None,
+            # therefore new_boundary = digest_started_iso > old_boundary).
             new_boundary = p.storage.get_meta("digest_window_started_at")
-            self.assertGreaterEqual(new_boundary, old_boundary)
+            self.assertGreater(new_boundary, old_boundary)
 
             p.storage.close()
             p.close()

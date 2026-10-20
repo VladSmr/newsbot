@@ -1213,6 +1213,7 @@ class Storage:
         self, limit: Optional[int] = None,
         since_iso: Optional[str] = None,
         max_age_hours: Optional[int] = None,
+        published_since: Optional[str] = None,
     ) -> List[NewsItem]:
         """
         Возвращает items со state='deferred', отсортированные:
@@ -1227,6 +1228,10 @@ class Storage:
                            now - max_age_hours. None означает «без ограничения».
                            Приоритет: max_age_hours вычисляется из since_iso,
                            если оба не заданы — ограничения по возрасту нет.
+            published_since: если задано — выборка ограничена published >= published_since.
+                              Позволяет исключить late-posted новости с old published
+                              из дайджеста. Для записей без published условие
+                              возвращает False (NULL не попадает в результат).
         """
         conn = self._connect()
         params: list = []
@@ -1244,6 +1249,9 @@ class Storage:
         if effective_since is not None:
             sql += " AND julianday(fetched_at) >= julianday(?)"
             params.append(effective_since)
+        if published_since is not None:
+            sql += " AND julianday(published) >= julianday(?)"
+            params.append(published_since)
         sql += " ORDER BY llm_score DESC, fetched_at ASC"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"

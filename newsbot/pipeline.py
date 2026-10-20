@@ -1191,6 +1191,7 @@ class NewsPipeline:
         deferred_items = self.storage.get_deferred_items(
             limit=max_items,
             since_iso=window_start_iso if raw_boundary is not None else None,
+            published_since=window_start_iso if raw_boundary is not None else None,
         )
 
         logger.info(
