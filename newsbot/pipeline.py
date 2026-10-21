@@ -29,6 +29,7 @@ deferred-items (до max_items сообщений с ретраями Telegram A
 import logging
 import math
 from datetime import datetime, timedelta, timezone as tz
+from email.utils import parsedate_to_datetime as _parsedate_to_dt
 from typing import Dict, List, Optional, Set
 
 from .collector import FeedCollector, FeedResult, NewsItem
@@ -120,54 +121,202 @@ def _infer_category(item) -> str:
 
     return 'other'
 
+
+def _cap_by_location(
+    items: List[NewsItem],
+    max_per_location: int = 2,
+) -> List[NewsItem]:
+    """
+    Ограничивает число новостей по локации и дню.
+
+    Для каждой пары (локация, день публикации) оставляет не более
+    max_per_location новостей. Items с cluster_key=None или корзиной
+    'other' пропускаются (кэп на них не распространяется).
+
+    Алгоритм: итерация по порядку, для каждой (локация, день) сохраняются
+    первые max_per_location items — остальные отфильтровываются.
+    Вызывается в run_digest ПОСЛЕ backfill, ДО _category_guarantee.
+    """
+    if max_per_location <= 0 or not items:
+        return list(items)
+
+    location_day_counts: Dict[tuple, int] = {}
+    result: List[NewsItem] = []
+
+    for item in items:
+        cluster_key = getattr(item, 'cluster_key', None)
+        if not cluster_key:
+            result.append(item)
+            continue
+
+        parts = cluster_key.split('|')
+        location = parts[0] if parts else 'other'
+        pub_day = parts[2] if len(parts) > 2 else 'unknown'
+
+        # bucket 'other' is not capped
+        if location == 'other':
+            result.append(item)
+            continue
+
+        key = (location, pub_day)
+        count = location_day_counts.get(key, 0)
+        if count < max_per_location:
+            result.append(item)
+            location_day_counts[key] = count + 1
+
+    if len(result) < len(items):
+        locations_hit = len(location_day_counts)
+        logger.info(
+            "Location cap: removed %d items across %d locations",
+            len(items) - len(result), locations_hit,
+        )
+
+    return result
+
 def _category_guarantee(
     items: List[NewsItem],
     category_min: Dict[str, int],
+    pool: Optional[List[NewsItem]] = None,
 ) -> List[NewsItem]:
     """
     Гарантирует минимум новостей по категориям.
+
     Алгоритм:
-    1. Сортируем все items по llm_score DESC
-    2. result = []
-    3. Для каждой категории в category_min: берём лучшие items этой категории,
-       которых ещё нет в result (до category_min[cat] штук)
-    4. Добиваем result оставшимися items по score до max_items
+    1. Считаем текущее покрытие по категориям в items.
+    2. Для каждой категории в category_min (кино первый): если покрытие < min,
+       вытесняем лучшие по score items категории из pool,
+       заменяя ими наименее ценные EVICTABLE items текущего набора.
+       EVICTABLE = item, чья категория НЕ в category_min
+       ИЛИ cat_counts[c] > category_min[c] (покрыта с запасом).
+    3. После каждого swap инкрементально обновляем cat_counts.
+    4. При пустом pool или None — legacy-режим: ничего не меняется
+       (swap невозможен, гарантия остаётся no-op).
+
+    Сорт вывода — по llm_score DESC вызывающей стороной после вызова.
     """
     if not category_min or not items:
         return items
 
-    result: List[NewsItem] = []
-    remaining = list(items)  # копия
-    used_ids = set()
+    result = list(items)
+    used_ids: Set[int] = {id(it) for it in items}
+
+    # Считаем текущее покрытие по категориям
+    cat_counts: Dict[str, int] = {}
+    for item in result:
+        cat = _infer_category(item)
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+
+    # Pool сортирован по score DESC
+    pool_sorted: List[NewsItem] = []
+    if pool:
+        pool_sorted = sorted(
+            list(pool),
+            key=lambda x: x.llm_score or 0,
+            reverse=True,
+        )
 
     # Приоритет по порядку в category_min (кино первый)
     for cat, min_count in category_min.items():
-        candidates = [
-            i for i in remaining
-            if _infer_category(i) == cat and id(i) not in used_ids
-        ]
-        # сортируем по score DESC
-        candidates.sort(key=lambda x: x.llm_score or 0, reverse=True)
-        taken = candidates[:min_count]
-        for item in taken:
-            result.append(item)
-            used_ids.add(id(item))
-        # убираем из remaining только взятые
-        remaining = [i for i in remaining if id(i) not in used_ids]
+        current = cat_counts.get(cat, 0)
+        if current >= min_count:
+            continue  # уже достаточно
 
-    # Добиваем оставшимися по score
-    remaining.sort(key=lambda x: x.llm_score or 0, reverse=True)
-    result += remaining
+        needed = min_count - current
+        added = 0
+        pool_idx = 0
+        while added < needed and pool_idx < len(pool_sorted):
+            candidate = pool_sorted[pool_idx]
+            pool_idx += 1
+            if id(candidate) in used_ids:
+                continue  # уже в result
+            if _infer_category(candidate) != cat:
+                continue  # не из нужной категории
+
+            # Жертва — только evictable: категория НЕ в category_min
+            # ИЛИ cat_counts[c] > category_min[c] (покрыта с запасом).
+            # Сортируем evictable по score ASC -> жертва с минимальным score.
+            def _evictable(x: NewsItem) -> bool:
+                c = _infer_category(x)
+                return (c not in category_min) or (cat_counts.get(c, 0) > category_min[c])
+
+            evictable = [x for x in result if _evictable(x)]
+            if not evictable:
+                logger.warning(
+                    "Категория %s: минимум не достигнут, некого вытеснять "
+                    "(current=%d, min=%d)", cat, current, min_count,
+                )
+                break
+
+            evictable_sorted = sorted(evictable, key=lambda x: x.llm_score or 0)
+            victim = evictable_sorted[0]  # наименее ценный evictable
+
+            victim_cat = _infer_category(victim)
+            # Удаление по индексу (вместо result.remove, опирающегося на __eq__)
+            victim_idx = next(i for i, x in enumerate(result) if x is victim)
+            del result[victim_idx]
+            used_ids.discard(id(victim))
+
+            # Инкрементальное обновление cat_counts
+            cat_counts[victim_cat] = cat_counts.get(victim_cat, 0) - 1
+
+            result.append(candidate)
+            used_ids.add(id(candidate))
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            added += 1
+
+    # Финальный warning по невыполненным категориям
+    for cat, min_count in category_min.items():
+        current = cat_counts.get(cat, 0)
+        if current < min_count:
+            logger.warning(
+                "Категория %s: минимум не достигнут (current=%d, min=%d)",
+                cat, current, min_count,
+            )
 
     return result
 
 
 def _iso_dt(value: str):
-    """Парсит ISO-8601 (в т.ч. 'Z') в datetime; None при ошибке."""
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, TypeError, AttributeError):
+    """Парсит дату из различных форматов в datetime (UTC или timezone-aware).
+    Поддерживает:
+      - ISO-8601 (в т.ч. 'Z', 'YYYY-MM-DD HH:MM')
+      - Русский формат 'DD.MM.YYYY HH:MM[:SS]' (без тайзоны, считается UTC)
+      - Русский формат с суффиксом 'UTC': 'DD.MM.YYYY HH:MM UTC'
+      - RFC-2822: 'Mon, 01 Jan 2025 12:00:00 GMT'
+    Форматы без тайзоны считаются UTC.
+    None при ошибке."""
+    if not isinstance(value, str):
         return None
+    v = value.strip()
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    # Русские форматы БЕЗ суффикса UTC
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(v, fmt).replace(tzinfo=tz.utc)
+        except ValueError:
+            continue
+    # Русские форматы С суффиксом 'UTC' (основной прод-формат, collector.py)
+    # Nit 1: точный срез вместо rsplit — rsplit(" UTC") срезал бы и " UTC+3".
+    # Проверяем точное окончание; HH:MM и HH:MM:SS различаем перебором форматов.
+    if v.endswith(" UTC"):
+        base = v[:-4]  # срез " UTC" (4 символа)
+        for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(base, fmt).replace(tzinfo=tz.utc)
+            except ValueError:
+                continue
+    # RFC-2822 fallback (collector.py сырые значения типа "Mon, 01 Jan 2025 12:00:00 GMT")
+    try:
+        parsed = _parsedate_to_dt(v)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=tz.utc)
+        return parsed
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 class NewsPipeline:
@@ -1162,8 +1311,22 @@ class NewsPipeline:
             logger.debug("Дайджест выключен (digest.enabled=false)")
             return 0
 
-        max_items = int(digest_cfg.get("max_items", 100))
-        max_items_per_message = int(digest_cfg.get("max_items_per_message", 20))
+        try:
+            max_items = max(1, int(digest_cfg.get("max_items", 30)))
+        except (TypeError, ValueError):
+            max_items = 30
+            logger.warning(
+                "digest.max_items некорректен: %r, использую 30",
+                digest_cfg.get("max_items"),
+            )
+        try:
+            max_items_per_message = int(digest_cfg.get("max_items_per_message", 20))
+        except (TypeError, ValueError):
+            max_items_per_message = 20
+            logger.warning(
+                "digest.max_items_per_message некорректен: %r, использую 20",
+                digest_cfg.get("max_items_per_message"),
+            )
         on_empty = digest_cfg.get("on_empty", "skip")
 
         # ── Оконная логика: граница окна ───────────────────────────────────
@@ -1189,9 +1352,58 @@ class NewsPipeline:
         # это защищает тесты без явной границы и первый запуск на свежей БД.
         # Следующий цикл уже имеет границу в meta и будет фильтровать.
         deferred_items = self.storage.get_deferred_items(
-            limit=max_items,
+            # M3-фикс: берём с запасом, чтобы Python-фильтр по published
+            # не «съел» нужные items (SQL LIMIT отрабатывает ДО фильтра).
+            # Окончательная обрезка — deferred_items[:max_items] ниже.
+            limit=max_items * 2 if (max_items and max_items > 0) else None,
             since_iso=window_start_iso if raw_boundary is not None else None,
-            published_since=window_start_iso if raw_boundary is not None else None,
+        )
+        # Кросс-дайджест дедуп: items с published РАНЬШЕ начала окна не
+        # попадают в дайджест (late-posted старые новости). Фильтр в Python:
+        # формат published в БД неоднородный (ISO у англ. фидов,
+        # 'DD.MM.YYYY HH:MM' у русских), SQLite julianday() по нему
+        # возвращает NULL и отсеивал ВСЕ строки (пустые дайджесты на проде).
+        # published, который не парсится, — сохраняем (не теряем новости).
+        # Публикуем отфильтрованный по published список (post-published-filtered)
+        # — он будет использован для бэкфилла и гарантии по категориям.
+        # Сохраняем ДО обрезки: это pool за пределами top-N.
+        deferrable_post_published = list(deferred_items)
+
+        if raw_boundary is not None:
+            ws_dt = _iso_dt(window_start_iso)
+            if ws_dt is not None:
+                # M2-фикс: правильная нормализация aware→naive через astimezone,
+                # а не .replace(tzinfo=None) (последнее давало ошибку ±offset часов).
+                # Minor 1: если ws_dt naive (legacy-meta без offset), astimezone
+                # трактовала бы его как локальное время → граница съезжает на offset.
+                # Лечим: naive оставляем как есть, aware нормализуем.
+                ws_naive = ws_dt if ws_dt.tzinfo is None else ws_dt.astimezone(tz.utc).replace(tzinfo=None)
+                filtered = []
+                for it in deferrable_post_published:
+                    pub_str = str(it.published or "")
+                    pub_dt = _iso_dt(pub_str) if pub_str else None
+                    # Непарсящийся published сохраняем (не теряем новости).
+                    # M2: aware → UTC → naive; naive уже без тайзоны.
+                    if pub_dt is None:
+                        filtered.append(it)
+                    else:
+                        if pub_dt.tzinfo is not None:
+                            pub_dt_norm = pub_dt.astimezone(tz.utc).replace(tzinfo=None)
+                        else:
+                            pub_dt_norm = pub_dt
+                        if pub_dt_norm >= ws_naive:
+                            filtered.append(it)
+                deferrable_post_published = filtered
+
+        # Minor 2 (NIT 1): обрезаем СРАЗУ после published-фильтра, ДО кластеризации.
+        # SQL-запас *2 оставлен (страхует от того, чтобы published-фильтр не «съел»
+        # нужные слоты). Truncation ВЫНЕСЕНА из if raw_boundary — применяется всегда,
+        # включая bootstrap (raw_boundary=None), чтобы при отсутствии границы
+        # _cluster_deferred_duplicates тоже получала ≤max_items → без 2× LLM-вызовов.
+        deferred_items = (
+            deferrable_post_published[:max_items]
+            if (max_items and max_items > 0)
+            else deferrable_post_published
         )
 
         logger.info(
@@ -1211,8 +1423,8 @@ class NewsPipeline:
                 )
                 unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
                 new_boundary = digest_started_iso
-                if isinstance(unprocessed, str) and _iso_dt(unprocessed) is not None \
-                        and _iso_dt(unprocessed) < now_utc:
+                udt = _iso_dt(unprocessed) if isinstance(unprocessed, str) else None
+                if udt is not None and udt < now_utc:
                     new_boundary = unprocessed
                 self.storage.set_meta("digest_window_started_at", new_boundary)
                 return 0
@@ -1225,12 +1437,67 @@ class NewsPipeline:
         if _dup_urls:
             deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
 
-        # Применяем гарантию по категориям (до сортировки по score)
+        # ── Задача A: бэкфилл после LLM-дедупа ──────────────────────────────
+        # Если в топе оказались дубли — дайджест недобирается (буфер max_items..2*max_items
+        # не используется). Добираем из pool_tail: items, изначально БЫВШИХ ЗА
+        # пределами top-N (deferrable_post_published[max_items:]). Важно: items,
+        # которые были В top-N, но были удалены dedup-ом, НЕ берутся из пула —
+        # они уже прошли top-N и не являются «запасными» кандидатами.
+        #
+        # Бэкфилл НЕ проходит повторный LLM-дедуп: запасные items прошли
+        # pre-LLM cluster_key caps при сборе и domain-дедуп — достаточно.
+        # Запоминаем, какие items уже были в original top-N (до dedup).
+        if deferrable_post_published and max_items and max_items > 0:
+            pool_tail = deferrable_post_published[max_items:]
+            backfill_added = 0
+            existing_urls = {x.url for x in deferred_items}
+            for it in pool_tail:
+                if len(deferred_items) >= max_items:
+                    break
+                if it.url not in existing_urls:
+                    deferred_items.append(it)
+                    existing_urls.add(it.url)
+                    backfill_added += 1
+            if backfill_added:
+                logger.info(
+                    "Дайджест: бэкфилл добавил %d items из пула (top-N был неполным)",
+                    backfill_added,
+                )
+
+        # ── Задача B: гарантия по категориям с возможностью ПДТЯГИВАНИЯ ──────
+        # Pool для гарантии: deferrable_post_published минус всё, что уже в
+        # deferred_items по url (id не используем — cap теперь после гарантии).
+        # MAJOR: cap by location/day — строго ПОСЛЕ _category_guarantee.
+        # Передвинут в конец, чтобы инвариант «≤max_per_location на (локация, день)»
+        # держался железно даже после свапов гарантии.
+        category_pool = None
+        if deferrable_post_published:
+            included_urls = {it.url for it in deferred_items}
+            category_pool = [
+                it for it in deferrable_post_published
+                if it.url not in included_urls
+                and it.url not in _dup_urls
+            ]
         category_min = digest_cfg.get("category_min", {})
         if category_min:
-            deferred_items = _category_guarantee(deferred_items, category_min)
+            deferred_items = _category_guarantee(deferred_items, category_min, pool=category_pool)
 
-        # Сортируем и обрезаем
+        # MAJOR: cap by location/day — СТРОГО ПОСЛЕДНИЙ, после всех свапов.
+        # Инвариант «≤max_per_location на (локация, день)» держится железно,
+        # cap не может обнулить список (max_per_location>0 → в каждой группе ≥1).
+        max_per_location = digest_cfg.get("max_per_location", 2)
+        if max_per_location and max_per_location > 0 and deferred_items:
+            deferred_items = _cap_by_location(
+                deferred_items, max_per_location=max_per_location,
+            )
+            if deferred_items:
+                logger.info(
+                    "Дайджест: location-cap оставил %d items",
+                    len(deferred_items),
+                )
+
+        # Финальный сорт — по llm_score DESC (состав уже зафиксирован гарантийными
+        # свапами; сорт только порядок вывода). Финальный slice ПОСЛЕ гарантии.
         deferred_items.sort(key=lambda x: x.llm_score or 0, reverse=True)
         deferred_items = deferred_items[:max_items]
 
@@ -1270,10 +1537,18 @@ class NewsPipeline:
         # дубли НЕ терминализируются (retry в след.окне).
         total_to_send = sum(len(grp) for _, grp in groups)
 
-        # R1-фикс: НЕ выходи раньше если on_empty="send" и deferred пуст.
-        # on_empty="send" должен отправить уведомление "нет новых новостей"
-        # даже когда groups пустые (и deferrred пустой).
-        if not groups and not (not deferred_items and on_empty == "send"):
+        # Фикс: оригинальное условие, но с правильным приоритетом скобок.
+        # Оригинальное: not groups and not (not deferred_items and on_empty == "send")
+        #   = not groups and (deferred_items or on_empty != "send")
+        # Это значит: выходим когда groups пустые И (deferred_items НЕ пустые
+        #   ИЛИ on_empty НЕ "send").
+        # Переписанное (эквивалентное):
+        #   - выходим: on_empty="skip" + groups пустые (неважно, есть ли deferred)
+        #   - выходим: on_empty="send" + groups пустые + deferred_items НЕ пустые
+        #     (items oversized → run_digest::send_text→False → sent_urls=[] → OK)
+        #   - НЕ выходим: on_empty="send" + groups пустые + deferred_items ПУСТЫЕ
+        #     → отправляем уведомление "нет новостей"
+        if not groups and (on_empty != "send" or deferred_items):
             logger.info("Дайджест: нет сообщений для отправки.")
             # M2: пишем маркер окна и при force+empty, чтобы _maybe_run_digest
             # не спамил повторно в следующем цикле.

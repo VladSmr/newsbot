@@ -321,6 +321,20 @@ class TestStorageWindow(unittest.TestCase):
         conn.close()
         self.assertNotIn("Del2days", remaining)
 
+    def test_get_deferred_items_published_since_ignored(self):
+        """
+        M4-тест: published_since= будущее время ВСЁ РАВНО возвращает
+        существующие deferred items. Параметр DEPRECATED и игнорируется
+        (фильтрация вынесена в pipeline, storage.py:1253).
+        """
+        self._insert("deferred", hours_ago=1, score=6.0, title="DefItem")
+        # published_since в далёком будущем — не должен влиять на выборку
+        items = self.storage.get_deferred_items(
+            published_since="2030-01-01T00:00:00+00:00"
+        )
+        self.assertEqual(len(items), 1,
+            "published_since игнорируется, deferred item должен быть возвращён")
+
 
 if __name__ == "__main__":
     unittest.main()

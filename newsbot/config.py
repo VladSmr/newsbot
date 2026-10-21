@@ -81,6 +81,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "on_empty": "skip",
         "max_age_hours": 24,
         "bootstrap_window_hours": 24,
+        "max_per_location": 2,  # макс. новостей на локацию/день в дайджесте
         "category_min": {
             "cinema": 2,
             "games": 1,

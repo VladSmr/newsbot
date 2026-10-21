@@ -17,8 +17,9 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
+from datetime import timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 _root = Path(__file__).parent.parent
 sys.path.insert(0, str(_root))
@@ -63,7 +64,7 @@ def _tmp_db():
             pass
 
 
-def _insert_deferred_item(db_path, title, url, published, fetched_at, score=6):
+def _insert_deferred_item(db_path, title, url, published, fetched_at, score=6, tags=None):
     """
     Вставляет deferred-item напрямую в БД с заданным fetched_at.
     Storage.save() игнорирует item.fetched_at (всегда ставит NOW),
@@ -72,15 +73,16 @@ def _insert_deferred_item(db_path, title, url, published, fetched_at, score=6):
     fetched_at ЯВЛЯЕТСЯ ОБЯЗАТЕЛЬНЫМ параметром — это гарантирует
     предсказуемое поведение в тестах (без race condition по секундам).
     score позволяет влиять на порядок get_deferred_items (сортировка: score DESC).
+    tags: JSON-string для категоризации (напр. '["film","movie"]' → cinema).
     """
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
         INSERT OR IGNORE INTO items
-        (source, url, title, summary, published, fetched_at, state, state_at, llm_score)
-        VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?)
+        (source, url, title, summary, published, fetched_at, state, state_at, llm_score, tags)
+        VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?, ?)
         """,
-        ("TestSrc", url, title, "Test summary", published, fetched_at, fetched_at, score),
+        ("TestSrc", url, title, "Test summary", published, fetched_at, fetched_at, score, tags),
     )
     conn.commit()
     conn.close()
@@ -107,6 +109,176 @@ def _mk_pipeline(db_path, digest_cfg=None, llm_filter=None):
 # =============================================================================
 # Тесты
 # =============================================================================
+
+class TestIsoDtParsing(unittest.TestCase):
+    """M1-тесты: _iso_dt парсит все прод-форматы (UTC-суффикс, RFC-2822, ISO)."""
+
+    def _assert_utc(self, result, year, month, day, hour, minute, second=0):
+        """Проверяет aware-UTC datetime."""
+        self.assertIsNotNone(result)
+        self.assertEqual(result.year, year)
+        self.assertEqual(result.month, month)
+        self.assertEqual(result.day, day)
+        self.assertEqual(result.hour, hour)
+        self.assertEqual(result.minute, minute)
+        self.assertEqual(result.second, second)
+        self.assertEqual(result.tzinfo, timezone.utc)
+
+    def _assert_aware(self, result, year, month, day, hour, minute, expected_offset_minutes=0):
+        """Проверяет aware datetime с ожидаемым offset (в минутах)."""
+        self.assertIsNotNone(result)
+        self.assertEqual(result.year, year)
+        self.assertEqual(result.month, month)
+        self.assertEqual(result.day, day)
+        self.assertEqual(result.hour, hour)
+        self.assertEqual(result.minute, minute)
+        self.assertIsNotNone(result.tzinfo)
+        self.assertEqual(
+            result.utcoffset(), timedelta(minutes=expected_offset_minutes),
+            f"utcoffset должен быть {expected_offset_minutes} мин, got {result.utcoffset()}",
+        )
+
+    def test_iso_dt_ru_without_utc_suffix(self):
+        """'DD.MM.YYYY HH:MM' без суффикса → aware UTC."""
+        from newsbot.pipeline import _iso_dt
+        result = _iso_dt("20.10.2026 21:02")
+        self._assert_utc(result, 2026, 10, 20, 21, 2)
+
+    def test_iso_dt_ru_with_utc_suffix(self):
+        """'DD.MM.YYYY HH:MM UTC' с суффиксом → aware UTC (основной формат прод-данных)."""
+        from newsbot.pipeline import _iso_dt
+        result = _iso_dt("20.10.2026 21:02 UTC")
+        self._assert_utc(result, 2026, 10, 20, 21, 2)
+
+    def test_iso_dt_ru_with_utc_suffix_seconds(self):
+        """'DD.MM.YYYY HH:MM:SS UTC' → aware UTC."""
+        from newsbot.pipeline import _iso_dt
+        result = _iso_dt("20.10.2026 21:02:34 UTC")
+        self._assert_utc(result, 2026, 10, 20, 21, 2, 34)
+
+    def test_iso_dt_iso_aware(self):
+        """ISO с явным offset ('+03:00') → aware с правильным offset."""
+        from newsbot.pipeline import _iso_dt
+        result = _iso_dt("2026-10-20T21:02:00+03:00")
+        self._assert_aware(result, 2026, 10, 20, 21, 2, expected_offset_minutes=180)  # +03:00 = 180 мин
+        # При конвертации в UTC: 21:02+03:00 → 18:02 UTC
+        utc = result.astimezone(timezone.utc)
+        self.assertEqual(utc.hour, 18)
+        self.assertEqual(utc.minute, 2)
+
+    def test_iso_dt_iso_z(self):
+        """ISO с 'Z' → aware UTC."""
+        from newsbot.pipeline import _iso_dt
+        result = _iso_dt("2026-10-20T21:02:00Z")
+        self._assert_utc(result, 2026, 10, 20, 21, 2)
+
+    def test_iso_dt_rfc2822_gmt(self):
+        """RFC-2822 'Mon, 01 Jan 2025 12:00:00 GMT' → aware (fallback из collector.py)."""
+        from newsbot.pipeline import _iso_dt
+        result = _iso_dt("Mon, 01 Jan 2025 12:00:00 GMT")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.year, 2025)
+        self.assertEqual(result.month, 1)
+        self.assertEqual(result.day, 1)
+        self.assertEqual(result.hour, 12)
+        self.assertEqual(result.minute, 0)
+        # RFC-2822 GMT должен вернуть aware (email.utils парсит с UTC)
+        self.assertIsNotNone(result.tzinfo)
+
+    def test_iso_dt_emdash(self):
+        """'—' (заглушка collector.py) → None."""
+        from newsbot.pipeline import _iso_dt
+        result = _iso_dt("—")
+        self.assertIsNone(result)
+
+    def test_iso_dt_none_guards(self):
+        """None → None; пустая строка → None."""
+        from newsbot.pipeline import _iso_dt
+        self.assertIsNone(_iso_dt(None))
+        self.assertIsNone(_iso_dt(""))
+        self.assertIsNone(_iso_dt(123))  # не строка
+
+
+class TestIsoDtDigestIntegration(unittest.TestCase):
+    """M4-тест: published-фильтр в run_digest — интеграция с реальными форматами."""
+
+    def test_late_posted_item_excluded_from_digest(self):
+        """
+        deferred item с published='19.10.2026 20:00 UTC' (старше границы окна)
+        и fetched_at ВНУТРИ окна — НЕ попадает в дайджест.
+
+        Без M1-фикса (_iso_dt не парсил 'UTC'-суффикс) этот item проходил
+        бы неотфильтрованным (pub_dt=None → fail-open).
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            # Граница: 2026-10-20 — published='19.10.2026 20:00 UTC' старше
+            s.set_meta("digest_window_started_at", "2026-10-20T00:00:00+00:00")
+            s.close()
+
+            # Item: fetched_at=2026-10-21 (ВНУТРИ окна), но published=2026-10-19 (за границей)
+            _insert_deferred_item(
+                db_path,
+                title="OldPublishedItem",
+                url="https://ex.com/oldpub",
+                published="19.10.2026 20:00 UTC",  # формат с суффиксом UTC (prod-format)
+                fetched_at="2026-10-21T12:00:00+00:00",
+                score=7,
+            )
+
+            p = _mk_pipeline(db_path)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            # Первый digest: отправляем то что есть (item попадает, если бы не фильтр)
+            count1 = p.run_digest(force=True)
+            # Item НЕ должен попасть в digest (published старше границы)
+            # → deferred не отправлен, но fetched_at в пределах окна:
+            # SQL-фильтр since_iso пропускает (fetched_at=2026-10-21 >= 2026-10-20),
+            # Python-фильтр published отсеивает → count1=0
+            self.assertEqual(count1, 0,
+                "Item с late published должен быть отфильтрован")
+
+            # Item остался в deferred
+            deferred_urls = {i.url for i in p.storage.get_all_by_state("deferred")}
+            self.assertIn("https://ex.com/oldpub", deferred_urls)
+
+            p.storage.close()
+            p.close()
+
+    def test_unparseable_published_passes_filter(self):
+        """
+        Item с published='не дата' (заглушка '—') попадает в digest (fail-open).
+        Не теряем новости с непарсящимся published.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2026-10-01T00:00:00+00:00")
+            s.close()
+
+            _insert_deferred_item(
+                db_path,
+                title="BadDateItem",
+                url="https://ex.com/baddate",
+                published="—",  # не парсится
+                fetched_at="2026-10-21T12:00:00+00:00",
+                score=7,
+            )
+
+            p = _mk_pipeline(db_path)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+            # fail-open: непарсящийся published сохраняем → item уходит в digest
+            self.assertEqual(count, 1,
+                "Item с непарсящимся published должен попасть в digest (fail-open)")
+
+            p.storage.close()
+            p.close()
+
 
 class TestDigestWindowSuccess(unittest.TestCase):
     """Успешный run_digest: ВСЁ окно удалено, пришедшие во время — сохранены."""
@@ -364,7 +536,7 @@ class TestDigestSecondRun(unittest.TestCase):
             # Без патча D1 и D2 могут получить одинаковое now_utc (одна секунда),
             # тогда new_item (fetched_at = old_boundary + 2s) не удалится при D2.
             import datetime as _dt
-            from datetime import timezone
+            from datetime import timedelta, timezone
             from unittest.mock import patch
 
             old_dt = _dt.datetime.fromisoformat(old_boundary.replace("Z", "+00:00"))
@@ -386,8 +558,6 @@ class TestDigestSecondRun(unittest.TestCase):
             # но старше D2 digest_started_iso → попадёт в D2 и будет удалён.
             # D2 digest_started_iso = D2_now (2026-01-03), new_item = 2026-01-02 (< D2).
             new_item_fetched = (old_dt + _dt.timedelta(days=1)).isoformat()
-            # published обновлён до D2-границы: теперь item проходит оба фильтра
-            # (fetched_at >= window_start И published >= window_start).
             _insert_deferred_item(
                 db_path, title="NewItem", url="https://ex.com/new",
                 published="2026-01-03 12:00", fetched_at=new_item_fetched,
@@ -695,6 +865,606 @@ class TestDigestWindowUnprocessedAndCleanup(unittest.TestCase):
 
             p.storage.close()
             p.close()
+
+
+class TestCategoryGuaranteeWithPool(unittest.TestCase):
+    """Задача B: _category_guarantee тянет items из-за пределов top-N."""
+
+    def test_guarantee_pulls_cinema_from_beyond_top_n(self):
+        """
+        max_items=3. В БД 6 deferred-items (limit=max_items*2=6):
+          top-3 по score: items с score 9/8/7 — БЕЗ категории 'cinema'
+          items 4-6: scores 6/5/4, последний — category='cinema', score=5
+        category_min: cinema=1.
+
+        После guarantee в итоговом дайджесте (после сорта и финального slice):
+          - cinema-item (score 5) ДОЛЖЕН быть (гарантия выполнена)
+          - вытеснён должен быть самый низкий НЕ-категорийный (score 7),
+            а не cinema-item (которого в top-3 и не было).
+        Проверяем по URL.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            # 3 top-items без категории cinema
+            for score, idx in [(9, 0), (8, 1), (7, 2)]:
+                _insert_deferred_item(
+                    db_path,
+                    title=f"Top{idx}",
+                    url=f"https://ex.com/top{idx}",
+                    published="2026-01-01 12:00",
+                    fetched_at="2026-01-01T12:00:00+00:00",
+                    score=score,
+                )
+
+            # 3 pool-items: cinema (score 5) за пределами top-3 + ещё 2 обычных
+            # tags=['film','movie'] → _infer_category вернёт 'cinema'
+            _insert_deferred_item(
+                db_path,
+                title="CinemaItem",
+                url="https://ex.com/cinema",
+                published="2026-01-01 12:00",
+                fetched_at="2026-01-01T12:00:00+00:00",
+                score=5,
+                tags='["film","movie"]',
+            )
+            _insert_deferred_item(
+                db_path,
+                title="Pool2",
+                url="https://ex.com/pool2",
+                published="2026-01-01 12:00",
+                fetched_at="2026-01-01T12:00:00+00:00",
+                score=6,
+            )
+            _insert_deferred_item(
+                db_path,
+                title="Pool3",
+                url="https://ex.com/pool3",
+                published="2026-01-01 12:00",
+                fetched_at="2026-01-01T12:00:00+00:00",
+                score=4,
+            )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True,
+                    "max_items": 3,
+                    "max_items_per_message": 20,
+                    "category_min": {"cinema": 1},
+                    "cluster_duplicates": True,
+                },
+            )
+            # llm_filter=None → _cluster_deferred_duplicates возвращает {}.
+            # dedup не убирает top-items, бэкфилл не нужен.
+            # Но cinema нет в top-3 → гарантия тянет из пула, вытесняя Top2.
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Пул: [CinemaPool(5), Pool2(6), Pool3(4)], Top0..Top2 в top.
+            # 1) cinema<min → гарантия добавляет CinemaPool(5), evict Top2(7).
+            # 2) Pool2(6) evictable (other не в min_guarantee, cat_counts[other]=2>0)
+            #    → evict Pool2(6), добавить Pool3(4).
+            # После гарантии: [Top0(9), Top1(8), CinemaPool(5), Pool3(4)].
+            # Swap 1:1 → размер не меняется (4 items). Cap не затрагивает (France=other).
+            # Сорт: Top0, Top1, CinemaPool. Финальный slice[:3]: 3 items.
+            self.assertEqual(count, 3,
+                msg="category_guarantee может превышать max_items на 1 (до финального slice)")
+            text = delivery.send_text.call_args[0][0]
+            # cinema-item в дайджесте
+            self.assertIn("CinemaItem", text)
+            self.assertIn("https://ex.com/cinema", text)
+            # Top2 (вытесненный минимальный non-category, score=7) НЕ в дайджесте
+            self.assertNotIn("Top2", text)
+            # Top0, Top1 (не вытеснены — их score выше)
+            self.assertIn("Top0", text)
+            self.assertIn("Top1", text)
+
+            p.storage.close()
+            p.close()
+
+    def test_backfill_restores_full_max_items_after_llm_dedup(self):
+        """
+        Задача A: LLM-дедуп убирает 1 item из топ-3 → без бэкфилла
+        дайджест неполный (N-1). С бэкфиллом — полный max_items.
+
+        Подменяем _cluster_deferred_duplicates через подмену llm_filter,
+        чтобы гарантированно получить нужное поведение без зависимости
+        от patch.object на instance-метод. Также используем lowercase-URLs
+        чтобы mock return_value совпадал с реальными URL.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            # 5 items: top-3 по score=a,b,c; pool=d,e
+            # lowercase URL = https://ex.com/{title.lower()} для совпадения с mock
+            for score, title in [(9, "a"), (8, "b"), (7, "c"), (6, "d"), (5, "e")]:
+                _insert_deferred_item(
+                    db_path,
+                    title=title.upper(),  # "A", "B", "C", "D", "E" (заголовок)
+                    url=f"https://ex.com/{title}",  # lowercase URL
+                    published="2026-01-01 12:00",
+                    fetched_at="2026-01-01T12:00:00+00:00",
+                    score=score,
+                )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 3, "max_items_per_message": 20,
+                },
+            )
+
+            # Подменяем llm_filter: detect_duplicates возвращает {1} (индекс B).
+            # _cluster_deferred_duplicates увидит set({1}) и вернёт {"https://ex.com/b"}.
+            real_filter = getattr(p, "llm_filter", None) or MagicMock()
+            real_filter.detect_duplicates = MagicMock(return_value={1})
+            p.llm_filter = real_filter
+
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Проверяем отправленный текст
+            self.assertEqual(count, 3,
+                f"Бэкфилл должен восстановить полный max_items. Получили {count}")
+            self.assertEqual(len(delivery.send_text.call_args_list), 1)
+            send_text_args = delivery.send_text.call_args[0][0]
+            # D (backfilled) должен быть в дайджесте
+            self.assertIn("D", send_text_args,
+                "Backfilled item D должен попасть в дайджест")
+            # B (дубль) не должно быть
+            self.assertNotIn("B", send_text_args,
+                "Dубликат B не должен попасть в дайджест")
+            # A и C — лидеры, остаются
+            self.assertIn("A", send_text_args)
+            self.assertIn("C", send_text_args)
+
+            p.storage.close()
+            p.close()
+
+
+class TestDigestWindowIntegrity(unittest.TestCase):
+    """Проверяем, что существующие тесты оконной логики не сломаны."""
+
+    def test_published_filter_still_works_after_truncation_outside_if(self):
+        """
+        NIT 1: обрезка вынесена из if raw_boundary.
+        Это не должно сломать published-фильтр.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2026-10-20T00:00:00+00:00")
+            s.close()
+
+            # Item с late published
+            _insert_deferred_item(
+                db_path,
+                title="LatePublished",
+                url="https://ex.com/late",
+                published="19.10.2026 20:00 UTC",
+                fetched_at="2026-10-21T12:00:00+00:00",
+                score=10,
+            )
+            # Item с valid published
+            _insert_deferred_item(
+                db_path,
+                title="ValidPublished",
+                url="https://ex.com/valid",
+                published="2026-10-21 12:00 UTC",
+                fetched_at="2026-10-21T12:00:00+00:00",
+                score=5,
+            )
+
+            p = _mk_pipeline(db_path)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Late item отфильтрован, valid — попал
+            self.assertEqual(count, 1)
+            self.assertIn("ValidPublished", delivery.send_text.call_args[0][0])
+            self.assertNotIn("LatePublished", delivery.send_text.call_args[0][0])
+
+            p.storage.close()
+            p.close()
+
+    def test_truncation_guard_no_blow_up_on_invalid_max_items(self):
+        """
+        NIT 2: limit=max_items*2 при max_items<=0 раньше давал безлимитный SELECT.
+        Проверяем, что при max_items=0 или None код не падает.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            for i in range(5):
+                _insert_deferred_item(
+                    db_path,
+                    title=f"Item{i}",
+                    url=f"https://ex.com/item{i}",
+                    published="2026-01-01 12:00",
+                    fetched_at="2026-01-01T12:00:00+00:00",
+                    score=7 - i,
+                )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True,
+                    "max_items": 0,  # zero — guard должен отработать
+                    "max_items_per_message": 20,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            # Не должно упасть (раньше был безлимитный SELECT, теперь None)
+            try:
+                count = p.run_digest(force=True)
+                # max_items=0 нормализуется в max(1,0)=1 на входе,
+                # поэтому в дайджесте будет ≥1 item. Главное — не падает.
+            except Exception as e:
+                self.fail(f"run_digest упал при max_items=0: {e}")
+
+            p.storage.close()
+            p.close()
+
+
+
+
+class TestCategoryGuaranteeEvictable(unittest.TestCase):
+    """MAJOR 1: evictable victim logic — only non-category or surplus items."""
+
+    def test_guarantee_never_evicts_needed_category(self):
+        """
+        Scenario from spec:
+          items=[games(2), other(9), other(8)], pool=[cinema(5)]
+          min: cinema=2, games=1
+
+        After cinema processing: evictable = {other(9), other(8)}
+        (games is needed for its own category_min guarantee, cat_counts[games]=1==min).
+        Victim = other(8) (lowest score among evictable).
+        After swap: cat_counts updated incrementally.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            # items: games(2), other(9), other(8) — inside window
+            # Source 'ign' = games category (use direct SQL to set source)
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO items
+                (source, url, title, summary, published, fetched_at,
+                 state, state_at, llm_score)
+                VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?)
+                """,
+                ("ign", "https://ex.com/games1", "GamesItem", "Test summary",
+                 "2026-01-01 12:00", "2026-01-01T12:00:00+00:00",
+                 "2026-01-01T12:00:00+00:00", 2),
+            )
+            conn.commit()
+            conn.close()
+            _insert_deferred_item(
+                db_path, title="OtherHigh", url="https://ex.com/other9",
+                published="2026-01-01 12:00", fetched_at="2026-01-01T12:00:00+00:00",
+                score=9,
+            )
+            _insert_deferred_item(
+                db_path, title="OtherLow", url="https://ex.com/other8",
+                published="2026-01-01 12:00", fetched_at="2026-01-01T12:00:00+00:00",
+                score=8,
+            )
+            # pool: cinema(5)
+            _insert_deferred_item(
+                db_path, title="CinemaPool", url="https://ex.com/cinema1",
+                published="2026-01-01 12:00", fetched_at="2026-01-01T12:00:00+00:00",
+                score=5,
+                tags='["film","movie"]',
+            )
+            # Another cinema in pool
+            _insert_deferred_item(
+                db_path, title="CinemaPool2", url="https://ex.com/cinema2",
+                published="2026-01-01 12:00", fetched_at="2026-01-01T12:00:00+00:00",
+                score=4,
+                tags='["film","movie"]',
+            )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 4, "max_items_per_message": 20,
+                    "category_min": {"cinema": 2, "games": 1},
+                    "cluster_duplicates": True,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # With max_items=4, result starts at 4 (3 initial + 1 from backfill if needed).
+            # After adding 2 cinema items from pool: result=5 > max_items,
+            # so one evictable item is evicted (lowest-score other: OtherLow).
+            # Final: games(1) + other(9) + cinema(5) + cinema(4) = 4 items.
+            # Games is NEVER evicted (games is in category_min, count=1 == min).
+            self.assertEqual(count, 4)
+            text = delivery.send_text.call_args[0][0]
+            # games item must NOT be evicted (it is needed for its own guarantee)
+            self.assertIn("GamesItem", text)
+            # cinema items MUST be present (guarantee fulfilled)
+            self.assertIn("CinemaPool", text)
+            self.assertIn("CinemaPool2", text)
+            # OtherLow (lowest score among evictable) should be evicted
+            self.assertNotIn("OtherLow", text)
+
+            p.storage.close()
+            p.close()
+
+    def test_guarantee_pool_none_legacy_mode(self):
+        """
+        pool=None: legacy mode — _category_guarantee returns items unchanged.
+        Tests backward compatibility (old tests use pool=None).
+        """
+        from newsbot.pipeline import _category_guarantee, _infer_category
+
+        class FakeItem:
+            def __init__(self, score, source):
+                self.llm_score = score
+                self.source = source
+
+        items = [
+            FakeItem(9, 'deadline'),  # cinema
+            FakeItem(2, 'deadline'),  # cinema
+        ]
+        result = _category_guarantee(items, {'cinema': 2}, pool=None)
+        cats = [_infer_category(i) for i in result]
+        self.assertEqual(cats.count('cinema'), 2)
+        self.assertEqual(len(result), 2)  # unchanged
+
+
+class TestLocationCap(unittest.TestCase):
+    """MAJOR 2: _cap_by_location — no more than max_per_location per (location, day)."""
+
+    def test_cap_by_location_allows_up_to_max(self):
+        """
+        4 items with same location+day, max_per_location=2.
+        First 2 survive (by iteration order), rest 2 are filtered.
+        """
+        from newsbot.pipeline import _cap_by_location
+
+        class FakeItem:
+            def __init__(self, title, pub, cluster_key=None):
+                self.title = title
+                self.published = pub
+                self.cluster_key = cluster_key
+
+        items = [
+            FakeItem("France News 1", "2026-10-20", "франция|abc|2026-10-20"),
+            FakeItem("France News 2", "2026-10-20", "франция|def|2026-10-20"),
+            FakeItem("France News 3", "2026-10-20", "франция|ghi|2026-10-20"),
+            FakeItem("France News 4", "2026-10-20", "франция|jkl|2026-10-20"),
+        ]
+        result = _cap_by_location(items, max_per_location=2)
+        self.assertEqual(len(result), 2)
+
+    def test_cap_by_location_different_days_pass(self):
+        """Same location, different days — both pass cap."""
+        from newsbot.pipeline import _cap_by_location
+
+        class FakeItem:
+            def __init__(self, title, pub, cluster_key=None):
+                self.title = title
+                self.published = pub
+                self.cluster_key = cluster_key
+
+        items = [
+            FakeItem("France News day1", "2026-10-20", "франция|abc|2026-10-20"),
+            FakeItem("France News day1", "2026-10-20", "франция|def|2026-10-20"),
+            FakeItem("France News day2", "2026-10-21", "франция|ghi|2026-10-21"),
+            FakeItem("France News day2", "2026-10-21", "франция|jkl|2026-10-21"),
+        ]
+        result = _cap_by_location(items, max_per_location=2)
+        self.assertEqual(len(result), 4)  # 2 per day, all pass
+
+    def test_cap_by_location_other_bucket_not_capped(self):
+        """Items with bucket 'other' are never capped."""
+        from newsbot.pipeline import _cap_by_location
+
+        class FakeItem:
+            def __init__(self, title, cluster_key=None):
+                self.title = title
+                self.cluster_key = cluster_key
+
+        items = [
+            FakeItem("Other News 1", "other|abc|2026-10-20"),
+            FakeItem("Other News 2", "other|def|2026-10-20"),
+            FakeItem("Other News 3", "other|ghi|2026-10-20"),
+            FakeItem("Other News 4", "other|jkl|2026-10-20"),
+            FakeItem("No cluster key item", None),
+        ]
+        result = _cap_by_location(items, max_per_location=2)
+        self.assertEqual(len(result), 5)  # all 5 pass (bucket=other, no cap)
+
+    def test_cap_by_location_zero_max_passes_all(self):
+        """max_per_location=0 means no cap — all items pass."""
+        from newsbot.pipeline import _cap_by_location
+
+        class FakeItem:
+            def __init__(self, cluster_key):
+                self.title = "Item"
+                self.cluster_key = cluster_key
+
+        items = [FakeItem("франция|abc|2026-10-20") for _ in range(10)]
+        result = _cap_by_location(items, max_per_location=0)
+        self.assertEqual(len(result), 10)
+
+    def test_location_cap_in_run_digest(self):
+        """
+        run_digest with max_per_location=2:
+        4 items of same location pass cap → only 2 in digest.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            # 4 items with same location+day — set cluster_key directly
+            # cluster_key = location|stem|day
+            for i in range(4):
+                # Insert directly via SQL to set cluster_key (not set by _insert_deferred_item)
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO items
+                    (source, url, title, summary, published, fetched_at,
+                     state, state_at, llm_score, tags, cluster_key)
+                    VALUES (?, ?, ?, ?, ?, ?, 'deferred', ?, ?, ?, ?)
+                    """,
+                    (
+                        "TestSrc",
+                        "https://ex.com/fr{}".format(i),
+                        "FranceItem{}".format(i),
+                        "Test summary",
+                        "2026-01-01 12:00",
+                        "2026-01-01T12:00:0{}+00:00".format(i),
+                        "2026-01-01T12:00:0{}+00:00".format(i),
+                        10 - i,
+                        None,
+                        "франция|stem{}|2026-01-01".format(i),
+                    ),
+                )
+                conn.commit()
+                conn.close()
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 10, "max_items_per_message": 20,
+                    "max_per_location": 2, "cluster_duplicates": True,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # max_per_location=2: ровно 2 items на (location, day) — верхних по score
+            self.assertEqual(
+                count, 2,
+                msg="Location cap should produce exactly 2 items (top 2 by score)",
+            )
+            # Verify: отправленные items — два верхних по score этой локации
+            call_args = delivery.send_text.call_args
+            if call_args:
+                text = call_args[0][0] if call_args[0] else ""
+                # top-2: FranceItem0 (score=10) и FranceItem1 (score=9) должны быть
+                self.assertIn("FranceItem0", text)
+                self.assertIn("FranceItem1", text)
+                # вырезанные: FranceItem2 (8) и FranceItem3 (7) — не должны быть
+                self.assertNotIn("FranceItem2", text)
+                self.assertNotIn("FranceItem3", text)
+
+            p.storage.close()
+            p.close()
+
+
+class TestMaxItemsNormalization(unittest.TestCase):
+    """MINOR: max_items <=0 normalized to 1 once at start of run_digest."""
+
+    def test_max_items_zero_normalizes_to_one(self):
+        """max_items=0 in config → normalized to 1, not zero."""
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            for i in range(5):
+                _insert_deferred_item(
+                    db_path,
+                    title="Item{}".format(i),
+                    url="https://ex.com/item{}".format(i),
+                    published="2026-01-01 12:00",
+                    fetched_at="2026-01-01T12:00:00+00:00",
+                    score=7 - i,
+                )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 0,
+                    "max_items_per_message": 20,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            try:
+                count = p.run_digest(force=True)
+                # With normalization: max(1, 0) = 1, so 1 item in digest
+                self.assertEqual(count, 1)
+            except Exception as e:
+                self.fail("run_digest crashed with max_items=0: {}".format(e))
+
+            p.storage.close()
+            p.close()
+
+    def test_max_items_negative_normalizes_to_one(self):
+        """max_items=-5 in config → normalized to 1."""
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            for i in range(3):
+                _insert_deferred_item(
+                    db_path,
+                    title="Item{}".format(i),
+                    url="https://ex.com/neg{}".format(i),
+                    published="2026-01-01 12:00",
+                    fetched_at="2026-01-01T12:00:00+00:00",
+                    score=7,
+                )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": -5,
+                    "max_items_per_message": 20,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            try:
+                count = p.run_digest(force=True)
+                self.assertEqual(count, 1)
+            except Exception as e:
+                self.fail("run_digest crashed with max_items=-5: {}".format(e))
+
+            p.storage.close()
+            p.close()
+
 
 
 if __name__ == "__main__":

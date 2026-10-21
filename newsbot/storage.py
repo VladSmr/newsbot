@@ -1228,10 +1228,11 @@ class Storage:
                            now - max_age_hours. None означает «без ограничения».
                            Приоритет: max_age_hours вычисляется из since_iso,
                            если оба не заданы — ограничения по возрасту нет.
-            published_since: если задано — выборка ограничена published >= published_since.
-                              Позволяет исключить late-posted новости с old published
-                              из дайджеста. Для записей без published условие
-                              возвращает False (NULL не попадает в результат).
+            published_since: DEPRECATED. Фильтрация по published выполняется на
+                              стороне pipeline (Python), т.к. формат published в БД
+                              неоднородный (ISO / 'DD.MM.YYYY HH:MM') и SQLite
+                              julianday() по нему ненадёжен. Параметр оставлен для
+                              обратной совместимости и игнорируется.
         """
         conn = self._connect()
         params: list = []
@@ -1249,9 +1250,8 @@ class Storage:
         if effective_since is not None:
             sql += " AND julianday(fetched_at) >= julianday(?)"
             params.append(effective_since)
-        if published_since is not None:
-            sql += " AND julianday(published) >= julianday(?)"
-            params.append(published_since)
+        # DEPRECATED: published_since фильтрация вынесена в pipeline (Python),
+        # т.к. julianday() по published ненадёжен (неоднородный формат в БД).
         sql += " ORDER BY llm_score DESC, fetched_at ASC"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
