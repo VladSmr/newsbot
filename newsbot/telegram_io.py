@@ -249,7 +249,19 @@ class TelegramPoller:
         self._thread = t
         self._log.info("TelegramPoller started (daemon thread)")
 
-    def stop(self) -> None:
+    def stop(self, max_join: Optional[float] = None) -> None:
+        """
+        Останавливает poller.
+
+        Параметры
+        ---------
+        max_join : float, optional
+            Верхняя граница join (сек), обычно остаток единого shutdown-бюджета
+            из __main__. Итоговый таймаут = min(poll_timeout + 5, max_join) —
+            так повторный join не выходит за жёсткий дедлайн (P1-фикс:
+            раньше join(poll_timeout+5) выполнялся ДО расчёта remaining и
+            бюджет 40 с не был жёстким).
+        """
         self._log.info("Stopping TelegramPoller...")
         self._stop_event.set()
         if self._thread is not None:
@@ -260,6 +272,8 @@ class TelegramPoller:
             # работает и _thread ещё жив, но stop() уже отпустил GIL.
             # Вместо этого ждём реального завершения потока.
             join_timeout = self._poll_timeout + 5
+            if max_join is not None:
+                join_timeout = max(0.0, min(join_timeout, float(max_join)))
             self._thread.join(timeout=join_timeout)
             # Только если поток ДЕЙСТВИТЕЛЬНО завершился — обнуляем.
             # Иначе оставляем reference alive (не создаём второй поллер).

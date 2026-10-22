@@ -1151,7 +1151,9 @@ def test_concurrent_initialization_two_storages(tmp_path):
 
 def test_purge_items_keeps_old_pending(tmp_path):
     """
-    Тест (в): purge_items не удаляет старый pending (активный retry).
+    Тест (в): purge_items не УДАЛЯЕТ pending — застрявший pending
+    (state_at старше PENDING_STALE_DAYS) терминализируется в 'failed',
+    но строка остаётся в БД и удалится обычным retention-окном для failed.
     """
     db_path = tmp_path / "purge_pending.db"
     s = Storage(db_path)
@@ -1163,7 +1165,344 @@ def test_purge_items_keeps_old_pending(tmp_path):
     deleted = s.purge_items(retention_days=1, deferred_retention_days=1)
 
     assert deleted == 1, f"должен быть удалён только delivered, deleted={deleted}"
-    assert _fetch_item_row(db_path, "https://pend.example/1") is not None, \
+    pend_row = _fetch_item_row(db_path, "https://pend.example/1")
+    assert pend_row is not None, \
         "старый pending НЕ должен удаляться purge_items"
+    assert pend_row["state"] == "failed", \
+        "застрявший pending должен терминализироваться в 'failed', " \
+        f"а не остаться {pend_row['state']}"
     assert _fetch_item_row(db_path, "https://deliv.example/1") is None
+    s.close()
+
+
+def test_purge_items_keeps_fresh_pending_as_pending(tmp_path):
+    """Свежий pending (в работе) терминализации не подлежит."""
+    db_path = tmp_path / "purge_pending_fresh.db"
+    s = Storage(db_path)
+
+    fresh_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    _insert_hardening_item(db_path, "pending", "https://pend2.example/1", "Pending", fresh_ts)
+
+    assert s.purge_items(retention_days=1, deferred_retention_days=1) == 0
+    row = _fetch_item_row(db_path, "https://pend2.example/1")
+    assert row is not None and row["state"] == "pending", \
+        "свежий pending должен остаться pending"
+    s.close()
+
+
+def test_purge_items_negative_retention_does_not_wipe(tmp_path):
+    """
+    Major: retention_days=-1 (опечатка) НЕ должен сносить все терминальные
+    items. Отрицательное значение → default (90), а не 0/cutoff=now.
+    """
+    db_path = tmp_path / "purge_negative.db"
+    s = Storage(db_path)
+
+    # 5 дней: по default 90 — не удаляются; при старом max(days,0)=0 — удалились бы.
+    ts = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+    for i, state in enumerate(("delivered", "skipped", "failed", "digested")):
+        _insert_hardening_item(
+            db_path, state, f"https://neg.example/{i}", f"{state}-item", ts,
+        )
+    # deferred 1 день: default deferred_retention=3 → сохраняется.
+    recent_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    _insert_hardening_item(
+        db_path, "deferred", "https://neg.example/def", "def", recent_ts,
+    )
+
+    deleted = s.purge_items(retention_days=-1, deferred_retention_days=-1)
+
+    assert deleted == 0, f"retention_days=-1 не должен ничего удалять, deleted={deleted}"
+    for i, state in enumerate(("delivered", "skipped", "failed", "digested")):
+        row = _fetch_item_row(db_path, f"https://neg.example/{i}")
+        assert row is not None and row["state"] == state, \
+            f"{state} не должен удаляться при retention_days=-1"
+    assert _fetch_item_row(db_path, "https://neg.example/def") is not None
+    s.close()
+
+
+# ---------------------------------------------------------------------------
+# v1.3.0: retention-параметры из config.yaml (строки) + cap title
+# ---------------------------------------------------------------------------
+
+def test_purge_items_accepts_string_retention(tmp_path):
+    """retention_days: "1" (строка из config.yaml) не должен валить purge."""
+    db_path = tmp_path / "purge_string_retention.db"
+    s = Storage(db_path)
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+    _insert_hardening_item(db_path, "delivered", "https://str.example/1", "Old", old_ts)
+
+    deleted = s.purge_items(retention_days="1", deferred_retention_days="1")
+
+    assert deleted == 1, f"строка retention_days должна работать, deleted={deleted}"
+    assert _fetch_item_row(db_path, "https://str.example/1") is None
+    s.close()
+
+
+def test_purge_items_invalid_retention_does_not_raise(tmp_path):
+    """Невалидный retention_days → fallback, purge не падает."""
+    s = Storage(tmp_path / "purge_bad_retention.db")
+    assert s.purge_items(retention_days="abc", deferred_retention_days=None) == 0
+    s.close()
+
+
+def test_prune_feedback_targets_invalid_days_skips(tmp_path):
+    """Невалидный older_than_days → 0 (данные не сносим), без исключения."""
+    s = Storage(tmp_path / "prune_bad.db")
+    assert s.prune_feedback_targets("abc") == 0
+    s.close()
+
+
+def test_prune_feedback_targets_valid_days_keeps_fresh_targets(tmp_path):
+    """
+    prune на НЕпустой БД: валидный "30" (строка из config.yaml) не сносит
+    свежие targets. Раньше тест шёл на пустой БД и был тривиальным.
+    """
+    s = Storage(tmp_path / "prune_fresh.db")
+    tid = s.add_feedback_target(
+        url="https://fresh-prune.example/1", source="TestSrc", title="Fresh",
+        summary="s", llm_score=6, kind="push",
+    )
+    assert s.prune_feedback_targets("30") == 0
+    assert s.get_feedback_target(tid) is not None, "свежий target не должен удаляться"
+    s.close()
+
+
+def test_prune_feedback_targets_negative_days_does_not_wipe(tmp_path):
+    """
+    Major: older_than_days=-1 (опечатка в конфиге) не должен сносить ВСЕ
+    targets — кнопки под старыми сообщениями умерли бы. days<=0 → пропуск.
+    """
+    s = Storage(tmp_path / "prune_negative.db")
+    tid = s.add_feedback_target(
+        url="https://old-prune.example/1", source="TestSrc", title="Old",
+        summary="s", llm_score=6, kind="push",
+    )
+    old_date = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+    conn = s._connect()
+    conn.execute(
+        "UPDATE feedback_targets SET created_at = ? WHERE id = ?", (old_date, tid),
+    )
+    conn.commit()
+
+    assert s.prune_feedback_targets(-1) == 0, "отрицательный retention не должен удалять"
+    assert s.prune_feedback_targets(0) == 0, "0 трактуется как «не чистить»"
+    assert s.get_feedback_target(tid) is not None, "target не должен быть снесён"
+    s.close()
+
+
+def test_save_caps_huge_title(tmp_path):
+    """Враждебный RSS: title в 100К символов капится в БД."""
+    from newsbot.storage import MAX_TITLE_CHARS
+
+    db_path = tmp_path / "title_cap.db"
+    s = Storage(db_path)
+    item = NewsItem(
+        source="TestSrc",
+        url="https://cap.example/1",
+        title="X" * 100_000,
+        summary="s",
+        published="01.01.2026",
+    )
+    assert s.save(item) is True
+
+    row = _fetch_item_row(db_path, "https://cap.example/1")
+    assert row is not None
+    assert len(row["title"]) == MAX_TITLE_CHARS
+    s.close()
+
+
+def test_save_many_caps_huge_title(tmp_path):
+    """save_many тоже капит title (batch-путь записи)."""
+    from newsbot.storage import MAX_TITLE_CHARS
+
+    db_path = tmp_path / "title_cap_many.db"
+    s = Storage(db_path)
+    item = NewsItem(
+        source="TestSrc",
+        url="https://cap.example/2",
+        title="Y" * 50_000,
+        summary="s",
+        published="01.01.2026",
+    )
+    s.save_many([item])
+
+    row = _fetch_item_row(db_path, "https://cap.example/2")
+    assert row is not None
+    assert len(row["title"]) == MAX_TITLE_CHARS
+    s.close()
+
+
+class _FlakyCommitConn:
+    """
+    Прокси вокруг sqlite3.Connection: первый commit() падает (имитация
+    disk I/O error / сбоя fsync), остальные делегируются реальному соединению.
+    Нужен, чтобы проверить rollback-семантику _tx().
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.fail_next_commit = True
+
+    def execute(self, *args, **kwargs):
+        return self._real.execute(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def commit(self):
+        if self.fail_next_commit:
+            self.fail_next_commit = False
+            raise sqlite3.OperationalError("disk I/O error (simulated)")
+        self._real.commit()
+
+
+def test_set_meta_uses_transaction(tmp_path):
+    """
+    set_meta в _tx: падение commit'а откатывается (ROLLBACK), значение НЕ
+    записано, и следующая транзакция открывается нормально (иначе было бы
+    «cannot start a transaction within a transaction»).
+    """
+    s = Storage(tmp_path / "meta_tx.db")
+    s.set_meta("k", "v")
+    assert s.get_meta("k") == "v"
+
+    proxy = _FlakyCommitConn(s._connect())
+    with mock.patch.object(s, "_connect", return_value=proxy):
+        with pytest.raises(sqlite3.OperationalError):
+            s.set_meta("k", "broken")
+        # после сбойного commit соединение НЕ осталось в транзакции:
+        # следующая запись проходит (в старом коде упала бы на BEGIN)
+        s.set_meta("k", "v2")
+
+    assert s.get_meta("k") == "v2", "успешная запись после сбоя должна примениться"
+    s.close()
+
+
+# ---------------------------------------------------------------------------
+# Minor (волна 4): батчевая терминализация pending + отравленное соединение
+# ---------------------------------------------------------------------------
+
+def test_purge_items_terminalizes_large_pending_backlog_in_batches(
+    tmp_path, monkeypatch, caplog,
+):
+    """
+    Minor (волна 4): 12k застрявших pending терминализируются ПОРЦИЯМИ
+    (короткие транзакции), а не одним UPDATE под общим WAL-lock'ом.
+    Батч уменьшен, чтобы проверить саму итеративность цикла.
+    """
+    monkeypatch.setattr(Storage, "PURGE_PENDING_BATCH_SIZE", 1000)
+
+    db_path = tmp_path / "purge_pending_batches.db"
+    s = Storage(db_path)
+
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+    total = 12_000
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO items
+        (source, url, title, summary, published, fetched_at, state, state_at, llm_score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                "TestSrc", f"https://batch.example/{i}", f"Batch {i}", "s",
+                "2025-01-01", old_ts, "pending", old_ts, 0,
+            )
+            for i in range(total)
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    traced = []
+    s._connect().set_trace_callback(traced.append)
+
+    with caplog.at_level(logging.WARNING, logger="newsbot.storage"):
+        deleted = s.purge_items(retention_days=1, deferred_retention_days=1)
+
+    s._connect().set_trace_callback(None)
+
+    assert deleted == 0, f"pending не удаляются, deleted={deleted}"
+
+    conn = sqlite3.connect(str(db_path))
+    pending_left = conn.execute(
+        "SELECT COUNT(*) FROM items WHERE state = 'pending'"
+    ).fetchone()[0]
+    failed = conn.execute(
+        "SELECT COUNT(*) FROM items WHERE state = 'failed'"
+    ).fetchone()[0]
+    conn.close()
+
+    assert pending_left == 0, f"осталось pending: {pending_left}"
+    assert failed == total, f"в failed должно быть {total}, got {failed}"
+
+    # Батчинг реально работал: 12 порций по 1000 + завершающая пустая +
+    # отдельная транзакция DELETE-фазы.
+    begins = [stmt for stmt in traced if stmt.strip().upper() == "BEGIN"]
+    assert len(begins) >= 12, (
+        f"ожидалось ≥12 коротких транзакций (батчи), получено {len(begins)}"
+    )
+
+    # Warning агрегированный: один, с общим числом.
+    warn_msgs = [
+        r.message for r in caplog.records
+        if r.levelno >= logging.WARNING and "pending" in r.message
+    ]
+    assert len(warn_msgs) == 1, f"ожидался один агрегированный warning: {warn_msgs}"
+    assert str(total) in warn_msgs[0], (
+        f"warning должен содержать общее число {total}: {warn_msgs[0]}"
+    )
+
+    s.close()
+
+
+class _PoisonedConn:
+    """
+    Соединение, у которого падают и commit(), и ROLLBACK, и close():
+    имитация мёртвого fd / disk I/O error. Все прочие вызовы — no-op.
+    """
+
+    row_factory = sqlite3.Row
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.strip().upper().startswith("ROLLBACK"):
+            raise sqlite3.OperationalError("disk I/O error (rollback)")
+        return None
+
+    def commit(self):
+        raise sqlite3.OperationalError("disk I/O error (commit)")
+
+    def rollback(self):
+        raise sqlite3.OperationalError("disk I/O error (rollback)")
+
+    def close(self):
+        raise sqlite3.OperationalError("disk I/O error (close)")
+
+
+def test_tx_resets_connection_when_rollback_fails(tmp_path):
+    """
+    Minor (волна 4): если в _tx падает и commit, и ROLLBACK — соединение
+    отравлено, self._conn сбрасывается, и следующая запись идёт через
+    заново созданное соединение (до фикса BEGIN падал до рестарта).
+    """
+    db_path = tmp_path / "poisoned_conn.db"
+    s = Storage(db_path)
+    real = s._conn
+
+    s._conn = _PoisonedConn()
+    with pytest.raises(sqlite3.OperationalError):
+        s.set_meta("k", "broken")
+
+    assert s._conn is None, (
+        "после провала ROLLBACK соединение должно быть сброшено (self._conn = None)"
+    )
+
+    real.close()
+
+    # Ленивое пересоздание в _connect() работает — запись проходит.
+    s.set_meta("k", "v")
+    assert s.get_meta("k") == "v", "запись после пересоздания соединения должна пройти"
+    assert s._conn is not None
     s.close()

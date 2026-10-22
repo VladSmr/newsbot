@@ -73,7 +73,17 @@ def _strip_source_prefix(title: str) -> str:
         result = pattern.sub(replacement, result)
     return result
 
-FETCH_TIMEOUT = 15  # секунд
+FETCH_TIMEOUT = 15  # секунд — потолок ОДНОЙ фазы (connect/read) на хоп
+MAX_REDIRECTS = 3  # P1: лимит хопов в цепочке редиректов (FEED_DEADLINE_SEC)
+# Minor (волна 4): httpx.Timeout(x) ставит x на КАЖДУЮ фазу, поэтому худший
+# случай одного хопа = connect + read (2x). Бюджет хопа делим на две фазы,
+# а connect дополнительно капим этим порогом: TCP+TLS-хендшейк дольше 5 с
+# практически всегда означает мёртвый хост, ждать read-бюджет бессмысленно.
+CONNECT_TIMEOUT_CAP = 5.0
+# Минимальная длительность ОДНОЙ фазы: таймаут < 1 с рвёт даже быстрые
+# соединения. Из-за floor'а при почти исчерпанном бюджете худший случай
+# хопа = 2 x MIN_PHASE_TIMEOUT (см. _fetch_feed — инвариант задокументирован).
+MIN_PHASE_TIMEOUT = 1.0
 MAX_FEED_BYTES = 10 * 1024 * 1024  # 10 MB — защита от gzip-бомбы / гигантского фида
 USER_AGENT = (
     "Mozilla/5.0 (compatible; NewsBot/1.0; +https://github.com/newsbot) "
@@ -166,6 +176,10 @@ class FeedCollector:
             timeout=FETCH_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
             follow_redirects=True,
+            # P1-фикс: цепочка редиректов — до N хопов ВНУТРИ stream(), каждый
+            # со своим connect/TLS; без лимита 20 хопов × таймаут держали цикл
+            # до 5–10 мин (FEED_DEADLINE_SEC не срабатывал).
+            max_redirects=MAX_REDIRECTS,
             trust_env=True,  # подхватывает HTTP_PROXY / HTTPS_PROXY из окружения (Docker)
         )
 
@@ -225,6 +239,25 @@ class FeedCollector:
         (в т.ч. пустой список если фид легитимно пуст).
         Возвращает FeedResult(ok=False, items=[]) при любой ошибке,
         в том числе при превышении FEED_DEADLINE_SEC на HTTP-фазе.
+
+        Per-hop таймауты (Minor, волна 4) — инвариант худшего случая:
+
+            hop_budget   = remaining / (MAX_REDIRECTS + 1)
+            phase_budget = min(FETCH_TIMEOUT, hop_budget / 2)
+            connect      = max(MIN_PHASE_TIMEOUT, min(CONNECT_TIMEOUT_CAP, phase_budget))
+            read         = max(MIN_PHASE_TIMEOUT, phase_budget)
+
+        httpx держит таймаут НА КАЖДУЮ фазу отдельно, поэтому худшее время
+        одного хопа ≈ connect + read (раньше Timeout(hop) давал 2x бюджет хопа).
+        При phase_budget >= MIN_PHASE_TIMEOUT connect + read <= hop_budget,
+        и вся цепочка (первый запрос + MAX_REDIRECTS хопов) укладывается
+        в remaining: (MAX_REDIRECTS + 1) x hop_budget == remaining.
+
+        Floor MIN_PHASE_TIMEOUT=1.0 с оговорён честно: при крошечном остатке
+        (< (MAX_REDIRECTS+1) x 2 с) худший случай равен
+        (MAX_REDIRECTS + 1) x 2 x MIN_PHASE_TIMEOUT — при MAX_REDIRECTS=3 это 8 с.
+        Осознанный размен: таймаут < 1 с рвёт и быстрые соединения, а такой
+        остаток — экзотика, и deadline-проверки в теле stream() обрывают фид раньше.
         """
         # ── M1: единый monotonic-deadline на ВСЮ обработку фида ──
         # Выставляется ДО self._client.stream(): read-таймаут httpx
@@ -236,13 +269,57 @@ class FeedCollector:
         deadline = feed_start + FEED_DEADLINE_SEC
 
         # ── HTTP: лимит по РАСПАКОВАННОМУ телу — защита от gzip-бомбы / гигантского фида ──
+        # Значения по умолчанию для лога таймаута (перезаписываются ниже
+        # фактическими per-phase таймаутами ещё до запроса).
+        connect_timeout = float(FETCH_TIMEOUT)
+        read_timeout = float(FETCH_TIMEOUT)
         try:
             logger.debug("[%s] GET %s", name, url)
 
             # Быстрый отказ по Content-Length (РАЗМЕР СЖАТОГО тела, не точный).
             # Не заменяет счётчик распакованных байтов — тот ниже.
             cl_str = ""
-            with self._client.stream("GET", url) as resp:
+            # P1-фикс (волна 2): httpx применяет таймаут к КАЖДОМУ хопу цепочки
+            # редиректов (connect+read на каждый URL отдельно), поэтому
+            # «remaining на запрос» давал худший случай
+            # (MAX_REDIRECTS+1) × min(FETCH_TIMEOUT, remaining) — до ~90 с
+            # при бюджете 30 с. Делим остаток на максимально возможное число
+            # хопов (первый запрос + MAX_REDIRECTS).
+            # Minor-фикс (волна 4): httpx.Timeout(x) ставит x на КАЖДУЮ фазу,
+            # т.е. худший случай хопа был connect + read = 2 × x, и цепочка
+            # давала до ~2 × remaining. Теперь hop_budget делится ПО ФАЗАМ:
+            # connect = min(CONNECT_TIMEOUT_CAP, hop_budget/2) (хендшейк дольше
+            # 5 с = мёртвый хост), read = hop_budget/2. Обе фазы не меньше
+            # MIN_PHASE_TIMEOUT (1 с), иначе рвутся быстрые соединения.
+            remaining = max(0.1, deadline - time.monotonic())
+            hop_budget = remaining / (MAX_REDIRECTS + 1)
+            # Доля бюджета на ОДНУ фазу; FETCH_TIMEOUT остаётся потолком
+            # (страховка, если FEED_DEADLINE_SEC когда-нибудь увеличат).
+            phase_budget = min(float(FETCH_TIMEOUT), hop_budget / 2.0)
+            connect_timeout = max(
+                MIN_PHASE_TIMEOUT,
+                min(CONNECT_TIMEOUT_CAP, phase_budget),
+            )
+            read_timeout = max(MIN_PHASE_TIMEOUT, phase_budget)
+            request_timeout = httpx.Timeout(
+                connect=connect_timeout,
+                read=read_timeout,
+                # write: GET без тела → фаза ~0, значение для полноты конфигурации
+                write=read_timeout,
+                # pool: ожидание свободного коннекта из пула — локальная
+                # операция, сетевого бюджета не тратит
+                pool=connect_timeout,
+            )
+            with self._client.stream("GET", url, timeout=request_timeout) as resp:
+                # Явная проверка deadline ПОСЛЕ установки соединения:
+                # редирект-цепочка могла съесть бюджет ещё до тела ответа.
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "[%s] FEED_DEADLINE_SEC=%d превышен при установке "
+                        "соединения (редиректы) — фид пропущен: %s",
+                        name, FEED_DEADLINE_SEC, url,
+                    )
+                    return FeedResult(ok=False, items=[])
                 resp.raise_for_status()
                 cl_str = resp.headers.get("content-length", "")
                 try:
@@ -283,7 +360,14 @@ class FeedCollector:
                     return FeedResult(ok=False, items=[])
                 raw = bytes(buf)
         except httpx.TimeoutException:
-            logger.warning("[%s] Таймаут (%d с)", name, FETCH_TIMEOUT)
+            # Логируем ФАКТИЧЕСКИЕ per-phase таймауты, а не константу FETCH_TIMEOUT:
+            # при почти исчерпанном бюджете они могут быть 1-4 с, и лог
+            # «Таймаут (15 с)» сбивал бы диагностику. connect и read показаны
+            # отдельно — видно, какая именно фаза сработала (TCP/TLS или чтение).
+            logger.warning(
+                "[%s] Таймаут (per-hop: connect %.1f с, read %.1f с; бюджет фида %d с)",
+                name, connect_timeout, read_timeout, FEED_DEADLINE_SEC,
+            )
             return FeedResult(ok=False, items=[])
         except httpx.HTTPStatusError as e:
             logger.warning("[%s] HTTP %d: %s", name, e.response.status_code, url)
@@ -344,54 +428,18 @@ class FeedCollector:
                              getattr(entry, "title", "")[:50])
                 continue
 
-            title = getattr(entry, "title", "") or ""
-            # m3: feedparser отдаёт title с HTML-сущностями (AT&amp;T, &quot;).
-            # Разэкранируем сразу — title идёт в дедуп, cluster_key и в БД,
-            # а digest затем сам html.escape'ит при отправке. Без unescape
-            # пользователь видел двойное экранирование (AT&amp;amp;T).
-            title = _html.unescape(title)
-
-            # summary: основной → fallback на content[0].value (<20 символов)
-            summary_raw = getattr(entry, "summary", "") or ""
-            if len(summary_raw) < 20:
-                content = getattr(entry, "content", []) or []
-                if content and hasattr(content[0], "value"):
-                    summary_raw = content[0].value or ""
-            summary = _strip_html(summary_raw)
-
-            published_str = _format_pubdate(entry)
-            pub_parsed = _parse_pubdate_utc(entry)
-
-            # Читаем <category> теги из фида
-            raw_tags = getattr(entry, "tags", []) or []
-            tags_list = []
-            for t in raw_tags:
-                term = getattr(t, "term", "") or ""
-                if term:
-                    tags_list.append(term)
-            tags_str = json.dumps(tags_list) if tags_list else None
-
-            # cluster_key: локация|stem_hash|день публикации
-            # Minor 6-фикс: единая реализация — build_cluster_key из locations.py
-            cluster_key = None
-            if title:
-                from .locations import build_cluster_key, extract_location
-                from .stemmer import stem_hash
-                location = extract_location(title)
-                stem = stem_hash(title)
-                cluster_key = build_cluster_key(location, stem, published_str, title=title)
-
-            news_items.append(NewsItem(
-                source=name,
-                url=link,
-                title=title,
-                summary=summary,
-                published=published_str,
-                published_parsed=pub_parsed,
-                tags=tags_str,
-                cluster_key=cluster_key,
-                lang=lang,
-            ))
+            # P2-фикс: ошибка конвертации ОДНОГО entry (кривой _strip_html,
+            # не-str term в tags, битый title в extract_location) не должна
+            # вылетать из генератора collect() и убивать остальные фиды цикла.
+            try:
+                news_item = _entry_to_news_item(entry, name, link, lang)
+            except Exception as e:
+                logger.warning(
+                    "[%s] пропущен entry (ошибка конвертации): %s", name, e,
+                )
+                continue
+            if news_item is not None:
+                news_items.append(news_item)
 
         logger.info(
             "[%s] собрано %d item(s) из %s",
@@ -407,6 +455,79 @@ class FeedCollector:
 # B6: максимальная длина summary для защиты LLM-бюджета и БД.
 # Обрезается В collector (до отправки в LLM), дублируется в storage.
 MAX_SUMMARY = 6000
+
+# Максимальная длина title: защита от враждебного RSS (заголовок в сотни КБ
+# раздувал БД/UNIQUE-индекс и уходил в LLM-токены). Дублируется в
+# storage.MAX_TITLE_CHARS — держать значения синхронными.
+MAX_TITLE_CHARS = 500
+
+
+def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Optional[NewsItem]:
+    """
+    Конвертирует один feedparser-entry в NewsItem.
+
+    Вынесено из цикла collect(), чтобы вызывающий мог обернуть конвертацию
+    в try/except и пропустить битый entry, не теряя остальные фиды цикла.
+
+    Возвращает None, если entry непригоден (пустой title не критичен —
+    item всё равно полезен по url).
+    """
+    title = getattr(entry, "title", "") or ""
+    if not isinstance(title, str):
+        title = str(title)
+    # m3: feedparser отдаёт title с HTML-сущностями (AT&amp;T, &quot;).
+    # Разэкранируем сразу — title идёт в дедуп, cluster_key и в БД,
+    # а digest затем сам html.escape'ит при отправке. Без unescape
+    # пользователь видел двойное экранирование (AT&amp;amp;T).
+    title = _html.unescape(title)[:MAX_TITLE_CHARS]
+
+    # summary: основной → fallback на content[0].value (<20 символов)
+    summary_raw = getattr(entry, "summary", "") or ""
+    if not isinstance(summary_raw, str):
+        summary_raw = str(summary_raw)
+    if len(summary_raw) < 20:
+        content = getattr(entry, "content", []) or []
+        if content and hasattr(content[0], "value"):
+            value = content[0].value or ""
+            summary_raw = value if isinstance(value, str) else str(value)
+    summary = _strip_html(summary_raw)
+
+    published_str = _format_pubdate(entry)
+    pub_parsed = _parse_pubdate_utc(entry)
+
+    # Читаем <category> теги из фида
+    raw_tags = getattr(entry, "tags", []) or []
+    tags_list = []
+    for t in raw_tags:
+        term = getattr(t, "term", "") or ""
+        if not isinstance(term, str):
+            # не-str term: json.dumps споткнулся бы, а падать из-за тега нельзя
+            term = str(term)
+        if term:
+            tags_list.append(term)
+    tags_str = json.dumps(tags_list) if tags_list else None
+
+    # cluster_key: локация|stem_hash|день публикации
+    # Minor 6-фикс: единая реализация — build_cluster_key из locations.py
+    cluster_key = None
+    if title:
+        from .locations import build_cluster_key, extract_location
+        from .stemmer import stem_hash
+        location = extract_location(title)
+        stem = stem_hash(title)
+        cluster_key = build_cluster_key(location, stem, published_str, title=title)
+
+    return NewsItem(
+        source=name,
+        url=link,
+        title=title,
+        summary=summary,
+        published=published_str,
+        published_parsed=pub_parsed,
+        tags=tags_str,
+        cluster_key=cluster_key,
+        lang=lang,
+    )
 
 # Collector Minor: тег = `<` + опциональный `/` + буква. Так «a < b > c»
 # (сравнение/формула из текста) не считается тегом и не вырезается.

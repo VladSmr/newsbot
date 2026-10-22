@@ -1,4 +1,5 @@
 """Справочник локаций для кластеризации новостей."""
+import re
 from typing import Optional
 
 LOCATIONS = {
@@ -85,6 +86,7 @@ def extract_location(title: str) -> str:
                 continue
 
             phrase = ' '.join(clean_tokens)
+            matched = False
             if phrase in LOCATIONS:
                 # 'us' — только если заглавная US в оригинале и это 1-грамма
                 if phrase == 'us':
@@ -92,6 +94,37 @@ def extract_location(title: str) -> str:
                     if not orig or orig[0] != orig[0].upper() or orig[0].islower():
                         continue
                 candidates.append(LOCATIONS[phrase])
+                matched = True
+
+            # P2: дефисные пары (US-China, Russia-Ukraine, Israel-Hamas) —
+            # пробельный split их не разделяет, и локация выпадала в 'other'
+            # (→ исчезала из location-cap). Дефис НЕ дисквалифицирует токен
+            # (в отличие от '.'/','), поэтому пробуем подтокены по -/—/–.
+            if not matched and any(
+                '-' in tok or '\u2014' in tok or '\u2013' in tok
+                for tok in clean_tokens
+            ):
+                parts = []
+                for tok in clean_tokens:
+                    parts.extend(
+                        p for p in re.split(r'[-\u2014\u2013]', tok) if p
+                    )
+                # сначала фраза с дефисами, заменёнными пробелами
+                # («South-Africa» → «south africa»)
+                joined = ' '.join(parts)
+                if joined in LOCATIONS:
+                    candidates.append(LOCATIONS[joined])
+                else:
+                    for part in parts:
+                        if part not in LOCATIONS:
+                            continue
+                        if part == 'us':
+                            # тот же капс-фильтр, что и для 1-граммы
+                            orig = words[i].strip(_TOKEN_STRIP_CHARS)
+                            if (not orig or orig[0] != orig[0].upper()
+                                    or orig[0].islower()):
+                                continue
+                        candidates.append(LOCATIONS[part])
 
     if not candidates:
         return 'other'

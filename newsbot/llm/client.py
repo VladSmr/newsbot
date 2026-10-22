@@ -29,6 +29,17 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _reject_json_constant(value: str) -> Any:
+    """parse_constant для json.loads: NaN/Infinity/-Infinity не валидный JSON.
+
+    Стандартный json.loads принимает эти литералы (в т.ч. `{"x": NaN}`),
+    хотя RFC 8259 их запрещает. Цель — не принять битый/нестандартный ответ
+    модели, поэтому бросаем ValueError (перехватывается ниже, уходит в ветку
+    невалидного JSON).
+    """
+    raise ValueError(f"недопустимая JSON-константа: {value}")
+
+
 def _parse_cached_tokens(usage: Dict[str, Any]) -> Tuple[int, int]:
     """
     Извлекает cached_hit и cached_miss из usage-блока.
@@ -319,27 +330,44 @@ class DeepSeekClient:
                 if not content:
                     raise LLMError("Пустой content в assistant message")
 
-                # Major #2-фикс: проверяем finish_reason на усечение.
-                # При length → JSON может быть обрезан → json.loads упадёт.
-                # Поднимаем LLMError, чтобы вызывающий получил fallback per-item
-                # (а не парсил битый JSON молча).
+                # Major #2-фикс / P5: finish_reason=length сам по себе НЕ значит,
+                # что JSON битый — валидный закрытый JSON может уложиться ровно
+                # в max_tokens на последнем токене. Поэтому сначала пробуем
+                # json.loads: успех → принимаем ответ (иначе split → повторный
+                # прогон тех же items → двойная оплата). LLMTruncationError —
+                # только если парсинг действительно не удался.
                 finish_reason: Any = first_choice.get("finish_reason")
-                if finish_reason == "length":
-                    # usage уже аккумулирован выше (сразу после проверки dict) —
-                    # токены учтены даже при length-truncation.
-                    logger.warning(
-                        "LLM ответ усечён (finish_reason=length, max_tokens=%d) — "
-                        "fallback для батча: шлём непрофильтрованными",
-                        self.max_tokens,
-                    )
-                    raise LLMTruncationError(
-                        f"LLM-ответ усечён (finish_reason=length, max_tokens={self.max_tokens}). "
-                        f"JSON может быть неполным — fallback (ok=False для всех items батча)."
-                    )
 
                 # ── usage-логирование уже выполнено выше (одно на response) ──
+                try:
+                    result: Any = json.loads(
+                        content, parse_constant=_reject_json_constant
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    if finish_reason == "length":
+                        # usage уже аккумулирован выше (сразу после проверки dict) —
+                        # токены учтены даже при length-truncation.
+                        logger.warning(
+                            "LLM ответ усечён (finish_reason=length, max_tokens=%d) "
+                            "и JSON не парсится — fallback для батча: "
+                            "шлём непрофильтрованными",
+                            self.max_tokens,
+                        )
+                        raise LLMTruncationError(
+                            f"LLM-ответ усечён (finish_reason=length, "
+                            f"max_tokens={self.max_tokens}). "
+                            f"JSON может быть неполным — fallback "
+                            f"(ok=False для всех items батча)."
+                        )
+                    raise
 
-                result: Any = json.loads(content)
+                if finish_reason == "length":
+                    logger.debug(
+                        "LLM ответ с finish_reason=length, но JSON валиден — "
+                        "принимаем без fallback (max_tokens=%d)",
+                        self.max_tokens,
+                    )
+
                 # Модель может вернуть массив или примитив
                 if not isinstance(result, dict):
                     raise LLMError(
@@ -420,6 +448,19 @@ class DeepSeekClient:
                     continue
                 # Второй JSONDecodeError или последняя попытка — выходим
                 break
+
+            except ValueError as e:
+                # Minor 4-волны: _reject_json_constant бросил ValueError
+                # (NaN/Infinity/-Infinity в JSON — не валидный RFC 8259).
+                # Явная ветка ВЫШЕ catch-all фиксирует намерение: это
+                # фатальная ошибка ответа, ретраить бессмысленно (модель
+                # вернёт тот же литерал, токены уже списаны).
+                # Ветка json.JSONDecodeError стоит раньше осознанно:
+                # JSONDecodeError — подкласс ValueError, у него свой
+                # 1-retry путь, семантика ретраев не меняется.
+                raise LLMError(
+                    f"Недопустимая JSON-константа в ответе: {e}"
+                ) from e
 
             # ── LLMError и прочие ошибки — без ретрая, сразу наружу ──
             except LLMError:

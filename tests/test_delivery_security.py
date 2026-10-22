@@ -764,3 +764,126 @@ def _make_item(i: int):
         published="2025-01-01",
         fetched_at=datetime.now(timezone.utc),
     )
+
+
+# ══════════════════════════════════════════════════════════════════
+# P1: пейджинг длинного body с HTML-спецсимволами не рвёт сущности
+# ══════════════════════════════════════════════════════════════════
+
+_VALID_ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|#x27);")
+
+
+def _broken_entities(text: str) -> bool:
+    """True, если в тексте есть '&', не начинающий валидную сущность."""
+    return "&" in _VALID_ENTITY_RE.sub("", text)
+
+
+class TestSplitTextRawBodyNoEntityTruncation:
+    """
+    P1-регресс: длинный СЫРОЙ body с " / ' / & раньше резался УЖЕ
+    экранированным — срез попадал внутрь &quot;/&#x27;/&amp; → Telegram 400
+    «can't parse entities» → item в failed после 8 ретраев (потеря новости).
+
+    Теперь режем сырой текст и экранируем каждый чанк отдельно.
+    """
+
+    @staticmethod
+    def _item_with_body(body: str):
+        from datetime import datetime, timezone
+        from newsbot.collector import NewsItem
+        return NewsItem(
+            source='ИСТОЧНИК "в кавычках" & Co',
+            url="https://example.com/long",
+            title='Заголовок с "кавычками" & амперсандом',
+            summary="short",
+            published="2025-01-01",
+            fetched_at=datetime.now(timezone.utc),
+            llm_summary=body,
+        )
+
+    def test_long_body_with_quotes_and_ampersands(self):
+        """Сырой body >5000 симв. с " / ' / & → все части валидный HTML ≤4096."""
+        body = ('Новость "кавычки" & амперсанд, апостроф\'s. ' * 200) + " ХВОСТ_МАРКЕР"
+        assert len(body) > 5000
+
+        td = TelegramDelivery(token="test_token", chat_id="123")
+        parts = td._build_message_parts(self._item_with_body(body))
+
+        assert len(parts) > 1, "длинный body должен разбиваться на части"
+        for p in parts:
+            text = p["text"]
+            assert len(text) <= 4096
+            assert not _broken_entities(text), "разорванная HTML-сущность"
+        # хвост новости не потерян
+        assert "ХВОСТ_МАРКЕР" in parts[-1]["text"]
+
+    def test_escape_expanding_body_quotes_only(self):
+        """3000 сырых ' (→ &#x27;) и 3000 & (→ &amp;) — сущности не рвутся."""
+        body = ('"' * 3000) + " " + ("&" * 3000)
+        assert len(body) == 6001
+
+        td = TelegramDelivery(token="test_token", chat_id="123")
+        parts = td._build_message_parts(self._item_with_body(body))
+
+        assert len(parts) >= 2
+        for p in parts:
+            text = p["text"]
+            assert len(text) <= 4096
+            assert not _broken_entities(text)
+
+    def test_split_paragraph_chunks_are_valid_escaped_html(self):
+        """_split_paragraph: каждый кусок — самостоятельный валидный escaped-HTML."""
+        td = TelegramDelivery(token="test_token", chat_id="123")
+        para = ('Он сказал "да" & ушёл\t' * 900)  # ~18k сырых символов
+        chunks = td._split_paragraph(para, 1000)
+
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert len(chunk) <= 1000
+            assert not _broken_entities(chunk)
+            assert "<" not in chunk and ">" not in chunk
+
+
+# ══════════════════════════════════════════════════════════════════
+# UTF-16: Telegram меряет длину в code units, не в code points
+# ══════════════════════════════════════════════════════════════════
+
+
+def _utf16_units(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+class TestSplitTextUtf16Limit:
+    """Не-BMP символы (эмодзи) — 2 UTF-16 units: части не должны превышать 4096."""
+
+    def test_4096_emoji_fit(self):
+        td = TelegramDelivery(token="test_token", chat_id="123")
+        # 4096 code points, но 8192 UTF-16 units — Telegram отверг бы целиком.
+        body = "😀" * 4096
+        result = td._split_text("T", body, "F", False, "")
+        assert len(result) > 1
+        for r in result:
+            assert _utf16_units(r["text"]) <= 4096
+
+    def test_emoji_body_build_message_parts(self):
+        from newsbot.collector import NewsItem
+        body = "😀" * 5000
+        item = NewsItem(
+            source="src", url="https://example.com/x", title="t",
+            summary="short", published="2025-01-01",
+            fetched_at=datetime.now(timezone.utc), llm_summary=body,
+        )
+        td = TelegramDelivery(token="test_token", chat_id="123")
+        parts = td._build_message_parts(item)
+        assert len(parts) > 1
+        for p in parts:
+            assert _utf16_units(p["text"]) <= 4096
+
+    def test_quotes_only_body_parts_are_valid(self):
+        """Строка из одних `"` (escape ×6) — валидные части в пределах лимита."""
+        td = TelegramDelivery(token="test_token", chat_id="123")
+        result = td._split_text("T", '"' * 3000, "F", False, "")
+        assert result
+        for r in result:
+            assert _utf16_units(r["text"]) <= 4096
+            assert not _broken_entities(r["text"])

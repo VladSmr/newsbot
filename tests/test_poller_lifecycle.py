@@ -596,7 +596,7 @@ def test_shutdown_poller_close_gets_only_remaining_budget():
     poller = MagicMock()
     captured = {}
 
-    def fake_stop():
+    def fake_stop(*args, **kwargs):
         clock.now += 35.0  # stop() ждал поток 35 с
 
     def fake_close(join_timeout=None):
@@ -628,7 +628,7 @@ def test_shutdown_poller_budget_never_repeats_full_join():
     poller = MagicMock()
     captured = {}
 
-    def fake_stop():
+    def fake_stop(*args, **kwargs):
         clock.now += budget + 10.0  # бюджет исчерпан
 
     def fake_close(join_timeout=None):
@@ -651,3 +651,99 @@ def test_poller_close_accepts_join_timeout():
     # Поток не запускался → join не нужен, close() не должен падать/висеть
     poller.close(join_timeout=0.0)
     poller.close()  # None — прежнее поведение, идемпотентно
+
+
+# ══════════════════════════════════════════════════════════════════
+# P1: stop() укладывается в shutdown-бюджет (join = min(poll+5, max_join))
+# ══════════════════════════════════════════════════════════════════
+
+
+def test_main_passes_remaining_budget_to_stop():
+    """main() передаёт stop() остаток shutdown-бюджета (max_join ≤ budget)."""
+    import newsbot.__main__ as main_mod
+
+    budget = main_mod._POLLER_SHUTDOWN_BUDGET_SEC
+    clock = _FakeClock()
+    poller = MagicMock()
+    captured = {}
+
+    def fake_stop(max_join=None):
+        captured["max_join"] = max_join
+        clock.now += 5.0
+
+    poller.stop.side_effect = fake_stop
+    poller.close.side_effect = lambda join_timeout=None: None
+
+    _run_main_with_poller(poller, clock)
+
+    assert "max_join" in captured, "stop() должен получить max_join"
+    assert 0.0 < captured["max_join"] <= budget
+
+
+def test_stop_caps_join_by_max_join():
+    """
+    stop(max_join=0.1) не ждёт poll_timeout+5 — join ограничен max_join,
+    поток остаётся alive, ссылка не обнуляется (нет второго поллера).
+    """
+    with patch("newsbot.storage.Storage") as MockStorage, \
+         patch("newsbot.telegram_io._TgClient") as MockClient:
+
+        mock_storage = MagicMock()
+        mock_storage.get_meta.return_value = None
+        MockStorage.return_value = mock_storage
+
+        mock_client = MagicMock()
+
+        poller_holder = {}
+
+        def fake_get_updates(**kwargs):
+            # Блокируемся до stop() (не sleep(3600): поток не должен утекать),
+            # затем короткая пауза — детерминированно гарантирует, что при
+            # max_join=0.1 поток ещё жив (проверяем именно cap join'а).
+            p = poller_holder.get("poller")
+            if p is not None:
+                p._stop_event.wait(timeout=10.0)
+            time.sleep(0.5)
+            return []
+
+        mock_client.getUpdates.side_effect = fake_get_updates
+        MockClient.return_value = mock_client
+
+        poller = TelegramPoller(
+            token="test_token", chat_id="123", db_path=":memory:",
+            on_digest=MagicMock(), poll_timeout=25,
+        )
+        poller_holder["poller"] = poller
+        poller.start()
+        time.sleep(0.3)
+
+        started = time.monotonic()
+        poller.stop(max_join=0.1)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0, f"stop(max_join=0.1) ждал {elapsed:.1f}с"
+        assert poller._thread is not None
+        assert poller._thread.is_alive()
+
+        # уборка: поток завершается сам (wait по _stop_event + 0.5 с) —
+        # close() его join'ит, утечки daemon-потока нет.
+        poller.close(join_timeout=5.0)
+
+
+# ══════════════════════════════════════════════════════════════════
+# P2: --bind без --set-chat-id → parser.error (не молчаливый демон)
+# ══════════════════════════════════════════════════════════════════
+
+
+def test_bind_without_set_chat_id_is_parser_error():
+    """--bind без --set-chat-id → SystemExit(2), демон не запускается."""
+    import newsbot.__main__ as main_mod
+
+    with patch.object(sys, "argv", ["newsbot", "--bind", "123456789"]), \
+         patch.object(main_mod, "_minimal_sanitizer_handler"), \
+         patch.object(main_mod, "NewsPipeline") as mock_pipeline:
+        with pytest.raises(SystemExit) as exc:
+            main_mod.main()
+
+    assert exc.value.code == 2
+    mock_pipeline.assert_not_called()

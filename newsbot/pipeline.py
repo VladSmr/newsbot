@@ -35,6 +35,7 @@ from typing import Dict, List, Optional, Set
 from .collector import FeedCollector, FeedResult, NewsItem
 from .dedup import filter_new
 from .delivery import ConsoleDelivery, TelegramDelivery, Delivery
+from .delivery.telegram import ChatIdNotBoundError, BotBlockedError
 from .digest import run_digest as _run_digest, build_digest_messages
 from .version import __version__
 from .llm import LLMFilter
@@ -63,6 +64,94 @@ def _parse_bool(value) -> bool:
     return False
 
 
+def _coerce_int(value, default: int = 0, context: str = "значение") -> int:
+    """
+    Приводит значение из конфига к int с fallback на default.
+
+    YAML может отдать число строкой ("2"): `str <= int` и срез `seq[:str]`
+    бросают TypeError ВНЕ try вокруг _run_digest → дайджест падал бы каждый
+    цикл (тот же класс бага, что чинили в dedup). Некорректное значение —
+    warning + default (без исключения).
+
+    Разбор через float (консистентно с dedup._cfg_int):
+    - "2.0"/"2.9" принимаются (раньше строка с точкой отвергалась → 0);
+    - NaN/inf (валидный YAML `.nan`/`.inf`) → default, а не ValueError/
+      OverflowError из int() ВНЕ try вокруг _run_digest;
+    - нецелый float не усекается молча: warning + floor.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректное значение %s=%r — использую %d", context, value, default,
+        )
+        return default
+    if not math.isfinite(parsed):
+        logger.warning(
+            "Некорректное значение %s=%r — не конечное число, использую %d",
+            context, value, default,
+        )
+        return default
+    floored = int(math.floor(parsed))
+    if floored != parsed:
+        logger.warning(
+            "Некорректное значение %s=%r — нецелое число, округлено вниз до %d",
+            context, value, floored,
+        )
+    return floored
+
+
+def _normalize_category_min(raw) -> Dict[str, int]:
+    """
+    Нормализует category_min из YAML в Dict[str, int].
+
+    Невалидное/нечисловое значение категории → warning + 0 (категория
+    игнорируется): опечатка в конфиге не должна ни ронять дайджест
+    (TypeError в сравнении/срезе вне try), ни выдумывать гарантию.
+    """
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(
+            "category_min: ожидался dict, получено %s — игнорирую",
+            type(raw).__name__,
+        )
+        return {}
+    normalized: Dict[str, int] = {}
+    for cat, value in raw.items():
+        normalized[str(cat)] = _coerce_int(
+            value, default=0, context="category_min[%s]" % cat,
+        )
+    return normalized
+
+
+def _loc_day_key(item) -> Optional[tuple]:
+    """
+    (локация, день) из cluster_key или None, если item не попадает
+    под location-cap (нет cluster_key или корзина 'other').
+
+    Парсинг ВЫРОВНЕН с _cap_by_location (nit, wave 4): cluster_key без
+    дня ('loc|x') даёт ('loc', 'unknown') — ровно ту группу, по которой
+    cap режет item. Раньше _loc_day_key возвращал для такого item None,
+    и гарантия не защищала его, хотя cap его кэпил (в ('loc','unknown'))
+    → гарантийный item молча отсекался. None — только там, где cap
+    действительно не применяется.
+    """
+    cluster_key = getattr(item, 'cluster_key', None)
+    if not cluster_key:
+        return None
+    parts = cluster_key.split('|')
+    location = parts[0]
+    if location == 'other':
+        return None
+    pub_day = parts[2] if len(parts) > 2 else 'unknown'
+    return (location, pub_day)
+
+
 def _parse_tags(tags_str: Optional[str]) -> List[str]:
     """Парсит JSON-массив тегов из БД."""
     if not tags_str:
@@ -73,13 +162,36 @@ def _parse_tags(tags_str: Optional[str]) -> List[str]:
     except Exception:
         return []
 
+# Словарь алиасов source → каноническое имя (ключи ДОЛЖНЫ быть в
+# нормализованном виде: lowercase без пунктуации/пробелов — см. _infer_category).
+# Все пробелы/апострофы удаляются: "Tom's Hardware"→"tomshardware",
+# "Krebs On Security"→"krebsonsecurity", "nasa spaceflight"→"nasaspaceflight".
+_SOURCE_ALIASES = {
+    "tomshardware": "tomshardware",
+    "krebsonsecurity": "krebs",
+    "nasaspaceflight": "nasaspaceflight",
+    "habr": "habr",
+    "habrnews": "habr",
+    "statnews": "statnews",
+    "stat": "statnews",
+    "sciencedaily": "sciencedaily",
+    "physorg": "physorg",
+    "bleepingcomputer": "bleepingcomputer",
+    "n1": "n1",
+    "nplus1": "n1",
+    # P2-фикс: нормализация убирает ПРОБЕЛЫ, поэтому "Naked Science"
+    # → "nakedscience". Прежний ключ 'naked science' не совпадал никогда.
+    "nakedscience": "nakedscience",
+}
+
+
 def _infer_category(item) -> str:
     """
     Определяет категорию новости по source + tags.
     categories: cinema, games, space, tech, cyber, science
 
     source нормализуется: lowercase + убирается пунктуация/апострофы.
-    Словарь алиасов → канонический ключ.
+    Словарь алиасов → канонический ключ (см. _SOURCE_ALIASES).
     """
     raw = (item.source or "").lower()
     import re
@@ -87,23 +199,6 @@ def _infer_category(item) -> str:
     # "Tom's Hardware" → "tomshardware"; "Krebs On Security" → "krebsonsecurity"
     normalized = re.sub(r"[^\w]", "", raw, flags=re.UNICODE)
 
-    # Словарь алиасов → каноническое имя
-    _SOURCE_ALIASES = {
-        # Все пробелы/апострофы удаляются: "Tom's Hardware"→"tomshardware",
-        # "Krebs On Security"→"krebsonsecurity", "nasa spaceflight"→"nasaspaceflight"
-        "tomshardware": "tomshardware",
-        "krebsonsecurity": "krebs",
-        "nasaspaceflight": "nasaspaceflight",
-        "habr": "habr",
-        "habrnews": "habr",
-        "statnews": "statnews",
-        "stat": "statnews",
-        "sciencedaily": "sciencedaily",
-        "physorg": "physorg",
-        "bleepingcomputer": "bleepingcomputer",
-        "n1": "n1",
-        "nplus1": "n1",
-    }
     source = _SOURCE_ALIASES.get(normalized, normalized)
 
     tags = _parse_tags(getattr(item, 'tags', None))
@@ -141,7 +236,7 @@ def _infer_category(item) -> str:
         return 'cyber'
 
     # Наука
-    if source in ('sciencedaily', 'physorg', 'n1', 'naked science', 'statnews'):
+    if source in ('sciencedaily', 'physorg', 'n1', 'nakedscience', 'statnews'):
         return 'science'
     if any(t in tags_lower for t in ('science', 'research', 'study', 'discovery', 'medical', 'health')):
         return 'science'
@@ -152,6 +247,7 @@ def _infer_category(item) -> str:
 def _cap_by_location(
     items: List[NewsItem],
     max_per_location: int = 2,
+    protected_urls: Optional[Set[str]] = None,
 ) -> List[NewsItem]:
     """
     Ограничивает число новостей по локации и дню.
@@ -164,14 +260,37 @@ def _cap_by_location(
     Алгоритм: итерация по порядку, для каждой (локация, день) сохраняются
     первые max_per_location items — остальные отфильтровываются.
     Вызывается в run_digest ПОСЛЕ _category_guarantee, ДО backfill.
+
+    P2-фикс: protected_urls — items, закрывающие минимум по категориям
+    (до category_min на категорию; см. run_digest). Иначе гарантия
+    бессмысленна: guarantee-items дописываются в конец списка, а cap идёт
+    по порядку → они первыми попадают под отсечку, если (location, day)
+    уже набрана из топов. Protected items обрабатываются ПЕРВЫМИ
+    (считаются в квоту) и имеют приоритет перед обычными.
+
+    Minor 2-фикс (wave 2): защита НЕ может превышать сам cap — на
+    (location, day) остаётся не более max_per_location items, включая
+    protected. Иначе при sum(category_min) ≈ max_items protected-ы
+    вытесняли всю обычную выборку и cap переставал работать молча.
+    Какие именно protected-ы выживут — решает вызывающая сторона
+    (run_digest обрезает набор заранее, с warning по категориям); здесь
+    лишние просто отсекаются как hard backstop.
     """
     if max_per_location <= 0 or not items:
         return list(items)
 
+    protected = protected_urls or set()
     location_day_counts: Dict[tuple, int] = {}
     result: List[NewsItem] = []
+    protected_dropped = 0
 
-    for item in items:
+    # Protected — первыми: они занимают квоту и отсекаются последними.
+    ordered_items = (
+        [it for it in items if getattr(it, 'url', None) in protected]
+        + [it for it in items if getattr(it, 'url', None) not in protected]
+    )
+
+    for item in ordered_items:
         cluster_key = getattr(item, 'cluster_key', None)
         if not cluster_key:
             result.append(item)
@@ -188,9 +307,20 @@ def _cap_by_location(
 
         key = (location, pub_day)
         count = location_day_counts.get(key, 0)
-        if count < max_per_location:
-            result.append(item)
-            location_day_counts[key] = count + 1
+        if count >= max_per_location:
+            # Квота группы исчерпана; protected здесь тоже не проходит —
+            # защита не может превышать cap.
+            if getattr(item, 'url', None) in protected:
+                protected_dropped += 1
+            continue
+        result.append(item)
+        location_day_counts[key] = count + 1
+
+    if protected_dropped:
+        logger.warning(
+            "Location cap: отсечено %d protected items — защита категорий "
+            "превышает location-cap", protected_dropped,
+        )
 
     if len(result) < len(items):
         locations_hit = len(location_day_counts)
@@ -220,8 +350,13 @@ def _category_guarantee(
     4. При пустом pool или None — legacy-режим: ничего не меняется
        (swap невозможен, гарантия остаётся no-op).
 
+    category_min нормализуется в Dict[str, int] (_normalize_category_min):
+    строковые значения из YAML не должны давать TypeError в сравнении
+    (Minor 1-фикс, wave 2).
+
     Сорт вывода — по llm_score DESC вызывающей стороной после вызова.
     """
+    category_min = _normalize_category_min(category_min)
     if not category_min or not items:
         return items
 
@@ -1210,6 +1345,20 @@ class NewsPipeline:
             else:
                 not_delivered = [i.url for i in to_deliver]
                 logger.info("Доставлено 0 items (items остаются pending)")
+        except (ChatIdNotBoundError, BotBlockedError) as e:
+            # P1-фикс: ПОСТОЯННАЯ ошибка конфигурации/доступа, а не транзиентная.
+            # ChatIdNotBoundError/BotBlockedError — подклассы TelegramDeliveryError,
+            # поэтому раньше попадали в общий except и url'ы уходили в failed_urls →
+            # increment_retry_count каждый цикл → max_retries → failed → purge.
+            # Сценарий «юзер заблокировал бота на 2 часа» стирал все новости.
+            # Теперь НЕ возвращаем failed: items остаются pending до починки чата,
+            # retry_count не инкрементируется (по образцу digest-пути).
+            logger.warning(
+                "Доставка невозможна (%s): %d items остаются pending без "
+                "расхода retry_count (чат/доступ не настроены)",
+                type(e).__name__, len(to_deliver),
+            )
+            return []
         except Exception as e:
             logger.error(
                 "Доставка упала (%d items → pending, retry в след.цикле): %s",
@@ -1579,33 +1728,106 @@ class NewsPipeline:
                 if it.url not in included_urls
                 and it.url not in _dup_urls
             ]
-        category_min = digest_cfg.get("category_min", {})
+        # Minor 1-фикс (wave 2): нормализация category_min — YAML может отдать
+        # строку ("2"); `str <= int` и `seq[:str]` бросают TypeError ВНЕ
+        # try вокруг _run_digest → дайджест падал бы каждый цикл.
+        category_min = _normalize_category_min(digest_cfg.get("category_min", {}))
+        # Minor 1-фикс: max_per_location вычисляется ДО блока гарантии —
+        # от него зависит квота защиты (Minor 2-фикс). Невалидное значение
+        # → documented default (2), а не отключение cap'а.
+        raw_max = digest_cfg.get("max_per_location", 2)
+        # None/"" (ключ есть, значение пустое) — это НЕ «выключить cap»,
+        # а незаполненный конфиг: documented default 2 + warning. Явный 0
+        # остаётся осознанным «без cap». Раньше `if raw_max` молча
+        # отключал cap на пустом значении.
+        if raw_max is None or (isinstance(raw_max, str) and not raw_max.strip()):
+            logger.warning(
+                "digest.max_per_location=%r — пустое значение, использую 2 "
+                "(явный 0 отключает cap)", raw_max,
+            )
+            max_per_location = 2
+        else:
+            max_per_location = _coerce_int(
+                raw_max, default=2, context="digest.max_per_location",
+            )
+        # P2-фикс: гарантийные items не должны отсекаться location-cap'ом.
+        # Защищаем от cap ровно те items, которые закрывают минимум по
+        # категории (до min_count на категорию, лучшие по score). Сюда входят
+        # и items, уже бывшие в топе, и добавленные _category_guarantee из pool.
+        guarantee_protected_urls: Set[str] = set()
         if category_min:
             deferred_items = _category_guarantee(deferred_items, category_min, pool=category_pool)
+            _by_cat: Dict[str, List[NewsItem]] = {}
+            for _it in deferred_items:
+                _by_cat.setdefault(_infer_category(_it), []).append(_it)
+            # Приоритет категорий — порядок в category_min (кино первый).
+            _cat_priority = {c: i for i, c in enumerate(category_min)}
+            # protected сгруппированы по (локация, день) — для квоты защиты.
+            _protected_by_group: Dict[tuple, List[tuple]] = {}
+            _protected_free: List[NewsItem] = []
+            for _cat, _min_count in category_min.items():
+                if _min_count <= 0:
+                    continue
+                _cat_items = sorted(
+                    _by_cat.get(_cat, []),
+                    key=lambda x: x.llm_score or 0,
+                    reverse=True,
+                )
+                for _it in _cat_items[:_min_count]:
+                    _loc_day = _loc_day_key(_it)
+                    if _loc_day is None:
+                        # cap на item не распространяется — защита не нужна
+                        _protected_free.append(_it)
+                        continue
+                    _protected_by_group.setdefault(_loc_day, []).append((_cat, _it))
+            for _it in _protected_free:
+                guarantee_protected_urls.add(_it.url)
+            # Minor 2-фикс (wave 2): защита не может превышать сам cap —
+            # иначе при sum(category_min) ≈ max_items protected-ы покрывают
+            # почти весь дайджест и max_per_location молча перестаёт работать.
+            # При превышении оставляем категории с высшим приоритетом
+            # (порядок в category_min), внутри категории — лучшие по score.
+            for _loc_day, _entries in _protected_by_group.items():
+                if (max_per_location and max_per_location > 0
+                        and len(_entries) > max_per_location):
+                    _entries.sort(
+                        key=lambda ce: (
+                            _cat_priority.get(ce[0], len(_cat_priority)),
+                            -(ce[1].llm_score or 0),
+                        )
+                    )
+                    _kept = _entries[:max_per_location]
+                    _dropped = _entries[max_per_location:]
+                    logger.warning(
+                        "Дайджест: защита категорий %s превышает location-cap=%d "
+                        "для локации %s/%s — оставлено %d, без защиты %s",
+                        ", ".join(sorted({c for c, _ in _entries})),
+                        max_per_location, _loc_day[0], _loc_day[1],
+                        len(_kept),
+                        ", ".join(sorted({c for c, _ in _dropped})),
+                    )
+                else:
+                    _kept = _entries
+                for _cat, _it in _kept:
+                    guarantee_protected_urls.add(_it.url)
         n_guarantee = len(deferred_items)
 
         # MAJOR: cap by location/day — СТРОГО ПОСЛЕДНИЙ, после всех свапов.
-        # Инвариант «≤max_per_location на (локация, день)» держится железно,
-        # cap не может обнулить список (max_per_location>0 → в каждой группе ≥1).
-        # Minor 1-фикс: нормализация — None/0 → 0 (без ограничений), int для safety.
-        raw_max = digest_cfg.get("max_per_location", 2)
-        max_per_location = int(raw_max) if raw_max else 0
-        # MAJOR 3-фикс: cap by location/day. Считаем исчерпанные пары ДО cap
-        # (count >= max_per_location), чтобы логировать. Само ограничение
-        # выполняется _cap_by_location().
+        # Инвариант «≤max_per_location на (локация, день)» держится железно
+        # (max_per_location>0 → в каждой группе ≥1), cap не может обнулить
+        # список; защита категорий ограничена тем же cap'ом (Minor 2-фикс).
         capped_count = 0
         from collections import Counter
         if max_per_location and max_per_location > 0 and deferred_items:
             pre_cap: Counter = Counter()
             for it in deferred_items:
-                ck = getattr(it, 'cluster_key', None)
-                if ck:
-                    parts = ck.split('|')
-                    if len(parts) >= 3 and parts[0] != 'other':
-                        pre_cap[(parts[0], parts[2])] += 1
+                _loc_day = _loc_day_key(it)
+                if _loc_day is not None:
+                    pre_cap[_loc_day] += 1
             capped_count = sum(1 for cnt in pre_cap.values() if cnt >= max_per_location)
             deferred_items = _cap_by_location(
                 deferred_items, max_per_location=max_per_location,
+                protected_urls=guarantee_protected_urls,
             )
             if deferred_items:
                 logger.info(
@@ -1638,11 +1860,9 @@ class NewsPipeline:
             running_counts: Counter = Counter()
             if max_per_location and max_per_location > 0:
                 for it in deferred_items:
-                    ck = getattr(it, 'cluster_key', None)
-                    if ck:
-                        parts = ck.split('|')
-                        if len(parts) >= 3 and parts[0] != 'other':
-                            running_counts[(parts[0], parts[2])] += 1
+                    _ld = _loc_day_key(it)
+                    if _ld is not None:
+                        running_counts[_ld] += 1
             backfill_candidates: List[NewsItem] = []
             for it in deferrable_post_published:
                 if it.url in included_urls:
@@ -1655,14 +1875,14 @@ class NewsPipeline:
                 # 'other' или отсутствие cluster_key не ограничивается локацией.
                 # Minor 1-фикс: guard max_per_location > 0 — без него 0>=0=True,
                 # backfill отбрасывает всех (тихая деградация при max_per_location=0).
-                ck = getattr(it, 'cluster_key', None)
-                if ck and max_per_location > 0:
-                    parts = ck.split('|')
-                    if len(parts) >= 3 and parts[0] != 'other':
-                        loc_day = (parts[0], parts[2])
-                        if running_counts[loc_day] >= max_per_location:
-                            continue
-                        running_counts[loc_day] += 1
+                # Nit (wave 4): группировка через _loc_day_key — как в cap и в
+                # гарантии; локальный `len(parts) >= 3` иначе не считал
+                # truncated-ключи и backfill возвращал отсечённый cap'ом item.
+                _ld = _loc_day_key(it)
+                if _ld is not None and max_per_location > 0:
+                    if running_counts[_ld] >= max_per_location:
+                        continue
+                    running_counts[_ld] += 1
                 backfill_candidates.append(it)
             # Сортировка: score DESC (fetched_at ASC уже в исходном порядке из SQL)
             backfill_candidates.sort(key=lambda x: -(x.llm_score or 0))
@@ -1895,6 +2115,22 @@ class NewsPipeline:
             )
             self.storage.set_meta("digest_failure_count", "0")
             self.storage.set_meta("last_digest_at", digest_started_iso)
+            # P2-фикс: 3-strike ветка возвращалась ДО терминализации
+            # poison-pill items (битый feedback-target / падение рендеринга) —
+            # они вечно циклятся в 'deferred', каждый раз исключаясь из groups.
+            # Помечаем их 'failed' и здесь.
+            if failed_digest_urls:
+                try:
+                    marked = self.storage.set_state(failed_digest_urls, "failed")
+                    logger.info(
+                        "digest (3-strike): %d/%d items → 'failed' "
+                        "(per-item исключение: рендеринг +/ feedback-target)",
+                        marked, len(failed_digest_urls),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "digest (3-strike): set_state('failed') упал: %s", e,
+                    )
             return 0
 
         # ── Отправляем через digest (с готовыми groups + buttons) ──
@@ -1920,6 +2156,14 @@ class NewsPipeline:
                 "deferred, граница окна НЕ сдвинута",
                 e,
             )
+            # P2-фикс: shutdown — штатная остановка, не сбой. Не инкрементируем
+            # счётчик и не пишем last_digest_at (см. ниже аналогичную ветку).
+            if self._shutdown_event is not None and self._shutdown_event.is_set():
+                logger.info(
+                    "Дайджест: остановка (shutdown) — счётчик неудач и "
+                    "last_digest_at НЕ изменяются",
+                )
+                return 0
             failure_count += 1
             self.storage.set_meta("digest_failure_count", str(failure_count))
             logger.info(
@@ -2056,29 +2300,44 @@ class NewsPipeline:
             # target'ов) — тоже не failure: они помечены 'failed', а не
             # потеряны.
             if sent_count == 0 and total_to_send > 0:
-                failure_count += 1
-                self.storage.set_meta("digest_failure_count", str(failure_count))
-                if failure_count >= 3:
-                    remaining = max(0, total_to_send - sent_count)
-                    sample_urls = [
-                        it.url for _, grp in groups for it in grp
-                        if it.url not in set(sent_urls)
-                    ][:5]
-                    logger.warning(
-                        "Дайджест: %d неудачных попыток подряд — %d items остаются "
-                        "deferred, граница окна НЕ сдвинута (повтор в следующем окне), "
-                        "счётчик сброшен; примеры url: %s",
-                        failure_count, remaining, ", ".join(sample_urls) or "—",
+                # P2-фикс: shutdown во время отправки — штатная остановка,
+                # а не сбой доставки. TelegramDelivery.send_digest при
+                # _shutdown_event возвращает False (внутри _api_call —
+                # TelegramDeliveryError("shutdown…")), и раньше это считалось
+                # провалом: 3 деплоя подряд → 3-strike → пропуск окна.
+                # Не инкрементируем digest_failure_count и не пишем
+                # last_digest_at — items остаются deferred до следующего окна.
+                if self._shutdown_event is not None and self._shutdown_event.is_set():
+                    logger.info(
+                        "Дайджест: остановка (shutdown) во время отправки — "
+                        "%d items остаются deferred, digest_failure_count и "
+                        "last_digest_at НЕ изменяются",
+                        total_to_send,
                     )
-                    # reset после 3-strike — бот сам восстанавливается после
-                    # разового внешнего сбоя (сеть/Telegram API transient).
-                    self.storage.set_meta("digest_failure_count", "0")
-                    self.storage.set_meta("last_digest_at", now_iso)
                 else:
-                    logger.debug(
-                        "Дайджест: пропущен (sent_count=%d/%d, failures=%d/3)",
-                        sent_count, total_to_send, failure_count,
-                    )
+                    failure_count += 1
+                    self.storage.set_meta("digest_failure_count", str(failure_count))
+                    if failure_count >= 3:
+                        remaining = max(0, total_to_send - sent_count)
+                        sample_urls = [
+                            it.url for _, grp in groups for it in grp
+                            if it.url not in set(sent_urls)
+                        ][:5]
+                        logger.warning(
+                            "Дайджест: %d неудачных попыток подряд — %d items остаются "
+                            "deferred, граница окна НЕ сдвинута (повтор в следующем окне), "
+                            "счётчик сброшен; примеры url: %s",
+                            failure_count, remaining, ", ".join(sample_urls) or "—",
+                        )
+                        # reset после 3-strike — бот сам восстанавливается после
+                        # разового внешнего сбоя (сеть/Telegram API transient).
+                        self.storage.set_meta("digest_failure_count", "0")
+                        self.storage.set_meta("last_digest_at", now_iso)
+                    else:
+                        logger.debug(
+                            "Дайджест: пропущен (sent_count=%d/%d, failures=%d/3)",
+                            sent_count, total_to_send, failure_count,
+                        )
             else:
                 logger.debug(
                     "Дайджест: частичная доставка или пустой набор "

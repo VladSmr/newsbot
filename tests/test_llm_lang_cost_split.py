@@ -503,6 +503,62 @@ class TestUsageOnEarlyRaise:
 
 
 # ─────────────────────────────────────────────────────────────────
+# NIT: json.loads не должен принимать NaN/Infinity как валидный JSON
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestJsonNonFiniteRejected:
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_non_finite_constant_rejected(self, monkeypatch, literal):
+        """`{"score": NaN}` — не валидный JSON (RFC 8259) → не принимаем."""
+        import newsbot.llm.client as cm
+
+        http = _SingleResponseHTTP({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": '{"score": %s}' % literal},
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                      "total_tokens": 12},
+        })
+        monkeypatch.setattr(cm.httpx, "Client", http)
+
+        client = DeepSeekClient(api_key="k", base_url="https://x.com", model="m")
+        with pytest.raises(LLMError):
+            client.chat_json(system="s", user="u")
+        assert http.calls == 1
+
+    def test_non_finite_constant_has_explicit_error_message(self, monkeypatch):
+        """Minor 4-волны: ValueError от parse_constant → явный LLMError.
+
+        Раньше путь держался на catch-all `except Exception` и давал
+        «Неожиданная ошибка…». Теперь — отдельная ветка без retry.
+        """
+        import newsbot.llm.client as cm
+
+        http = _SingleResponseHTTP({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": '{"score": NaN}'},
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2,
+                      "total_tokens": 12},
+        })
+        monkeypatch.setattr(cm.httpx, "Client", http)
+
+        client = DeepSeekClient(api_key="k", base_url="https://x.com", model="m")
+        with pytest.raises(LLMError) as exc_info:
+            client.chat_json(system="s", user="u")
+
+        assert type(exc_info.value) is LLMError  # не LLMTruncationError
+        msg = str(exc_info.value)
+        assert "Недопустимая JSON-константа в ответе" in msg
+        assert "недопустимая JSON-константа: NaN" in msg  # текст из ValueError
+        assert "Неожиданная ошибка" not in msg
+        assert http.calls == 1  # без retry
+
+
+# ─────────────────────────────────────────────────────────────────
 # MINOR 4: shutdown прекращает отправку (burst при обнулённых паузах)
 # ─────────────────────────────────────────────────────────────────
 

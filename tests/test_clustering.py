@@ -1,7 +1,7 @@
 """Тесты стеммера, локаций и кластеризации (Задача 2)."""
 import pytest
 
-from newsbot.stemmer import normalize, stem_hash
+from newsbot.stemmer import normalize, stem_hash, _stem_word
 from newsbot.locations import build_cluster_key, extract_location, LOCATIONS
 
 
@@ -91,6 +91,119 @@ class TestStemmer:
         result = normalize("protesting protesters protestation")
         assert "protest" in result
 
+    def test_es_suffix_only_after_sibilants(self):
+        """
+        P2: -es снимается только у основ на s/x/z/ch/sh; иначе — обычное -s.
+        Раньше cases→cas, notes→not, rates→rat: rate/rates расходились
+        по кластерам и domain-дедуп не склеивал перепечатку.
+        """
+        assert _stem_word("rates") == _stem_word("rate") == "rate"
+        assert _stem_word("notes") == _stem_word("note") == "note"
+        # шипящие/свистящие — прежнее поведение
+        assert _stem_word("passes") == "pass"
+        assert _stem_word("boxes") == "box"
+        assert _stem_word("clashes") == "clash"
+        assert _stem_word("watches") == "watch"
+
+    def test_es_se_bases_singular_plural_agree(self):
+        """
+        Minor 2-волны: основы на -se (немое -e) не должны терять -e во
+        множественном числе. Раньше cases→cas, responses→respons,
+        releases→releas, raises→rais — расходятся с единственным числом
+        (case/response/release/raise) и дедуп не склеивает перепечатки.
+        """
+        for singular, plural in (
+            ("case", "cases"),
+            ("response", "responses"),
+            ("release", "releases"),
+            ("raise", "raises"),
+            ("base", "bases"),
+            ("promise", "promises"),
+        ):
+            assert _stem_word(plural) == _stem_word(singular) == singular, (
+                f"{plural} и {singular} должны давать один стем"
+            )
+        # шипящие/свистящие не сломались
+        assert _stem_word("passes") == "pass"
+        assert _stem_word("classes") == "class"
+
+    def test_es_us_plurals_keep_base(self):
+        """
+        Minor 4-волны (регрессия 2-волны): плюралисы на -us не должны
+        получать немое -e. Было viruses→viruse, statuses→statuse, buses→buse —
+        расходились с virus/status/bus. Чиним явным whitelist'ом.
+        """
+        for singular in ("virus", "status", "bus"):
+            plural = singular + "es"
+            assert _stem_word(plural) == _stem_word(singular) == singular, (
+                f"{plural} и {singular} должны давать один стем"
+            )
+            assert stem_hash(f"New {plural} found") == stem_hash(
+                f"New {singular} found"
+            ), f"stem_hash для {plural}/{singular} разошёлся"
+
+        # основы на -use (немое -e — часть корня) не сломаны
+        assert _stem_word("houses") == _stem_word("house") == "house"
+        assert _stem_word("purposes") == "purpose"
+
+    def test_ies_suffix_to_y(self):
+        """P2: -ies → y (rallies→rally, policies→policy)."""
+        assert _stem_word("rallies") == "rally"
+        assert _stem_word("policies") == "policy"
+        assert _stem_word("industries") == "industry"
+
+    def test_ed_restores_silent_e(self):
+        """
+        Minor 2-волны: -ed после гласной+s восстанавливает немое -e,
+        иначе raised→rais, а raise→raise — расходятся по стемам.
+        """
+        assert _stem_word("raised") == _stem_word("raise") == "raise"
+        assert _stem_word("used") == _stem_word("use") == "use"
+        assert _stem_word("closed") == _stem_word("close") == "close"
+        assert _stem_word("increased") == _stem_word("increase") == "increase"
+        # основы на -us: немое e не восстанавливается (focus→focus, не focuse)
+        assert _stem_word("focused") == _stem_word("focus") == "focus"
+        # удвоение и обычные -ed не сломались
+        assert _stem_word("stopped") == "stop"
+        assert _stem_word("attacked") == "attack"
+        # NB (вне скоупа 2-волны): passed→'pas' из-за pre-existing rollback
+        # удвоения (pass+ed), тогда как passes→'pass'. Расхождение было
+        # и до фикса, здесь не менялось.
+
+    def test_stop_words_filtered_before_stemming(self):
+        """
+        Minor 2-волны: стоп-слова фильтруются ДО стемминга. Раньше
+        does→doe, has→ha, was→wa не совпадали со STOP_WORDS и попадали
+        в stem_hash мусорными токенами.
+        """
+        assert _stem_word("does") == "doe"  # стеммер как таковой
+        norm = normalize("Central bank does nothing")
+        assert "doe" not in norm.split(), f"'doe' просочился в normalize: {norm!r}"
+        assert "does" not in norm.split()
+        # прочие стоп-слова во множественном/прошедшем не протекают
+        for text in ("He has plans", "It was here"):
+            tokens = normalize(text).split()
+            for junk in ("ha", "wa"):
+                assert junk not in tokens, f"{junk!r} просочился: {tokens}"
+
+    def test_raise_past_present_same_cluster(self):
+        """
+        Minor 2-волны: raise/raises/raised → один стем → один кластер
+        (перепечатки «central bank raises rate» / «raised rate»).
+        """
+        h1 = stem_hash("Central bank raises key rate")
+        h2 = stem_hash("Central bank raised key rate")
+        h3 = stem_hash("Central bank raise key rate")
+        assert h1 == h2 == h3, (
+            f"raise/raises/raised должны совпадать: {h1}, {h2}, {h3}"
+        )
+
+    def test_rate_singular_plural_same_cluster(self):
+        """rate/rates дают одинаковый stem → один кластер (domain-дедуп)."""
+        assert stem_hash("Central bank raises key rate") == stem_hash(
+            "Central bank raises key rates"
+        )
+
 
 class TestLocations:
     """Тесты locations.py."""
@@ -151,6 +264,24 @@ class TestLocations:
         assert extract_location("Москва…") == "москва"
         assert extract_location("Москва — новости дня") == "москва"
         assert extract_location("«Киев»: подробности") == "киев"
+
+    def test_extract_location_hyphenated_pair(self):
+        """
+        P2: дефисные пары (US-China, Russia-Ukraine, Israel-Hamas) раньше
+        не распознавались (пробельный split) → 'other' → выпадали из
+        location-cap. Дефис не должен дисквалифицировать токен.
+        """
+        assert extract_location("US-China trade war escalates") == "сша"
+        assert extract_location("Russia-Ukraine conflict update") == "россия"
+        assert extract_location("Israel-Hamas ceasefire talks") == "израиль"
+        # дефисная запись 2-словной локации
+        assert extract_location("South-Africa summit opens") == "юар"
+        # локация внутри обычного текста между дефисами
+        assert extract_location("Talks resume in Paris-London shuttle") == "париж"
+
+    def test_extract_location_hyphen_does_not_glue_dotted(self):
+        """Точка/запятая по-прежнему дисквалифицируют токен (не дефис)."""
+        assert extract_location("U.S.-China talks") == "other"
 
     def test_locations_no_duplicate_kiev(self):
         """

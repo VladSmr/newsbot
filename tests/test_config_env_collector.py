@@ -715,4 +715,125 @@ class TestConfigHardening:
         assert DEFAULT_CONFIG["dedup"]["max_seen_titles"] == 2000
 
 
+# ── P2: llm-числа — ±inf и отрицательные не проходят ─────────────────────────
+
+
+class TestConfigLLMNumericRanges:
+    """
+    P2-фикс: llm.timeout_sec=.inf (валидный YAML float) раньше проходил
+    валидацию → OverflowError на каждом LLM-вызове; batch_size/max_tokens=-1
+    тоже проходили. Теперь isfinite + range-check → warning + дефолт.
+    """
+
+    def test_inf_timeout_falls_back_to_default(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("llm:\n  timeout_sec: .inf\n", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["llm"]["timeout_sec"] == 60
+        assert any("timeout_sec" in r.getMessage() for r in caplog.records)
+
+    def test_negative_nan_inf_values_fall_back(self, tmp_path, caplog):
+        import logging
+        import math
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "llm:\n"
+            "  batch_size: -1\n"
+            "  max_tokens: -1\n"
+            "  temperature: .nan\n"
+            "  daily_cost_limit: -.inf\n",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["llm"]["batch_size"] == 10
+        assert cfg["llm"]["max_tokens"] == 4096
+        assert cfg["llm"]["temperature"] == 0
+        assert cfg["llm"]["daily_cost_limit"] == 0.50
+        assert all(
+            not isinstance(cfg["llm"][k], float) or math.isfinite(cfg["llm"][k])
+            for k in ("temperature", "daily_cost_limit")
+        )
+
+    def test_out_of_range_upper_bound_falls_back(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("llm:\n  max_tokens: 999999999\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert cfg["llm"]["max_tokens"] == 4096
+
+
+# ── P1: telegram.poll_timeout — тип, диапазон, кламп ─────────────────────────
+
+
+class TestConfigTelegramPollTimeout:
+    """
+    P1-фикс: poll_timeout влияет на join poller'а при shutdown
+    (join = poll_timeout + 5). Значение >30 клампится до 30, невалидное —
+    дефолт 25, чтобы бюджет graceful shutdown оставался жёстким.
+    """
+
+    def test_valid_value_kept_as_int(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text('telegram:\n  poll_timeout: "10"\n', encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert cfg["telegram"]["poll_timeout"] == 10
+
+    def test_too_large_value_is_clamped(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("telegram:\n  poll_timeout: 120\n", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["telegram"]["poll_timeout"] == 30
+        assert any("poll_timeout" in r.getMessage() for r in caplog.records)
+
+    def test_invalid_value_falls_back_to_default(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("telegram:\n  poll_timeout: soon\n", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["telegram"]["poll_timeout"] == 25
+        assert any("poll_timeout" in r.getMessage() for r in caplog.records)
+
+    def test_negative_or_zero_falls_back_to_default(self, tmp_path):
+        from newsbot.config import load_config
+
+        for bad in ("0", "-5", "1.5", "true"):
+            cfg_file = tmp_path / "config.yaml"
+            cfg_file.write_text(
+                f"telegram:\n  poll_timeout: {bad}\n", encoding="utf-8"
+            )
+            cfg = load_config(str(cfg_file))
+            assert cfg["telegram"]["poll_timeout"] == 25, bad
+
+
 # --

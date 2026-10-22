@@ -583,6 +583,111 @@ class TestPartialDeliveryKeepsBoundary(unittest.TestCase):
 
 
 # =============================================================================
+# P2: 3-strike терминализирует poison-pill items
+# =============================================================================
+
+class TestThreeStrikeTerminalizesPoisonPills(unittest.TestCase):
+    """P2: ветка digest_failure_count>=3 возвращалась ДО set_state('failed')
+    для битых feedback-target items → они вечно циклятся в deferred."""
+
+    def test_poison_pill_marked_failed_on_3strike(self):
+        from newsbot.delivery.telegram import TelegramDelivery
+
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.set_meta("digest_failure_count", "3")
+            s.close()
+
+            _insert_deferred_item(
+                db_path, "Poison", "https://ex.com/poison",
+                "2025-01-01 12:00", "2025-01-01T12:00:00+00:00", score=9,
+            )
+
+            p = _mk_pipeline(db_path)
+            p.config["feedback"] = {"enabled": True, "digest_enabled": True}
+            delivery = MagicMock(spec=TelegramDelivery)
+            delivery.send_digest.return_value = True
+            p.delivery = delivery
+
+            def boom_target(item, kind):
+                raise RuntimeError("broken feedback target")
+
+            with patch.object(
+                p.storage, "get_or_create_feedback_target_from_item",
+                side_effect=boom_target,
+            ):
+                count = p.run_digest(force=True)
+
+            self.assertEqual(count, 0, "3-strike: дайджест пропущен")
+            self.assertIn(
+                "https://ex.com/poison",
+                {i.url for i in p.storage.get_all_by_state("failed")},
+                "P2: poison-pill item должен быть терминализирован в 'failed'",
+            )
+            p.storage.close()
+            p.close()
+
+
+# =============================================================================
+# P2: shutdown во время дайджеста — не провал доставки
+# =============================================================================
+
+class TestShutdownDoesNotCountAsFailure(unittest.TestCase):
+    """P2: остановка процесса — штатная ситуация, не 3-strike."""
+
+    def test_shutdown_does_not_increment_failure_or_write_last_digest(self):
+        import threading
+
+        old_boundary = "2020-01-01T00:00:00+00:00"
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", old_boundary)
+            s.close()
+
+            _insert_deferred_item(
+                db_path, "Backlog", "https://ex.com/backlog",
+                "2025-01-01 12:00", "2025-01-01T12:00:00+00:00", score=9,
+            )
+
+            ev = threading.Event()
+            p = _mk_pipeline(db_path)
+            p._shutdown_event = ev
+            delivery = MagicMock()
+            delivery.send_text.return_value = False  # как при shutdown в _api_call
+            p.delivery = delivery
+
+            ev.set()
+            for i in range(3):
+                count = p.run_digest(force=True)
+                self.assertEqual(count, 0)
+                self.assertIn(
+                    p.storage.get_meta("digest_failure_count"), (None, "0"),
+                    f"прогон {i + 1}: shutdown не инкрементирует 3-strike",
+                )
+                self.assertIsNone(
+                    p.storage.get_meta("last_digest_at"),
+                    "shutdown не должен писать last_digest_at",
+                )
+                self.assertEqual(
+                    p.storage.get_meta("digest_window_started_at"), old_boundary,
+                    "shutdown не должен двигать границу окна",
+                )
+
+            # Окно НЕ пропущено: после снятия shutdown бэклог уходит.
+            ev.clear()
+            delivery.send_text.return_value = True
+            count = p.run_digest(force=True)
+            self.assertEqual(count, 1, "3 деплоя подряд не должны пропускать окно")
+            self.assertIn(
+                "https://ex.com/backlog",
+                {i.url for i in p.storage.get_all_by_state("digested")},
+            )
+            p.storage.close()
+            p.close()
+
+
+# =============================================================================
 # Внешний except-путь run_digest (:1888)
 # =============================================================================
 
@@ -624,6 +729,125 @@ class TestExternalRunDigestException(unittest.TestCase):
             )
             p.storage.close()
             p.close()
+
+
+# =============================================================================
+# Minor 1 (wave 2): битый category_min не роняет дайджест каждый цикл
+# =============================================================================
+
+class TestBadCategoryMinConfigDoesNotBreakDigest(unittest.TestCase):
+    """YAML может отдать category_min строкой; TypeError раньше летел ВНЕ
+    try вокруг _run_digest → дайджест падал каждый цикл (и 3-strike)."""
+
+    def test_string_category_min_and_max_per_location(self):
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            _insert_deferred_item(
+                db_path, "Ok", "https://ex.com/ok",
+                "2025-01-01 12:00", "2025-01-01T12:00:00+00:00", score=9,
+            )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 10,
+                    "max_items_per_message": 20,
+                    "max_per_location": "2",       # строка
+                    "category_min": {"cinema": "1"},  # строка
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+            self.assertEqual(count, 1, "строковый category_min не должен ломать дайджест")
+            self.assertEqual(p.storage.get_meta("digest_failure_count"), "0")
+            p.storage.close()
+            p.close()
+
+    def test_invalid_category_min_values_do_not_raise(self):
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            _insert_deferred_item(
+                db_path, "Ok", "https://ex.com/ok2",
+                "2025-01-01 12:00", "2025-01-01T12:00:00+00:00", score=9,
+            )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 10,
+                    "max_items_per_message": 20, "max_per_location": 2,
+                    # мусорные значения: нечисловая строка и None
+                    "category_min": {"cinema": "abc", "science": None},
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+            self.assertEqual(count, 1)
+            self.assertEqual(p.storage.get_meta("digest_failure_count"), "0")
+            p.storage.close()
+            p.close()
+
+
+# =============================================================================
+# Major (wave 4): `.nan`/`.inf` в max_per_location не роняют дайджест
+# =============================================================================
+
+class TestNonFiniteMaxPerLocationDoesNotBreakDigest(unittest.TestCase):
+    """YAML `.nan`/`.inf` — валидные числа; до фикса int() бросал
+    ValueError/OverflowError на строке :1713 ВНЕ try вокруг _run_digest →
+    дайджест падал каждый цикл (и копил 3-strike)."""
+
+    def test_nan_and_inf_max_per_location(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=bad), _tmp_db() as db_path:
+                s = Storage(db_path)
+                s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+                s.close()
+
+                _insert_deferred_item(
+                    db_path, "Ok", "https://ex.com/ok",
+                    "2025-01-01 12:00", "2025-01-01T12:00:00+00:00", score=9,
+                )
+
+                p = _mk_pipeline(
+                    db_path,
+                    digest_cfg={
+                        "enabled": True, "max_items": 10,
+                        "max_items_per_message": 20,
+                        "max_per_location": bad,
+                    },
+                )
+                delivery = MagicMock()
+                delivery.send_text.return_value = True
+                p.delivery = delivery
+
+                with self.assertLogs("newsbot.pipeline", level="WARNING") as cm:
+                    count = p.run_digest(force=True)
+
+                self.assertEqual(count, 1, f"{bad!r}: дайджест не должен падать")
+                self.assertEqual(p.storage.get_meta("digest_failure_count"), "0")
+                self.assertTrue(
+                    any("не конечное число" in m for m in cm.output),
+                    f"{bad!r}: ожидался warning, получено {cm.output}",
+                )
+                self.assertIn(
+                    "https://ex.com/ok",
+                    {i.url for i in p.storage.get_all_by_state("digested")},
+                )
+                p.storage.close()
+                p.close()
 
 
 if __name__ == "__main__":

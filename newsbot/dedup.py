@@ -33,6 +33,7 @@ r"""
 NOTE: дедуп по точному URL (primary key) — permanent, всегда активен.
 """
 import logging
+import math
 import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -70,6 +71,109 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
     except Exception as e:
         logger.warning("Доменный дедуп: ошибка, fail-open: %s", e)
         return False
+
+
+# ─── Защищённый разбор dedup.* из конфига ─────────────────────────────────────
+# Опечатка в config.yaml (window_days: 3d, threshold: high, cross_source: "false")
+# не должна ронять filter_new внутри цикла (иначе каждый цикл обрывается до
+# save_many → новости не сохраняются). Невалидное значение → warning + дефолт.
+
+# Границы «разумности» для окна дедупа (дней): 0/отрицательное молча выключало
+# бы кросс-источниковый дедуп, поэтому трактуем как дефолт-минимум 1 день.
+MIN_DEDUP_WINDOW_DAYS = 1
+# Верхняя граница окна. Дефолт — 3 дня; кросс-источниковые дубли старше месяца
+# практически не встречаются (retention/доставка работают на порядок уже окна).
+# Опечатка вроде window_days: 300 не должна сканировать заголовки за год.
+MAX_DEDUP_WINDOW_DAYS = 30
+
+
+def _cfg_bool(config: dict, key: str, default: bool) -> bool:
+    """bool-поле dedup.*: bool как есть, int — как 0/1, строка — только true/1/yes/on."""
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    # YAML/JSON-конфиг может содержать 0/1 для булева поля. Раньше `cfg.get()`
+    # трактовал 0 как falsy; сохраняем это поведение без warning, иначе
+    # cross_source: 0 (дефолт True) молча ВКЛЮЧАЛ бы кросс-дедуп + спамил warning.
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off", ""):
+            return False
+    logger.warning(
+        "dedup.%s=%r — ожидалось true/false, используется дефолт %r",
+        key, value, default,
+    )
+    return default
+
+
+def _cfg_float(config: dict, key: str, default: float) -> float:
+    """float-поле dedup.*: невалидное значение → warning + дефолт."""
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        logger.warning(
+            "dedup.%s=%r — ожидалось число, используется дефолт %r",
+            key, value, default,
+        )
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "dedup.%s=%r — ожидалось число, используется дефолт %r",
+            key, value, default,
+        )
+        return default
+    if not math.isfinite(parsed):
+        # NaN/inf из конфига (например "nan") — невалидны для порогов.
+        logger.warning(
+            "dedup.%s=%r — не конечное число, используется дефолт %r",
+            key, value, default,
+        )
+        return default
+    return parsed
+
+
+def _cfg_int(config: dict, key: str, default: int) -> int:
+    """int-поле dedup.*: невалидное значение → warning + дефолт.
+
+    Нецелый float (2.9) не усекается молча: warning + округление ВНИЗ.
+    Консистентно с _cfg_float: разбираем через float (принимаем "3", "3.0"),
+    NaN/inf → дефолт. Но в отличие от порогов (где неверное значение молча
+    ломает дедуп), у окна дней намерение очевидно — floor безопаснее дефолта,
+    а warning сохраняет наблюдаемость опечатки.
+    """
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        logger.warning(
+            "dedup.%s=%r — ожидалось целое число, используется дефолт %r",
+            key, value, default,
+        )
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "dedup.%s=%r — ожидалось целое число, используется дефолт %r",
+            key, value, default,
+        )
+        return default
+    if not math.isfinite(parsed):
+        logger.warning(
+            "dedup.%s=%r — не конечное число, используется дефолт %r",
+            key, value, default,
+        )
+        return default
+    floored = int(math.floor(parsed))
+    if floored != parsed:
+        logger.warning(
+            "dedup.%s=%r — нецелое число, округлено вниз до %d",
+            key, value, floored,
+        )
+    return floored
 
 
 # ─── Предфильтр для fuzzy-дедупа ──────────────────────────────────────────────
@@ -258,8 +362,10 @@ def filter_new(
     Возвращает (new_items, total_count, dup_count).
     """
     cfg = dedup_config if dedup_config is not None else {}
-    cross_source = cfg.get("cross_source", True)
-    fuzzy = cfg.get("fuzzy", True)
+    # P1-фикс: защищённый разбор dedup.* — опечатка в config.yaml не должна
+    # ронять filter_new (иначе цикл обрывается до save_many → потери новостей).
+    cross_source = _cfg_bool(cfg, "cross_source", True)
+    fuzzy = _cfg_bool(cfg, "fuzzy", True)
     # NOTE: fuzzy выполняется ТОЛЬКО при cross_source=true (кросс-источниковый контекст).
     # При cross_source=false fuzzy игнорируется — это сохраняет семантику per-source
     # дедупа (иначе возникает неочевидное поведение: разные source, но fuzzy всё склеивает).
@@ -268,9 +374,21 @@ def filter_new(
     else:
         fuzzy_enabled = False  # явно выключаем при cross_source=false
 
-    threshold = float(cfg.get("threshold", 0.95))
-    token_threshold = float(cfg.get("token_threshold", 0.8))
-    window_days = int(cfg.get("window_days", 3))
+    threshold = _cfg_float(cfg, "threshold", 0.95)
+    token_threshold = _cfg_float(cfg, "token_threshold", 0.8)
+    window_days = _cfg_int(cfg, "window_days", 3)
+    if window_days < MIN_DEDUP_WINDOW_DAYS:
+        logger.warning(
+            "dedup.window_days=%r вне диапазона — используется %d",
+            window_days, MIN_DEDUP_WINDOW_DAYS,
+        )
+        window_days = MIN_DEDUP_WINDOW_DAYS
+    elif window_days > MAX_DEDUP_WINDOW_DAYS:
+        logger.warning(
+            "dedup.window_days=%r больше максимума — используется %d",
+            window_days, MAX_DEDUP_WINDOW_DAYS,
+        )
+        window_days = MAX_DEDUP_WINDOW_DAYS
 
     # Лимит выборки заголовков за окно. None/невалидное/отрицательное → 2000
     # (дефолт), 0 в конфиге → без лимита (только окно). Жёсткий LIMIT 500 молча

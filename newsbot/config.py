@@ -10,6 +10,7 @@
 """
 import copy
 import logging
+import math
 import os as _os
 import sys
 from pathlib import Path
@@ -239,6 +240,10 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
         if cfg[key] is None:
             cfg[key] = {}
 
+    # P1-фикс: валидация telegram.poll_timeout (тип/диапазон/кламп) —
+    # после guard'ов секций, чтобы работал уже нормализованный dict.
+    _validate_telegram_poll_timeout(cfg)
+
     # ── Telegram: .env поверх config.yaml ──
     # .env читается только для telegram.* — остальное из config.yaml
     env_token = telegram_token()
@@ -275,22 +280,25 @@ def _validate_llm_numeric_fields(cfg: Dict[str, Any]) -> None:
         return
 
     defaults = DEFAULT_CONFIG["llm"]
-    # (путь в llm-секции, тип; int — не bool)
+    # (путь в llm-секции, тип, нижняя граница, верхняя граница);
+    # int — не bool. P2-фикс: ±inf (валидный YAML float) и отрицательные
+    # значения раньше проходили валидацию (inf → OverflowError на каждом
+    # LLM-вызове, -1 в batch_size/max_tokens → невалидные запросы).
     spec = (
-        (("push_threshold",), int),
-        (("digest_threshold",), int),
-        (("max_retries",), int),
-        (("max_tokens",), int),
-        (("timeout_sec",), float),
-        (("temperature",), float),
-        (("daily_cost_limit",), float),
-        (("batch_size",), int),
-        (("max_per_cycle",), int),
-        (("balance", "threshold"), float),
-        (("balance", "check_interval_hours"), int),
+        (("push_threshold",), int, 0, 10),
+        (("digest_threshold",), int, 0, 10),
+        (("max_retries",), int, 0, 10),
+        (("max_tokens",), int, 1, 65536),
+        (("timeout_sec",), float, 1, 600),
+        (("temperature",), float, 0, 2),
+        (("daily_cost_limit",), float, 0, 100000),
+        (("batch_size",), int, 1, 1000),
+        (("max_per_cycle",), int, 0, 100000),
+        (("balance", "threshold"), float, 0, 1e9),
+        (("balance", "check_interval_hours"), int, 1, 8760),
     )
 
-    for path, expected in spec:
+    for path, expected, lo, hi in spec:
         container: Any = llm_cfg
         ok = True
         for part in path[:-1]:
@@ -315,12 +323,24 @@ def _validate_llm_numeric_fields(cfg: Dict[str, Any]) -> None:
         else:
             try:
                 if expected is int:
-                    converted = int(raw) if float(int(raw)) == float(raw) else None
+                    f = float(raw)
+                    converted = (
+                        int(f) if math.isfinite(f) and float(int(f)) == f else None
+                    )
                 else:
                     value = float(raw)
-                    converted = value if value == value else None  # отсекает NaN
+                    # P2: isfinite отсекает NaN и ±inf (inf — валидный YAML float,
+                    # но ломает httpx/таймауты: OverflowError на каждом вызове).
+                    converted = value if math.isfinite(value) else None
             except (TypeError, ValueError, OverflowError):
                 converted = None
+
+        if converted is not None and not (lo <= converted <= hi):
+            logger.warning(
+                "llm.%s=%r вне диапазона [%s..%s], используется дефолт %r",
+                ".".join(path), raw, lo, hi, default,
+            )
+            converted = None
 
         if converted is None:
             logger.warning(
@@ -334,6 +354,60 @@ def _validate_llm_numeric_fields(cfg: Dict[str, Any]) -> None:
             # Нормализуем к числу (например "9" → 9), чтобы потребители
             # конфига получали уже валидный тип.
             container[key] = converted
+
+
+# ── telegram.poll_timeout ─────────────────────────────────────────────────────
+# Верхняя граница long-poll getUpdates. От неё зависит join poller-потока при
+# graceful shutdown (join = poll_timeout + 5). При stop_grace_period 45s и
+# бюджете _POLLER_SHUTDOWN_BUDGET_SEC=40s значение >30 гарантий не даёт,
+# поэтому всё, что больше, клампим (P1-фикс).
+_MAX_TELEGRAM_POLL_TIMEOUT = 30
+
+
+def _validate_telegram_poll_timeout(cfg: Dict[str, Any]) -> None:
+    """
+    Валидация ``telegram.poll_timeout``: целое, 1.._MAX_TELEGRAM_POLL_TIMEOUT.
+
+    Невалидное значение (строка, bool, дробное, ≤0) → warning + дефолт.
+    Значение больше верхней границы → warning + кламп до _MAX_TELEGRAM_POLL_TIMEOUT
+    (чтобы poll-join гарантированно укладывался в shutdown-бюджет).
+
+    Правит cfg in-place.
+    """
+    tg_cfg = cfg.get("telegram")
+    if not isinstance(tg_cfg, dict) or "poll_timeout" not in tg_cfg:
+        return
+
+    default = DEFAULT_CONFIG["telegram"]["poll_timeout"]
+    raw = tg_cfg["poll_timeout"]
+
+    converted = None
+    if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+        try:
+            f = float(raw)
+            if math.isfinite(f) and f == int(f) and int(f) >= 1:
+                converted = int(f)
+        except (TypeError, ValueError, OverflowError):
+            converted = None
+
+    if converted is None:
+        logger.warning(
+            "telegram.poll_timeout=%r — ожидалось целое число >= 1, "
+            "используется дефолт %r",
+            raw, default,
+        )
+        tg_cfg["poll_timeout"] = default
+        return
+
+    if converted > _MAX_TELEGRAM_POLL_TIMEOUT:
+        logger.warning(
+            "telegram.poll_timeout=%r превышает максимум %d — клампим до %d "
+            "(иначе poller-join не укладывается в shutdown-бюджет)",
+            raw, _MAX_TELEGRAM_POLL_TIMEOUT, _MAX_TELEGRAM_POLL_TIMEOUT,
+        )
+        converted = _MAX_TELEGRAM_POLL_TIMEOUT
+
+    tg_cfg["poll_timeout"] = converted
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:

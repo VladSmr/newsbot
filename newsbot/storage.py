@@ -42,6 +42,52 @@ _TITLE_DEDUP_TTL_DAYS = 30
 # и не проверяются по title-dedup во избежание ложного схлопывания.
 MIN_TITLE_LEN = 3
 
+# Максимальная длина title, записываемого в БД (защита от враждебного RSS).
+# Раньше капился только summary — заголовок в сотни КБ раздувал строку БД,
+# UNIQUE-индекс по url/title и шёл в LLM (оплата токенов).
+# Дублируется в collector.MAX_TITLE_CHARS — держать значения синхронными.
+MAX_TITLE_CHARS = 500
+
+
+def _coerce_days(value, default: int, param_name: str = "retention_days") -> int:
+    """
+    Приводит retention-параметр (может прийти строкой из config.yaml) к int.
+
+    config.yaml читается как YAML/строка → retention_days: "90" давал
+    TypeError в timedelta() ещё ДО try-purge, из-за чего очистка не
+    выполнялась ни разу. Невалидное значение → осмысленный fallback (default).
+
+    Отрицательное значение (опечатка вида `retention_days: -1`) → ОТКАЗ
+    от применения + default. Раньше здесь стоял max(days, 0): -1 превращался
+    в 0, cutoff = now, и первый же purge сносил ВСЕ терминальные items
+    (delivered/skipped/failed/digested/deferred) — потеря данных из-за одной
+    опечатки в конфиге. Теперь такой конфиг логирует warning и работает как
+    default.
+
+    Ноль остаётся допустимым ЯВНЫМ значением «удалять сразу»: это осознанный
+    путь, используемый тестами и (теоретически) оператором для ручной чистки.
+    В prod-конфиге 0 попадает только при явном `retention_days: 0` — purge_items
+    логирует об этом warning, чтобы такой конфиг был заметен в логах.
+    """
+    if value is None:
+        return int(default)
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s: невалидное значение %r — используем %d",
+            param_name, value, int(default),
+        )
+        return int(default)
+    if days < 0:
+        logger.warning(
+            "%s: отрицательное значение %r — используем %d "
+            "(иначе cutoff=now и purge снёс бы все данные)",
+            param_name, value, int(default),
+        )
+        return int(default)
+    return days
+
 
 class Storage:
     """
@@ -68,6 +114,27 @@ class Storage:
     # не уничтожил ещё не обработанные новости. Терминальные состояния
     # чистятся по retention_days (сутки).
     DEFAULT_NEW_RETENTION_DAYS = 7
+    # Предельный возраст 'pending' (сутки). Pending — «в работе», но при
+    # ChatIdNotBoundError/BotBlocked retry_count НЕ растёт (P1-фикс не
+    # инкрементирует его для непоправимых ошибок), поэтому recover_stuck_pending
+    # (фильтр retry_count >= max_retries) такие items НЕ снимет, а purge_items
+    # раньше не трогал pending вообще → бэклог рос неограниченно, и после
+    # починки бота get_stuck_pending (без LIMIT) выливал его флудом.
+    # 7 суток: заведомо больше любого штатного цикла (порог retry — 60 с,
+    # окно 'new' — те же 7 дней), т.е. всё, что висит в pending неделю,
+    # уже не «в работе», а мёртвый груз. Терминализация в 'failed' (НЕ
+    # удаление): failed живёт по обычному retention_days, т.е. данные
+    # остаются доступны для разбора, а из retry-выборки item уходит.
+    PENDING_STALE_DAYS = 7
+    # Minor (волна 4): размер батча pending-терминализации в purge_items.
+    # Раньше один UPDATE на весь бэклог шёл в ОДНОЙ write-транзакции вместе с
+    # тремя DELETE: при десятках тысяч застрявших pending (недели блокировки
+    # бота) транзакция держала WAL write-lock секундами/минутами, и
+    # параллельные writers (poller) отваливались на «database is locked».
+    # Теперь pending переводится в 'failed' порциями по N строк, каждая
+    # порция — короткая отдельная транзакция; DELETE-фаза остаётся отдельной
+    # транзакцией (она отсекается индексом state+state_at и обычно мала).
+    PURGE_PENDING_BATCH_SIZE = 5000
 
     def __init__(self, db_path: Path, dedup_config: Optional[dict] = None):
         """
@@ -115,7 +182,17 @@ class Storage:
             try:
                 conn.execute("ROLLBACK")
             except Exception:
-                pass
+                # Minor (волна 4): ROLLBACK тоже упал — соединение отравлено
+                # (disk I/O error, сломанный файл, закрытый fd). Оставлять
+                # self._conn открытым нельзя: незавершённая транзакция держит
+                # write-lock, и все последующие BEGIN падают с «cannot start a
+                # transaction within a transaction» до рестарта процесса.
+                # Сбрасываем ссылку — _connect() лениво пересоздаст соединение.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._conn = None
             raise
 
     def _current_version(self) -> int:
@@ -1039,6 +1116,9 @@ class Storage:
         # Cap summary — защита от чрезмерных LLM-токенов и БД-размера.
         MAX_SUMMARY_CHARS = 6000
         summary = item.summary[:MAX_SUMMARY_CHARS]
+        # Cap title — враждебный RSS с заголовком в сотни КБ раздувал строку
+        # БД/UNIQUE-индекс и уходил в LLM (оплата токенов).
+        title = item.title[:MAX_TITLE_CHARS] if item.title else item.title
 
         try:
             with self._tx() as conn:
@@ -1052,7 +1132,7 @@ class Storage:
                     (
                         item.source,
                         item.url,
-                        item.title,
+                        title,
                         summary,
                         item.published,
                         getattr(item, "tags", None),
@@ -1140,6 +1220,7 @@ class Storage:
             with self._tx() as conn:
                 for item in items:
                     summary = item.summary[:MAX_SUMMARY_CHARS]
+                    title = item.title[:MAX_TITLE_CHARS] if item.title else item.title
                     normalized = item.title_normalized()
 
                     cur = conn.execute(
@@ -1152,7 +1233,7 @@ class Storage:
                         (
                             item.source,
                             item.url,
-                            item.title,
+                            title,
                             summary,
                             item.published,
                             getattr(item, "tags", None),
@@ -1413,19 +1494,17 @@ class Storage:
         Это предотвращает зависшие «мертвые» pending (например, при падении бота
         сразу после set_state(pending)), которые могли бы висеть часами.
 
-        Для retry_count < max_retries применяется порог 60 с (защита «в работе»).
+        ⚠️ Возрастной фильтр НЕ применяется: pending с retry_count < max_retries
+        НЕ трогаются здесь — их штатно подбирает get_stuck_pending() по порогу
+        retry_threshold_sec и они уходят в retry (переводить их в 'failed'
+        здесь означало бы ломать retry-механику).
 
         Args:
-            max_retries: лимит попыток
-            retry_threshold_sec: окно «зависания» для retry_count < max_retries.
-                                 Если None — DEFAULT_RETRY_THRESHOLD_SECONDS (60 с).
-                                 Для retry_count >= max_retries игнорируется.
+            max_retries: лимит попыток.
+            retry_threshold_sec: DEPRECATED, не используется (оставлен для
+                                 обратной совместимости вызовов из pipeline).
+                                 Возрастную выборку делает get_stuck_pending().
         """
-        if retry_threshold_sec is None:
-            retry_threshold_sec = self.DEFAULT_RETRY_THRESHOLD_SECONDS
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=retry_threshold_sec)
-        ).isoformat()
         now_iso = datetime.now(timezone.utc).isoformat()
         total = 0
         try:
@@ -1840,13 +1919,60 @@ class Storage:
         return row["value"] if row else default
 
     def set_meta(self, key: str, value: str) -> None:
-        """Пишет или обновляет ключ в meta. Полностью идемпотентна."""
-        conn = self._connect()
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            (key, value),
-        )
-        conn.commit()
+        """
+        Пишет или обновляет ключ в meta. Полностью идемпотентна.
+
+        Обёрнуто в _tx(): при ошибке commit соединение оставалось с открытой
+        транзакцией, и все последующие BEGIN падали с «cannot start a
+        transaction within a transaction» → записи отваливались до рестарта.
+        """
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
+    def _terminalize_stale_pending(
+        self, pending_cutoff: str, now_iso: str, batch_size: Optional[int] = None,
+    ) -> int:
+        """
+        Переводит застрявший pending (state_at < pending_cutoff) в 'failed'.
+
+        Minor (волна 4): делает это ПОРЦИЯМИ по batch_size строк, каждая
+        порция — отдельная короткая write-транзакция. Одним UPDATE на весь
+        бэклог нельзя: десятки тысяч строк под WAL write-lock блокировали
+        параллельных writers (poller) до «database is locked».
+
+        Условие `state_at < pending_cutoff` после UPDATE само себя исключает
+        (state_at = now_iso), поэтому цикл монотонно сходится; rowcount < batch
+        означает, что хвост выбран, — выходим.
+        """
+        size = batch_size or self.PURGE_PENDING_BATCH_SIZE
+        try:
+            size = max(1, int(size))
+        except (TypeError, ValueError):
+            size = self.PURGE_PENDING_BATCH_SIZE
+        total = 0
+        while True:
+            with self._tx() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE items
+                    SET state = 'failed', state_at = ?
+                    WHERE rowid IN (
+                        SELECT rowid FROM items
+                        WHERE state = 'pending'
+                          AND state_at < ?
+                        LIMIT ?
+                    )
+                    """,
+                    (now_iso, pending_cutoff, size),
+                )
+                updated = cur.rowcount
+            total += updated
+            if updated < size:
+                break
+        return total
 
     def purge_items(
         self,
@@ -1864,15 +1990,27 @@ class Storage:
             digest берёт топ-30 по score, остаток копился вечно).
           - 'delivered', 'skipped', 'failed', 'digested': терминальные items
             старше retention_days (классический purge).
-        'pending' — не удаляется (активный retry).
+        'pending' — не удаляется (активный retry). Но pending, который не
+        двигается (state_at не обновлялся) дольше PENDING_STALE_DAYS, —
+        терминализируется в 'failed' (см. ниже), НЕ удаляется: удаление
+        произойдёт обычным retention-окном уже для failed.
 
         Также вызывает prune_feedback_targets для очистки старых targets
         (feedback при этом СОХРАНЯЕТСЯ — обучающие данные).
         """
-        if retention_days is None:
-            retention_days = self.DEFAULT_RETENTION_DAYS
-        if deferred_retention_days is None:
-            deferred_retention_days = self.DEFAULT_DEFERRED_RETENTION_DAYS
+        retention_days = _coerce_days(
+            retention_days, self.DEFAULT_RETENTION_DAYS, "purge_items.retention_days",
+        )
+        if retention_days == 0:
+            logger.warning(
+                "purge_items: retention_days=0 — все терминальные items "
+                "будут удалены немедленно (осознанный путь? проверьте конфиг)",
+            )
+        deferred_retention_days = _coerce_days(
+            deferred_retention_days,
+            self.DEFAULT_DEFERRED_RETENTION_DAYS,
+            "purge_items.deferred_retention_days",
+        )
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=retention_days)
         ).isoformat()
@@ -1881,13 +2019,32 @@ class Storage:
         ).isoformat()
         # 'new' живут минимум DEFAULT_NEW_RETENTION_DAYS дней, даже если
         # retention_days передан как 0 (например, из тестов).
-        new_retention_days = max(int(retention_days or 0), self.DEFAULT_NEW_RETENTION_DAYS)
+        new_retention_days = max(retention_days, self.DEFAULT_NEW_RETENTION_DAYS)
         cutoff_new = (
             datetime.now(timezone.utc) - timedelta(days=new_retention_days)
         ).isoformat()
+        # Застрявший pending: state_at не двигался PENDING_STALE_DAYS дней.
+        pending_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=self.PENDING_STALE_DAYS)
+        ).isoformat()
+        now_iso = datetime.now(timezone.utc).isoformat()
 
         total_deleted = 0
+        pending_failed = 0
         try:
+            # Pending-терминализация (НЕ удаление): защита от роста бэклога,
+            # когда retry_count не инкрементируется (ChatIdNotBoundError /
+            # BotBlocked) — такие items не снимет recover_stuck_pending
+            # (его фильтр retry_count >= max_retries) и не удалит purge.
+            # state_at обновляется при каждом переходе в pending, поэтому
+            # «state_at старше N дней» = item не двигается N дней.
+            # Minor (волна 4): вынесено ИЗ общей _tx и выполняется батчами
+            # (см. _terminalize_stale_pending) — иначе один UPDATE на весь
+            # бэклог держал write-lock вместе с тремя DELETE.
+            pending_failed = self._terminalize_stale_pending(
+                pending_cutoff, now_iso,
+            )
+
             with self._tx() as conn:
                 # терминальные (retention_days)
                 cur = conn.execute(
@@ -1923,6 +2080,12 @@ class Storage:
                 deferred_del = cur_def.rowcount
 
                 total_deleted = terminal_del + new_del + deferred_del
+            if pending_failed:
+                logger.warning(
+                    "purge_items: %d застрявших pending (state_at старше %d дней) "
+                    "переведены в 'failed' — retry-выборка их больше не подберёт",
+                    pending_failed, self.PENDING_STALE_DAYS,
+                )
             if total_deleted:
                 parts = []
                 if terminal_del:
@@ -2256,9 +2419,35 @@ class Storage:
 
         Returns:
             Количество удалённых feedback_targets. feedback не затрагивается.
+
+        Невалидный (не приводимый к int) older_than_days → 0 и warning,
+        БЕЗ удаления: feedback_targets — данные для кнопок, сносить их
+        из-за опечатки в конфиге нельзя.
+
+        older_than_days <= 0 → 0 и warning, БЕЗ удаления. Раньше здесь стоял
+        max(days, 0): -1 (опечатка `feedback.retention_days: -1`) давал
+        cutoff = now и сносил ВСЕ targets — кнопки под старыми сообщениями
+        переставали работать, что прямо противоречило докстрингу «невалидный
+        → без удаления». 0 теперь тоже трактуется как «не чистить»:
+        осмысленного «удалить всё» для кнопок не существует.
         """
+        try:
+            days = int(older_than_days)
+        except (TypeError, ValueError):
+            logger.warning(
+                "prune_feedback_targets: невалидный older_than_days=%r — пропуск",
+                older_than_days,
+            )
+            return 0
+        if days <= 0:
+            logger.warning(
+                "prune_feedback_targets: older_than_days=%r (<=0) — пропуск, "
+                "targets не удаляются",
+                older_than_days,
+            )
+            return 0
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=older_than_days)
+            datetime.now(timezone.utc) - timedelta(days=days)
         ).isoformat()
         try:
             with self._tx() as conn:
@@ -2270,7 +2459,7 @@ class Storage:
             if deleted:
                 logger.info(
                     "prune_feedback_targets: удалено %d targets (старше %d дней)",
-                    deleted, older_than_days,
+                    deleted, days,
                 )
             return deleted
         except Exception as e:
@@ -2398,6 +2587,7 @@ class Storage:
         now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         MAX_SUMMARY_CHARS = 6000
         summary = item.summary[:MAX_SUMMARY_CHARS]
+        title = item.title[:MAX_TITLE_CHARS] if item.title else item.title
 
         try:
             with self._tx() as conn:
@@ -2411,7 +2601,7 @@ class Storage:
                     (
                         item.source,
                         item.url,
-                        item.title,
+                        title,
                         summary,
                         item.published,
                         getattr(item, "tags", None),

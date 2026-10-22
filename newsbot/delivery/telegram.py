@@ -20,6 +20,21 @@ logger = logging.getLogger("newsbot.delivery.telegram")
 _TG_MESSAGE_MAX = 4096
 _TG_URL_MAX = 1024   # Telegram inline-кнопка URL ≤ 1024
 
+# Telegram меряет длину текста в UTF-16 code units, а не в code points.
+# Для BMP-символов 1 code point = 1 unit, для не-BMP (эмодзи и т.п.) — 2 units.
+# Поэтому все проверки «влезает ли в лимит» считаем в UTF-16 units.
+_UTF16_BYTES_PER_UNIT = 2
+
+# Минимально возможная длина одного экранированного символа — &quot; (6 симв.).
+# Нужна как нижняя граница usable, иначе жёсткий срез не сможет отдать
+# даже один символ и зациклится/превысит лимит.
+_MIN_ESCAPED_CHAR_UNITS = 6
+
+
+def _utf16_units(s: str) -> int:
+    """Длина строки в UTF-16 code units (как её считает Telegram)."""
+    return len(s.encode("utf-16-le")) // _UTF16_BYTES_PER_UNIT
+
 # ── Pacing: защита от 429 Too Many Requests ───────────────────────────────────
 # Пауза между исходящими сообщениями (Telegram rate limit ~30 msg/sec).
 # 0.6 с — достаточно для заполнения burst bucket'а без превышения лимита.
@@ -363,8 +378,9 @@ class TelegramDelivery:
         Каждая часть ≤ _TG_MESSAGE_MAX.
         Формат: title + body + footer (+ inline-кнопка только в последней части).
 
-        N2-фикс: truncate ДО html.escape, чтобы избежать обрыва сущностей
-        (&am → &amp или &l → &lt→&amp;lt). Порядок: truncate → escape → split.
+        N2/P1-фикс: truncate и split — ДО html.escape, чтобы избежать обрыва
+        сущностей (&am → &amp или &l → &lt→&amp;lt). Порядок:
+        truncate → (fit-check по escaped) → split по СЫРОМУ → escape чанков.
         """
         # ── N2: truncate ДО html.escape (poison-message prevention) ──
         _MAX_RAW_TITLE = 250  # до escape, чтобы избежать обрыва сущностей
@@ -405,7 +421,7 @@ class TelegramDelivery:
         part_text = f"{title}\n\n{escaped_summary}\n\n{footer}"
 
         # если влезает в одно сообщение — экранированный текст уже готов
-        if len(part_text) <= _TG_MESSAGE_MAX:
+        if _utf16_units(part_text) <= _TG_MESSAGE_MAX:
             payload = self._make_payload(
                 title, escaped_summary, footer,
                 has_button=has_button, url=safe_url, is_last=True,
@@ -413,8 +429,10 @@ class TelegramDelivery:
             )
             return [payload]
 
-        # не влезает — передаём экранированный summary в _split_text
-        return self._split_text(title, escaped_summary, footer, has_button, safe_url, fbtid)
+        # не влезает — передаём СЫРОЙ summary в _split_text.
+        # P1-фикс: режем сырой текст, а экранируем каждый чанк отдельно
+        # (иначе срез экранированного текста рвёт сущность → Telegram 400).
+        return self._split_text(title, raw_body, footer, has_button, safe_url, fbtid)
 
     def _make_payload(self, title: str, body_esc: str, footer: str,
                       has_button: bool, url: str, is_last: bool,
@@ -455,64 +473,92 @@ class TelegramDelivery:
                 payload["reply_markup"] = {"inline_keyboard": rows}
         return payload
 
-    def _split_text(self, title_esc: str, body_esc: str,
+    def _split_text(self, title_esc: str, body_raw: str,
                     footer_esc: str, has_button: bool, url: str,
                     feedback_target_id: Optional[int] = None) -> List[dict]:
         """
-        Разбивает ЭКРАНИРОВАННЫЙ body (body_esc) на части <= _TG_MESSAGE_MAX.
-        Все аргументы уже прошли html.escape() в вызывающей стороне.
+        Разбивает СЫРОЙ (неэкранированный) body на части <= _TG_MESSAGE_MAX.
+        title_esc/footer_esc уже прошли html.escape() в вызывающей стороне,
+        body_raw — НЕТ: каждый чанк экранируется отдельно.
+
+        P1-фикс: раньше резался УЖЕ экранированный body, поэтому жёсткий срез
+        мог попасть внутрь сущности (&quot; / &#x27; / &amp;) → Telegram 400
+        «can't parse entities» → item уходил в failed после 8 ретраев (потеря
+        новости). Теперь границы чанков считаются по длине html.escape(чанк),
+        а срез всегда делается по СЫРОМУ тексту.
+
         Greedy: каждая часть наполняется пока влезает, затем следующая.
         Суффикс "(i/n)" и кнопка (только в последней) учтены в overhead.
 
-        Клавиатура (URL + 👍/👎) добавляется ТОЛЬКО на последнюю часть:
-          - избегаем «кнопки на каждом куске»;
-          - feedback_target_id не зависит от номера части;
-          - Telegram гарантирует, что callback приходит по message_id последнего
-            сообщения (при отправке нескольких — Telegram использует последний).
+        Клавиатура (URL + 👍/👎) добавляется ТОЛЬКО на последнюю часть.
 
         C2-фикс: title/source усекаются ДО html.escape() в _build_message_parts
         (_MAX_RAW_TITLE=250, _MAX_RAW_FOOTER_SOURCE=100), поэтому здесь
-        экранированные title_esc/footer_esc УЖЕ ограничены и НЕ нуждаются
-        в повторном усечении. Повторное усечение title_esc при наличии &/</>/"
-        может обрезать сущность (&am → &amp → Telegram 400). Не усекаем.
+        title_esc/footer_esc УЖЕ ограничены и не нуждаются в повторном усечении.
         """
         result: List[dict] = []
 
-        # C2: лимиты уже заданы ДО escape в _build_message_parts —
-        # title/source обрезаны по байтам ДО html.escape,
-        # поэтому title_esc/footer_esc гарантированно не содержат
-        # незавершённых сущностей и НЕ требуют повторного усечения.
-        # Оставляем их как есть.
+        # overhead считается по экранированным title/footer + разделители.
+        # 4 = 2×"\n" (после title и после body) + пустая строка.
+        # Суффикс "(i/n)" считается ДИНАМИЧЕСКИ: его длина зависит от числа
+        # частей, а при ≥100 частях старая константа "+12" не хватала.
+        base_overhead = _utf16_units(title_esc) + _utf16_units(footer_esc) + 4
 
-        # overhead считается по экранированным title/footer + suffix
-        overhead = len(title_esc) + len(footer_esc) + 12   # 12 ~ "(99/99)" + margin
-        usable = _TG_MESSAGE_MAX - overhead
-        # B7: гарантируем usable >= 1 — иначе _split_paragraph с max_len<=0 зациклится
-        usable = max(usable, 1)
+        def _pack(suffix_units: int) -> List[str]:
+            """Укладывает body в части с учётом резерва под суффикс."""
+            usable = _TG_MESSAGE_MAX - base_overhead - suffix_units
+            # B7: гарантируем usable ≥ 1 (иначе разбиение зациклится),
+            # но не меньше минимальной длины экранированного символа —
+            # иначе _hard_slice_raw не сможет отдать ни одного символа.
+            usable = max(usable, _MIN_ESCAPED_CHAR_UNITS)
 
-        # разбиваем body по абзацам, бьём oversized-абзацы
-        chunks: List[str] = []
-        for para in body_esc.split("\n\n"):
-            if not para.strip():
-                continue
-            if len(para) > usable:
-                chunks.extend(self._split_paragraph(para, usable))
-            else:
-                chunks.append(para)
+            # разбиваем СЫРОЙ body по абзацам, бьём oversized-абзацы.
+            # chunks хранит УЖЕ экранированные куски (каждый — валидный HTML).
+            chunks: List[str] = []
+            for para in (body_raw or "").split("\n\n"):
+                if not para.strip():
+                    continue
+                para_esc = html.escape(para)
+                if _utf16_units(para_esc) <= usable:
+                    chunks.append(para_esc)
+                else:
+                    chunks.extend(self._split_paragraph(para, usable))
 
-        # greedy packing; result хранит (body_esc, is_last)
-        buf = ""
-        for chunk in chunks:
-            if not buf:
-                buf = chunk
-            elif len(buf) + 2 + len(chunk) + len(title_esc) + len(footer_esc) + 4 + 12 <= _TG_MESSAGE_MAX:
-                buf += "\n\n" + chunk
-            else:
-                result.append((buf, False))
-                buf = chunk
+            # greedy packing
+            packed: List[str] = []
+            buf = ""
+            for chunk in chunks:
+                if not buf:
+                    buf = chunk
+                elif (_utf16_units(buf) + 2 + _utf16_units(chunk)
+                      + base_overhead + suffix_units <= _TG_MESSAGE_MAX):
+                    buf += "\n\n" + chunk
+                else:
+                    packed.append(buf)
+                    buf = chunk
+            if buf:
+                packed.append(buf)
+            return packed
 
-        if buf:
-            result.append((buf, True))   # последняя — с кнопкой
+        # Итеративно уточняем резерв под суффикс: число частей зависит от
+        # резерва, а резерв — от числа частей. Резерв только РАСТЁТ
+        # (монотонно), поэтому цикл сходится за 1–3 итерации.
+        total_hint = 1
+        packed: List[str] = []
+        for _ in range(10):
+            suffix_units = _utf16_units(f" ({total_hint}/{total_hint})") if total_hint > 1 else 0
+            packed = _pack(suffix_units)
+            # Достаточно, если частей не больше, чем предполагали: тогда
+            # фактический суффикс "(i/total)" не длиннее зарезервированного.
+            if len(packed) <= total_hint:
+                break
+            total_hint = len(packed)
+        else:
+            # Страховка от расхождения: резервируем с запасом на 2 знака.
+            packed = _pack(_utf16_units(f" ({len(packed)}/{len(packed)})") + 2)
+
+        if packed:
+            result = [(part, i == len(packed) - 1) for i, part in enumerate(packed)]
 
         # проставить суффиксы и построить финальные payload'ы
         total = len(result)
@@ -532,34 +578,90 @@ class TelegramDelivery:
 
     def _split_paragraph(self, para: str, max_len: int) -> List[str]:
         """
-        Бьёт длинный абзац по предложениям.
-        Если отдельное предложение длиннее max_len — жёсткий срез (chunk > max_len
-        невозможен, иначе _split_text получит oversized chunk и первая часть превысит 4096).
+        Бьёт длинный СЫРОЙ абзац на куски, у которых html.escape(кусок) ≤ max_len.
+
+        Режем СЫРЫЙ текст и экранируем каждый кусок ОТДЕЛЬНО — это гарантирует,
+        что сущность (&quot; / &#x27; / &amp; / &lt;) никогда не окажется разорвана
+        границей чанка (P1: иначе Telegram 400 «can't parse entities» и потеря
+        новости после 8 ретраев).
+
+        Приоритет границ: предложение → слово → жёсткий срез по символам
+        (жёсткий срез тоже по сырому тексту).
         """
         parts: List[str] = []
 
-        def _emit(b: str) -> None:
-            """Emit chunk: slice to max_len before append, repeat until fits."""
-            b = b.strip()
-            while len(b) > max_len:
-                parts.append(b[:max_len].rstrip())
-                b = b[max_len:].lstrip()
-            if b:
-                parts.append(b)
+        def _emit(unit: str) -> None:
+            """Кладёт один юнит; если не влезает — режет по словам/символам."""
+            unit = unit.strip()
+            if not unit:
+                return
+            if _utf16_units(html.escape(unit)) <= max_len:
+                parts.append(html.escape(unit))
+                return
+            # юнит длиннее лимита — режем по словам
+            buf = ""
+            for word in unit.split():
+                candidate = (buf + " " + word) if buf else word
+                if _utf16_units(html.escape(candidate)) <= max_len:
+                    buf = candidate
+                    continue
+                if buf:
+                    parts.append(html.escape(buf))
+                    buf = ""
+                if _utf16_units(html.escape(word)) <= max_len:
+                    buf = word
+                else:
+                    parts.extend(self._hard_slice_raw(word, max_len))
+            if buf:
+                parts.append(html.escape(buf))
 
         buf = ""
         for sent in re.split(r"(?<=[.!?])\s+", para):
             if not sent.strip():
                 continue
-            if buf and len(buf) + len(sent) + 1 > max_len:
+            candidate = (buf + " " + sent).strip() if buf else sent
+            if _utf16_units(html.escape(candidate)) <= max_len:
+                buf = candidate
+            else:
                 _emit(buf)   # всегда безопасно: _emit режет до max_len
                 buf = sent
-            else:
-                buf = (buf + " " + sent).strip()
 
         if buf.strip():
             _emit(buf)   # финальный буфер — тот же хелпер
         return parts
+
+    @staticmethod
+    def _hard_slice_raw(text: str, max_len: int) -> List[str]:
+        """
+        Жёсткий срез СЫРОГО текста на куски, каждый из которых после
+        html.escape() не длиннее max_len. Возвращает УЖЕ экранированные куски.
+        """
+        out: List[str] = []
+        rest = text
+        while rest:
+            lo, hi, best = 1, len(rest), 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if _utf16_units(html.escape(rest[:mid])) <= max_len:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best <= 0:
+                # max_len меньше длины экранированного одного символа
+                # (&quot; = 6 units). Валидного среза не существует —
+                # отдаём один символ, чтобы не зациклиться, и явно
+                # сигнализируем аномалию в лог (usable клампится в
+                # _split_text, поэтому на практике сюда не попадаем).
+                logger.warning(
+                    "_hard_slice_raw: max_len=%d < минимальной длины "
+                    "экранированного символа — чанк неизбежно превысит лимит",
+                    max_len,
+                )
+                best = 1
+            out.append(html.escape(rest[:best]))
+            rest = rest[best:]
+        return out
 
     # ── HTTP-вызовы ──────────────────────────────────────────────────────────
 

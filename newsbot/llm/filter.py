@@ -585,7 +585,9 @@ class LLMFilter:
                 continue
 
             # ── summary (per-item валидация) ─────────────────────────
-            summary = str(item_raw.get("summary", "")).strip()
+            # P4-фикс: `or ""` вместо дефолта в get() — JSON null → "None",
+            # такой литерал проходил валидацию и уходил в дайджест.
+            summary = str(item_raw.get("summary") or "").strip()
             if not summary:
                 logger.warning(
                     "Батч item id=%d: пустой summary → ok=False",
@@ -594,7 +596,7 @@ class LLMFilter:
                 results[index] = FilterResult(ok=False)
                 continue
 
-            reason = str(item_raw.get("reason", "")).strip()
+            reason = str(item_raw.get("reason") or "").strip()
 
             # ── urgent (per-item валидация, tolerant) ─────────────────
             raw_urgent = item_raw.get("urgent")
@@ -1005,14 +1007,14 @@ class LLMFilter:
             )
             return FilterResult(ok=False)
 
-        summary = str(raw.get("summary", "")).strip()
+        summary = str(raw.get("summary") or "").strip()
         if not summary:
             logger.warning(
                 "LLM вернул пустой summary → fallback: шлём непрофильтрованным"
             )
             return FilterResult(ok=False)
 
-        reason = str(raw.get("reason", "")).strip()
+        reason = str(raw.get("reason") or "").strip()
 
         # ── T2-11: парсинг флага urgent ───────────────────────────────
         # Принимаем: bool, "true"/"false" (case-insensitive), 1/0 (int).

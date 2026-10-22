@@ -288,6 +288,11 @@ def main():
     )
     args = parser.parse_args()
 
+    # P2-фикс: --bind без --set-chat-id раньше молча игнорировался →
+    # запускался демон (пользователь ждал привязку чата). Явная ошибка.
+    if args.bind and not args.set_chat_id:
+        parser.error("--bind requires --set-chat-id")
+
     # ── диагностические команды — без полного pipeline ──
     if args.version:
         print(f"newsbot {__version__}")
@@ -428,9 +433,13 @@ def main():
         logger.info("Завершение: останавливаем poller...")
         if _poller is not None:
             shutdown_deadline = time.monotonic() + _POLLER_SHUTDOWN_BUDGET_SEC
-            _poller.stop()   # stop → join с таймаутом poll_timeout+5 с
             remaining = max(0.0, shutdown_deadline - time.monotonic())
+            # P1-фикс: stop() получает ОСТАТОК бюджета и делает
+            # join(min(poll_timeout+5, remaining)) — раньше join(poll_timeout+5)
+            # выполнялся ДО расчёта remaining, и бюджет 40 с не был жёстким.
+            _poller.stop(max_join=remaining)
             # close(): остаток дедлайна вместо повторного полного join
+            remaining = max(0.0, shutdown_deadline - time.monotonic())
             _poller.close(join_timeout=remaining)
         pipeline.close()
         if _LOCK_FILE is not None:
