@@ -5,6 +5,7 @@ DeepSeek API-клиент (OpenAI-compatible).
 """
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -20,12 +21,21 @@ logger = logging.getLogger("newsbot.llm.client")
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    """Безопасное преобразование в int. При ошибке — default."""
+    """Безопасное преобразование в int. При ошибке — default.
+
+    Major-фикс: usage-поля из ответа API могут быть Infinity/NaN (битый или
+    нестандартный ответ). ``int(float('inf'))`` бросает OverflowError, который
+    не перехватывался → LLMError → валидный content выбрасывался. Usage —
+    вспомогательные данные (cost-guard), они не должны ронять разбор ответа:
+    невалидное число → default.
+    """
     if value is None:
+        return default
+    if isinstance(value, float) and not math.isfinite(value):
         return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 

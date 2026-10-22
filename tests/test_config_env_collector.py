@@ -836,4 +836,104 @@ class TestConfigTelegramPollTimeout:
             assert cfg["telegram"]["poll_timeout"] == 25, bad
 
 
+# ── poll_interval_minutes: тип/диапазон/кламп (MAJOR: рестарт-луп демона) ────
+
+
+class TestConfigPollInterval:
+    """
+    MAJOR-фикс: poll_interval_minutes валидируется при загрузке конфига.
+
+    Раньше строка "15" или null доезжали до демона, где `slept >= interval`
+    падал TypeError'ом ВНЕ try → процесс умирал → restart: unless-stopped →
+    вечный рестарт-луп.
+    """
+
+    def test_string_is_coerced_to_int(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text('poll_interval_minutes: "15"\n', encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["poll_interval_minutes"] == 15
+        assert isinstance(cfg["poll_interval_minutes"], int)
+        assert not [r for r in caplog.records if "poll_interval" in r.getMessage()]
+
+    def test_null_falls_back_to_default_with_warning(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("poll_interval_minutes: null\n", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["poll_interval_minutes"] == 15
+        assert any(
+            "poll_interval_minutes" in r.getMessage() for r in caplog.records
+        )
+
+    def test_non_numeric_falls_back_to_default(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "poll_interval_minutes: often\n", encoding="utf-8"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["poll_interval_minutes"] == 15
+        assert any(
+            "poll_interval_minutes" in r.getMessage() for r in caplog.records
+        )
+
+    def test_zero_and_negative_are_clamped_to_one(self, tmp_path):
+        from newsbot.config import load_config
+
+        for bad in ("0", "-5", 0, -5):
+            cfg_file = tmp_path / "config.yaml"
+            cfg_file.write_text(
+                f"poll_interval_minutes: {bad}\n", encoding="utf-8"
+            )
+            cfg = load_config(str(cfg_file))
+            assert cfg["poll_interval_minutes"] == 1, bad
+
+    def test_too_large_is_clamped_to_max(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "poll_interval_minutes: 1500\n", encoding="utf-8"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["poll_interval_minutes"] == 240
+        assert any(
+            "poll_interval_minutes" in r.getMessage() for r in caplog.records
+        )
+
+    def test_bool_is_rejected(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("poll_interval_minutes: true\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert cfg["poll_interval_minutes"] == 15
+
+
 # --

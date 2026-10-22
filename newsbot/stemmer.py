@@ -19,20 +19,30 @@ STOP_WORDS = {
 CONSONANTS = frozenset('bcdfghjklmnpqrstvwxyz')
 VOWELS = frozenset('aeiou')
 
-# Плюралисы на -us (лат./греч. основы): снимаем -es, а не только -s.
-# Регрессия волны 2: общее правило «-es = немое e + s, снимаем только -s»
-# верно для case/response/house (основы на -se/-use), но для основ на -us
-# давало viruse/statuse/buse — расходилось с единственным числом
-# (virus/status/bus) и ломало склейку перепечаток. Набор явный и узкий:
-# основы на -use/-ous (house→house, purpose→purpose) остаются нетронутыми,
-# т.к. там -e действительно часть корня.
-_ES_TO_US_PLURALS = frozenset({
-    'viruses',      # virus
-    'statuses',     # status
-    'buses',        # bus
-    'censuses',     # census
-    'consensuses',  # consensus
-    'crocuses',     # crocus
+# Единственное число существительных на -us (лат./греч. основы). Один набор
+# используют ДВЕ ветки, чтобы singular/plural/past одного слова сходились в
+# один стем:
+#
+#   -es:  viruses→virus, statuses→status, focuses→focus, campuses→campus,
+#         bonuses→bonus, geniuses→genius (иначе было бы viruse/focuse/…);
+#   -ed:  focused→focus (немое -e НЕ восстанавливаем), но caused→caus+e=cause,
+#         paused→pause, housed→house, aroused→arouse — там база (caus/paus/
+#         hous/arous) в набор НЕ входит, т.к. это основа глагола на -se без
+#         немого -e, а не существительное на -us.
+#
+# Ключевой инвариант: в наборе лежат ПОЛНЫЕ слова на -us (focus, status, bus),
+# а не «база без -ed» — поэтому базы -se-глаголов (caus/paus/hous/arous/us/
+# abus/confus/…) в него не попадают автоматически. Прежний признак
+# `base.endswith('us')` ловил и focus, и caus — из-за чего caused→caus,
+# а causes→cause расходились по стемам. Набор намеренно узкий и новостной:
+# основы на -use/-ous (house, purpose, cause, pause) и прилагательные на -ous
+# обрабатываются общими правилами (−ous снимается выше, house/purpose
+# сохраняют -e).
+_US_SINGULARS = frozenset({
+    'focus', 'status', 'campus', 'virus', 'bonus', 'census', 'consensus',
+    'crocus', 'surplus', 'stimulus', 'apparatus', 'corpus', 'octopus',
+    'prospectus', 'impetus', 'hiatus', 'exodus', 'locus', 'radius', 'genius',
+    'bus',
 })
 
 
@@ -96,12 +106,16 @@ def _stem_word(w: str) -> str:
             base = base[:-1]
         # восстанавливаем немое -e: raised→raise (rais), used→use (us).
         # Без этого raised→rais, а raise→raise — расходятся по стемам.
-        # Исключение: основы на -us (focus, status) — там -ed снимается как есть.
+        # Исключение: существительные на -us из _US_SINGULARS (focus, status) —
+        # там -ed снимается как есть (focused→focus), немого -e в корне нет.
+        # Проверяем вхождение в набор, а не `base.endswith('us')`: иначе под
+        # исключение попадали базы -se-глаголов (caus/paus/hous/arous) и
+        # caused→caus, тогда как causes→cause — расхождение стемов.
         elif (
             len(base) >= 2
             and base.endswith('s')
             and base[-2] in VOWELS
-            and not (len(base) > 2 and base.endswith('us'))
+            and base not in _US_SINGULARS
         ):
             base += 'e'
         return base
@@ -116,8 +130,11 @@ def _stem_word(w: str) -> str:
     # и case/cases, rate/rates расходились по кластерам, из-за чего
     # domain-дедуп не склеивал перепечатку.
     if w.endswith('es') and len(w) > 3:
-        # -us-плюралисы: снимаем -es целиком (viruses→virus, buses→bus)
-        if w in _ES_TO_US_PLURALS:
+        # -us-существительные: снимаем -es целиком (viruses→virus, buses→bus,
+        # focuses→focus, campuses→campus, bonuses→bonus). Проверка по полному
+        # слову без -es: базы -se-глаголов (hous/paus/caus) в набор не входят,
+        # поэтому houses→house, pauses→pause, causes→cause идут обычным -s.
+        if w[:-2] in _US_SINGULARS:
             return w[:-2]
         if w.endswith(('sses', 'ches', 'shes', 'xes', 'zzes')):
             return w[:-2]

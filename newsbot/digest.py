@@ -4,7 +4,7 @@
 Формирует текстовые сообщения для отправки владельцу:
   — собирает deferred items (top-N по llm_score DESC)
   — группирует items по категориям (фиксированный порядок секций)
-  — разбивает на блоки по max_items_per_message и лимиту 4096 символов
+  — разбивает на блоки по max_items_per_message и лимиту 4096 UTF-16 units
   — HTML-экранирование всех пользовательских данных
   — URL-whitelist: только http:// / https://
 
@@ -19,7 +19,14 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from .delivery import Delivery, format_time_utc
-from .delivery.telegram import is_valid_http_url
+# _utf16_units: Telegram меряет лимит 4096 в UTF-16 code units, а не в code
+# points. Для BMP 1 cp == 1 unit, для не-BMP (эмодзи, 🔗) — 2 units.
+# Поэтому ВСЕ оценки бюджета дайджеста обязаны считаться в units, иначе
+# страница с ≥20 эмодзи-футерами проходит локальную проверку и получает
+# от Telegram 400 «message is too long» → items остается deferred →
+# детерминированный повтор каждое окно. Берём общий helper из telegram.py —
+# единственный источник истины для лимита (не дублируем формулу).
+from .delivery.telegram import _utf16_units, is_valid_http_url
 
 # Тип для кнопок одной новости в дайджесте
 DigestItemButtons = List[dict]  # [{url, target_id}, ...]
@@ -35,7 +42,7 @@ logger = logging.getLogger("newsbot.digest")
 # транзиентный ImportError не запирает процесс в fallback навсегда.
 _INFER_CATEGORY_UNAVAILABLE: bool = False
 
-# Лимит Telegram-сообщения
+# Лимит Telegram-сообщения (в UTF-16 code units — так его меряет Bot API)
 _TG_MESSAGE_MAX = 4096
 # Резерв на футер + запас
 _MARGIN = 20
@@ -273,13 +280,13 @@ def build_digest_messages(
 
     def _entry_size(title_raw: str, source_raw: str, body_raw: str,
                     footer_raw: str) -> int:
-        """Верхняя оценка размера entry после HTML-escape."""
+        """Верхняя оценка размера entry после HTML-escape (в UTF-16 units)."""
         return (
-            len(f"<b>{html.escape(title_raw)} — {html.escape(source_raw)}</b>")
+            _utf16_units(f"<b>{html.escape(title_raw)} — {html.escape(source_raw)}</b>")
             + 2  # \n\n
-            + len(html.escape(body_raw))
+            + _utf16_units(html.escape(body_raw))
             + 2  # \n\n
-            + len(footer_raw)
+            + _utf16_units(footer_raw)
         )
 
     message_groups: List[Tuple[str, List[NewsItem]]] = []
@@ -320,7 +327,7 @@ def build_digest_messages(
         заголовок сообщения (с учётом cur_count) + entries + заголовки секций.
         """
         return (
-            len(_make_header(msg_start_index + 1, msg_start_index + cur_count))
+            _utf16_units(_make_header(msg_start_index + 1, msg_start_index + cur_count))
             + _raw_size(cur_raw)
             + cur_extra
         )
@@ -359,11 +366,12 @@ def build_digest_messages(
         source_esc = html.escape(source_r)
 
         # overhead: <b> + </b> + " — " + footer + \n\n + margin
-        # source_esc вычисляется ДО поиска — не меняется при урезании body
+        # source_esc вычисляется ДО поиска — не меняется при урезании body.
+        # Все длины — в UTF-16 units (как считает Telegram).
         overhead = (
-            len(f"<b>{title_esc} — {source_esc}</b>")
+            _utf16_units(f"<b>{title_esc} — {source_esc}</b>")
             + 2
-            + len(footer_r)
+            + _utf16_units(footer_r)
             + _MARGIN
         )
         budget = usable - overhead
@@ -377,11 +385,11 @@ def build_digest_messages(
             return f"<b>{title_esc} — {source_esc}</b>\n\n{footer_r}"
 
         lo, hi = 0, body_len
-        # Итерируем: уменьшаем hi пока escaped > budget
+        # Итерируем: уменьшаем hi пока escaped > budget (units, не code points)
         while lo < hi:
             mid = (lo + hi + 1) // 2   # верхняя середина
             candidate = _truncate_raw_summary(body_r, mid)
-            escaped_len = len(html.escape(candidate))
+            escaped_len = _utf16_units(html.escape(candidate))
             if escaped_len <= budget:
                 lo = mid
             else:
@@ -407,15 +415,18 @@ def build_digest_messages(
             continue  # пустые секции не выводятся
 
         sec_header = f"<b>{sec_title}</b>"
+        sec_header_units = _utf16_units(sec_header)
         sec_sizes = [_entry_size(t, s, b, f) for t, s, b, f, _ in sec_items]
         # Оценка «секция целиком» для атомарного переноса в новое сообщение.
-        sec_total = len(sec_header) + sum(size + 2 for size in sec_sizes)
+        sec_total = sec_header_units + sum(size + 2 for size in sec_sizes)
         # Ёмкость пустого сообщения. Заголовок берём с диапазоном
         # «1–TOTAL» — он длиннее одиночного «1 из TOTAL». Оценка почти
         # консервативна: при total ≥ 100 фактический заголовок может
         # оказаться на 1–2 символа длиннее (напр. «99–100» против «1–100»),
         # поэтому итоговый размер дополнительно ограничивается бюджетом ниже.
-        fresh_usable = _TG_MESSAGE_MAX - len(_make_header(1, total)) - _MARGIN
+        fresh_usable = (
+            _TG_MESSAGE_MAX - _utf16_units(_make_header(1, total)) - _MARGIN
+        )
         section_atomic = (
             sec_total <= fresh_usable
             and len(sec_items) <= max_items_per_message
@@ -443,7 +454,7 @@ def build_digest_messages(
             # 3. budget limit (с учётом заголовка секции, если он нужен)
             if cur_entries:
                 used = _used_estimate(len(_cur_items()) + 1)
-                extra = (len(sec_header) + 2) if need_header else 0
+                extra = (sec_header_units + 2) if need_header else 0
                 if used + 2 + extra + entry_est > _TG_MESSAGE_MAX:
                     _emit()
                     need_header = True
@@ -451,16 +462,16 @@ def build_digest_messages(
             if not cur_entries:
                 # Fresh message: считаем budget для одного entry
                 header = _make_header(msg_start_index + 1, msg_start_index + 1)
-                usable = _TG_MESSAGE_MAX - len(header) - _MARGIN
+                usable = _TG_MESSAGE_MAX - _utf16_units(header) - _MARGIN
                 if need_header:
-                    usable -= len(sec_header) + 2
+                    usable -= sec_header_units + 2
                 entry_html = _assemble_entry(
                     title_r, source_r, body_r, footer_r, usable
                 )
                 if need_header:
                     cur_entries.append((sec_header, None))
                     cur_section = sec_key
-                    cur_extra += len(sec_header) + 2
+                    cur_extra += sec_header_units + 2
                 cur_entries.append((entry_html, item))
                 cur_raw.append((title_r, source_r, body_r, footer_r))
             else:
@@ -468,7 +479,7 @@ def build_digest_messages(
                 if need_header:
                     cur_entries.append((sec_header, None))
                     cur_section = sec_key
-                    cur_extra += len(sec_header) + 2
+                    cur_extra += sec_header_units + 2
                 cur_entries.append(
                     (_assemble_entry(title_r, source_r, body_r, footer_r,
                                      usable=9999), item)
@@ -536,11 +547,12 @@ def _send_digest_with_targets(
         if not msg.strip():
             continue
 
-        # N3: консервативный check на превышение 4096
-        if len(msg) > _TG_MESSAGE_MAX:
+        # N3: консервативный check на превышение 4096 (в UTF-16 units)
+        msg_units = _utf16_units(msg)
+        if msg_units > _TG_MESSAGE_MAX:
             logger.warning(
-                "Дайджест msg[%d/%d]: %d символов (>%d лимит)",
-                i, n_groups, len(msg), _TG_MESSAGE_MAX,
+                "Дайджест msg[%d/%d]: %d UTF-16 units (>%d лимит)",
+                i, n_groups, msg_units, _TG_MESSAGE_MAX,
             )
 
         # M1-фикс: try/except ВНУТРИ цикла — падение одного сообщения
@@ -677,10 +689,10 @@ def run_digest(
         for i, (msg, group_items) in enumerate(groups, 1):
             if not msg.strip():
                 continue
-            if len(msg) > _TG_MESSAGE_MAX:
+            if _utf16_units(msg) > _TG_MESSAGE_MAX:
                 logger.warning(
-                    "Дайджест msg[%d]: %d символов (>%d лимит)",
-                    i, len(msg), _TG_MESSAGE_MAX,
+                    "Дайджест msg[%d]: %d UTF-16 units (>%d лимит)",
+                    i, _utf16_units(msg), _TG_MESSAGE_MAX,
                 )
             try:
                 ok = delivery.send_text(msg)

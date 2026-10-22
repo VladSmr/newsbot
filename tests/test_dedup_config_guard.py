@@ -171,3 +171,124 @@ class TestDedupConfigParseGuard:
             )
         finally:
             st.close()
+
+    def test_max_seen_titles_inf_means_unlimited(self, db_path, caplog):
+        """Major-регресс: max_seen_titles: .inf не должен давать OverflowError.
+
+        YAML-идиома `.inf` = «без лимита»; контракт уже означает 0 как
+        «без лимита», поэтому inf мапится в 0 (+ warning), а не в дефолт 2000.
+        """
+        cfg = {
+            "cross_source": True,
+            "fuzzy": True,
+            "max_seen_titles": float("inf"),
+            "window_days": 3,
+        }
+        st = Storage(db_path, dedup_config=cfg)
+        try:
+            limits = []
+            original = st.get_recent_normalized_titles
+
+            def spy(*args, **kwargs):
+                limits.append(kwargs.get("limit"))
+                return original(*args, **kwargs)
+
+            st.get_recent_normalized_titles = spy
+
+            item = _mk_item()
+            with caplog.at_level("WARNING", logger="newsbot.dedup"):
+                new_items, total, dup = filter_new([item], st, dedup_config=cfg)
+            assert len(new_items) == 1, "filter_new не должен падать на .inf"
+            assert limits and all(limit == 0 for limit in limits), (
+                f"inf должен трактоваться как «без лимита» (limit=0), получено {limits}"
+            )
+            assert any(
+                "max_seen_titles" in r.message and "без лимита" in r.message
+                for r in caplog.records
+            )
+        finally:
+            st.close()
+
+    def test_max_seen_titles_nan_falls_back_to_default(self, db_path, caplog):
+        """max_seen_titles: .nan → дефолт 2000 + warning (не OverflowError)."""
+        cfg = {
+            "cross_source": True,
+            "fuzzy": False,
+            "max_seen_titles": float("nan"),
+            "window_days": 3,
+        }
+        st = Storage(db_path, dedup_config=cfg)
+        try:
+            limits = []
+            original = st.get_recent_normalized_titles
+
+            def spy(*args, **kwargs):
+                limits.append(kwargs.get("limit"))
+                return original(*args, **kwargs)
+
+            st.get_recent_normalized_titles = spy
+
+            item = _mk_item()
+            with caplog.at_level("WARNING", logger="newsbot.dedup"):
+                new_items, total, dup = filter_new([item], st, dedup_config=cfg)
+            assert len(new_items) == 1
+            assert limits and all(limit == 2000 for limit in limits)
+            assert any("max_seen_titles" in r.message for r in caplog.records)
+        finally:
+            st.close()
+
+
+class TestThresholdClampWarns:
+    """Minor-фикс: кламп порогов не должен быть молчаливым."""
+
+    def test_threshold_upper_clamped_to_one_warns(self, db_path, caplog):
+        """threshold: 95 → 1.0 + warning."""
+        cfg = {"cross_source": True, "fuzzy": True, "threshold": 95}
+        st = Storage(db_path, dedup_config=cfg)
+        try:
+            item = _mk_item()
+            with caplog.at_level("WARNING", logger="newsbot.dedup"):
+                new_items, total, dup = filter_new([item], st, dedup_config=cfg)
+            assert len(new_items) == 1
+            assert any(
+                "threshold" in r.message and "кламплено" in r.message
+                for r in caplog.records
+            )
+            assert any(
+                "threshold" in r.message and "отключён" in r.message
+                for r in caplog.records
+            )
+        finally:
+            st.close()
+
+    def test_threshold_negative_clamped_to_zero_warns(self, db_path, caplog):
+        """threshold: -1 → 0 + warning."""
+        cfg = {"cross_source": True, "fuzzy": True, "threshold": -1}
+        st = Storage(db_path, dedup_config=cfg)
+        try:
+            item = _mk_item()
+            with caplog.at_level("WARNING", logger="newsbot.dedup"):
+                new_items, total, dup = filter_new([item], st, dedup_config=cfg)
+            assert len(new_items) == 1
+            assert any(
+                "threshold" in r.message and "кламплено" in r.message
+                for r in caplog.records
+            )
+        finally:
+            st.close()
+
+    def test_token_threshold_clamp_warns(self, db_path, caplog):
+        """token_threshold: 5 → 1.0 + warning."""
+        cfg = {"cross_source": True, "fuzzy": True, "token_threshold": 5}
+        st = Storage(db_path, dedup_config=cfg)
+        try:
+            item = _mk_item()
+            with caplog.at_level("WARNING", logger="newsbot.dedup"):
+                new_items, total, dup = filter_new([item], st, dedup_config=cfg)
+            assert len(new_items) == 1
+            assert any(
+                "token_threshold" in r.message and "кламплено" in r.message
+                for r in caplog.records
+            )
+        finally:
+            st.close()

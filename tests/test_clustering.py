@@ -170,6 +170,104 @@ class TestStemmer:
         # удвоения (pass+ed), тогда как passes→'pass'. Расхождение было
         # и до фикса, здесь не менялось.
 
+    @pytest.mark.parametrize(
+        "past, plural, infinitive",
+        [
+            ("caused", "causes", "cause"),
+            ("paused", "pauses", "pause"),
+            ("housed", "houses", "house"),
+            ("aroused", "arouses", "arouse"),
+            ("used", "uses", "use"),
+        ],
+    )
+    def test_ed_se_verb_forms_same_stem(self, past, plural, infinitive):
+        """
+        Major: -ed-restore исключение `not base.endswith('us')` било не только
+        по focus/status. Базы -se-глаголов (caus/paus/hous/arous) тоже
+        оканчиваются на 'us', поэтому caused→caus, а causes→cause (ветка
+        -es:w[:-1]) — три формы одного слова давали ДВА стема, и дедуп не
+        склеивал перепечатки («causes»/«caused»). Теперь исключение работает
+        только по явному набору _US_SINGULARS, и -ed восстанавливает немое -e.
+        """
+        stems = {_stem_word(past), _stem_word(plural), _stem_word(infinitive)}
+        assert stems == {infinitive}, (
+            f"{past}/{plural}/{infinitive} должны давать один стем "
+            f"{infinitive!r}, получили {stems}"
+        )
+
+    def test_ed_se_verb_forms_same_cluster_hash(self):
+        """То же на уровне stem_hash (контракт кластеризации)."""
+        for past, plural, infinitive in (
+            ("caused", "causes", "cause"),
+            ("paused", "pauses", "pause"),
+            ("housed", "houses", "house"),
+            ("aroused", "arouses", "arouse"),
+        ):
+            h_past = stem_hash(f"Storm {past} damage")
+            h_plural = stem_hash(f"Storm {plural} damage")
+            h_inf = stem_hash(f"Storm {infinitive} damage")
+            assert h_past == h_plural == h_inf, (
+                f"{past}/{plural}/{infinitive}: хеши разошлись "
+                f"({h_past}, {h_plural}, {h_inf})"
+            )
+
+    def test_us_singulars_focus_forms_same_stem(self):
+        """
+        focus/focuses/focused → один стем: `-es`-ветка по _US_SINGULARS снимает
+        -es целиком, `-ed`-ветка не восстанавливает немое -e.
+        """
+        assert _stem_word("focuses") == _stem_word("focus") == "focus"
+        assert _stem_word("focused") == "focus"
+        assert (
+            stem_hash("Report focuses on crime")
+            == stem_hash("Report focused on crime")
+            == stem_hash("Report focus on crime")
+        )
+
+    @pytest.mark.parametrize(
+        "singular, plural",
+        [
+            ("campus", "campuses"),
+            ("bonus", "bonuses"),
+            ("virus", "viruses"),
+            ("status", "statuses"),
+            ("census", "censuses"),
+            ("consensus", "consensuses"),
+            ("crocus", "crocuses"),
+            ("surplus", "surpluses"),
+            ("genius", "geniuses"),
+            ("radius", "radiuses"),
+            ("bus", "buses"),
+        ],
+    )
+    def test_us_singular_plural_same_stem(self, singular, plural):
+        """-us-существительные: plural и singular дают один стем."""
+        assert _stem_word(plural) == _stem_word(singular) == singular
+
+    def test_ed_us_singular_no_silent_e(self):
+        """Существительные на -us не получают немое -e в -ed-ветке."""
+        for word in ("focus", "status", "campus", "virus", "bonus", "bus"):
+            assert _stem_word(word + "ed") == word, (
+                f"{word}ed должен давать {word!r}"
+            )
+
+    def test_ed_es_generic_regressions(self):
+        """Генерические -se-основы и шипящие не сломаны фиксом."""
+        # plural: обычное -s (немое -e сохраняется)
+        for word in ("case", "response", "release", "raise", "base", "promise"):
+            assert _stem_word(word + "s") == word, f"{word}s != {word}"
+        # past: немое -e восстанавливается только если перед 's' гласная
+        # (raising-основа), поэтому response сюда не входит — у него 'ns'.
+        for word in ("case", "release", "raise", "base", "promise", "close"):
+            assert _stem_word(word + "d") == word, f"{word}d != {word}"
+        assert _stem_word("houses") == "house"
+        assert _stem_word("purposes") == "purpose"
+        assert _stem_word("passes") == "pass"
+        assert _stem_word("classes") == "class"
+        assert _stem_word("boxes") == "box"
+        assert _stem_word("clashes") == "clash"
+        assert _stem_word("watches") == "watch"
+
     def test_stop_words_filtered_before_stemming(self):
         """
         Minor 2-волны: стоп-слова фильтруются ДО стемминга. Раньше

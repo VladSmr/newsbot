@@ -176,6 +176,28 @@ def _cfg_int(config: dict, key: str, default: int) -> int:
     return floored
 
 
+def _clamp_unit_interval(key: str, value: float) -> float:
+    """Кламп порога в [0,1] с warning'ами (Minor-фикс: кламп был молчаливым).
+
+    Граничные значения (0.0 / 1.0) означают «критерий фактически отключён»:
+    0 — совпадает всё, 1 — только побайтово идентичные строки. Логируем это
+    отдельным warning'ом, чтобы оператор видел причину «дедуп не работает».
+    """
+    clamped = max(0.0, min(1.0, value))
+    if clamped != value:
+        logger.warning(
+            "dedup.%s=%r вне диапазона [0,1] — кламплено в %r",
+            key, value, clamped,
+        )
+    if clamped <= 0.0 or clamped >= 1.0:
+        logger.warning(
+            "dedup.%s=%r — fuzzy-дедуп по этому критерию фактически "
+            "отключён (граничное значение)",
+            key, clamped,
+        )
+    return clamped
+
+
 # ─── Предфильтр для fuzzy-дедупа ──────────────────────────────────────────────
 # Максимум кандидатов для сравнения SequenceMatcher (ограничение O(N)).
 MAX_FUZZY_CANDIDATES = 200
@@ -398,16 +420,50 @@ def filter_new(
     max_seen_titles = cfg.get("max_seen_titles", 2000)
     if isinstance(max_seen_titles, bool):
         max_seen_titles = 2000
-    try:
-        max_seen_titles = int(max_seen_titles)
-    except (TypeError, ValueError):
-        max_seen_titles = 2000
+    else:
+        # Major-фикс: YAML-идиома `max_seen_titles: .inf` («без лимита») давала
+        # float('inf'), а int(inf) бросает OverflowError → filter_new падал →
+        # цикл обрывался ДО save_many (потеря новостей). Не-finite float
+        # обрабатываем ДО int(); inf трактуем как «без лимита» = 0 (ровно то,
+        # что уже означает 0 в контракте), nan — как опечатку → дефолт 2000.
+        _numeric = None
+        if isinstance(max_seen_titles, float):
+            _numeric = max_seen_titles
+        elif isinstance(max_seen_titles, str):
+            try:
+                _numeric = float(max_seen_titles)
+            except ValueError:
+                _numeric = None
+        if _numeric is not None and not math.isfinite(_numeric):
+            if _numeric > 0:  # +inf (для -inf ветка < 0 ниже ведёт в дефолт)
+                logger.warning(
+                    "dedup.max_seen_titles=%r — трактуется как «без лимита» (0)",
+                    max_seen_titles,
+                )
+                max_seen_titles = 0
+            else:
+                logger.warning(
+                    "dedup.max_seen_titles=%r — не конечное число, "
+                    "используется 2000",
+                    max_seen_titles,
+                )
+                max_seen_titles = 2000
+        else:
+            try:
+                max_seen_titles = int(max_seen_titles)
+            except (TypeError, ValueError, OverflowError):
+                logger.warning(
+                    "dedup.max_seen_titles=%r — ожидалось целое число, "
+                    "используется 2000",
+                    max_seen_titles,
+                )
+                max_seen_titles = 2000
     if max_seen_titles < 0:
         max_seen_titles = 2000
 
-    # clamp thresholds
-    threshold = max(0.0, min(1.0, threshold))
-    token_threshold = max(0.0, min(1.0, token_threshold))
+    # clamp thresholds (с warning — молчаливый кламп скрывал опечатку)
+    threshold = _clamp_unit_interval("threshold", threshold)
+    token_threshold = _clamp_unit_interval("token_threshold", token_threshold)
 
     new_items: List[NewsItem] = []
     dup_count = 0

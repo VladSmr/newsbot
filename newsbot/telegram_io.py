@@ -220,7 +220,12 @@ class TelegramPoller:
         if not logger:
             logger = logging.getLogger("newsbot.telegram_io")
         self._log = logger
-        self._client = _TgClient(token)
+        # MINOR-фикс: HTTP-таймаут клиента должен быть БОЛЬШЕ long-poll таймаута
+        # getUpdates (poll_timeout), иначе read-timeout клиента срабатывает
+        # одновременно с ответом Telegram → ложный TgApiError(timeout) → backoff
+        # и повторная обработка тех же updates (двойной /stop, двойной фидбэк).
+        # poll_timeout клампится в config.py (≤30) → HTTP-таймаут ≤40 с.
+        self._client = _TgClient(token, timeout=float(poll_timeout) + 10.0)
         self._chat_id = str(chat_id)
         self._db_path = db_path
         # on_digest — callable для установки флага (НЕ выполнения в poller thread)

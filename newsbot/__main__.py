@@ -7,6 +7,7 @@
 """
 import argparse
 import ctypes
+import errno
 import logging
 import os
 import signal
@@ -47,20 +48,202 @@ _digest_requested = threading.Event()
 # Lock-файл: <db_dir>/newsbot.lock. Захватывается при демон-старте,
 # освобождается в finally при аккуратном выходе.
 # Для --once/--digest/--check-* блокировка НЕ используется (one-shot, быстрые).
+#
+# MAJOR-фикс (lock-liveness): раньше «живость» определялась ТОЛЬКО по PID из
+# файла. После SIGKILL/OOM/reboot в файле оставался PID (например 7 — типичный
+# PID приложения под tini), новый контейнер в своём PID-namespace получал ТОТ ЖЕ
+# PID, os.kill(pid, 0) отвечал «жив» (это он сам) → «Уже запущен» → exit(1) →
+# restart: unless-stopped → вечный рестарт-луп, лечился только ручным rm.
+# Теперь основной механизм — эксклюзивная БЛОКИРОВКА ФАЙЛА (ядро снимает её
+# при смерти процесса):
+#   POSIX   — fcntl.flock(LOCK_EX | LOCK_NB);
+#   Windows — msvcrt.locking(LK_NBLCK) на байте вне данных файла.
+# Семантика «уже запущен» = не удалось взять блокировку (а не «PID жив»).
+# Lock-файл при этом может оставаться на диске — это нормально.
+# PID-эвристика (_acquire_lock_pid_fallback) используется ТОЛЬКО как fallback,
+# если механизм блокировки недоступен (экзотическая ФС / нет fcntl и msvcrt).
 _LOCK_FILE: Optional["Path"] = None
+# Держим fd открытым всё время жизни демона — закрытие снимает блокировку.
+_LOCK_FD: Optional[int] = None
+# Windows/msvcrt: блокируем байт по смещению 4096 (вне содержимого с PID).
+# Блокировать сам байт 0 нельзя: Windows запрещает запись в заблокированный
+# диапазон даже владельцу блокировки — PID не записать.
+_LOCK_WIN_OFFSET = 4096
+
+
+def _lock_fd_exclusive(fd: int) -> Optional[bool]:
+    """
+    Пытается взять эксклюзивную блокировку файла по открытому fd.
+
+    Returns:
+      True  — блокировка взята (мы владелец);
+      False — блокировку держит другой процесс (живой владелец);
+      None  — механизм недоступен → вызывающий откатывается на PID-эвристику.
+    """
+    try:
+        import fcntl  # POSIX-only
+    except ImportError:
+        fcntl = None  # type: ignore[assignment]
+
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            return None
+
+    try:
+        import msvcrt  # Windows-only
+    except ImportError:
+        return None
+
+    try:
+        os.lseek(fd, _LOCK_WIN_OFFSET, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+            return False
+        return None
+
+
+def _unlock_fd(fd: int) -> None:
+    """Снимает блокировку, взятую _lock_fd_exclusive (best-effort)."""
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None  # type: ignore[assignment]
+
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return
+
+    try:
+        import msvcrt
+    except ImportError:
+        return
+    try:
+        os.lseek(fd, _LOCK_WIN_OFFSET, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+def _write_pid_to_fd(fd: int, pid: int) -> None:
+    """Перезаписывает содержимое lock-файла нашим PID (best-effort)."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(pid).encode("ascii"))
+    except OSError:
+        pass
+
+
+def _read_lock_pid(lock_path: "Path") -> Optional[int]:
+    """PID из lock-файла; None если файла нет / содержимое не число."""
+    try:
+        return int(lock_path.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _pid_blocks_start(pid: Optional[int], my_pid: int) -> bool:
+    """
+    True если PID из lock-файла указывает на ЖИВОЙ чужой процесс.
+
+    Собственный PID заведомо stale: мы только что стартовали, второго
+    экземпляра в этом же процессе быть не может. Это же закрывает сценарий
+    PID-reuse (контейнер получил тот же PID после OOM/reboot).
+    Используется только в PID-fallback (когда блокировка файла недоступна).
+    """
+    if pid is None or pid == my_pid:
+        return False
+    return _is_process_alive(pid)
 
 
 def _acquire_lock(lock_path: "Path", my_pid: int) -> bool:
     """
-    Пытается захватить эксклюзивный lock.
+    Захватывает single-instance lock.
 
-    Атомарность: PID пишется в temp-файл в той же директории и публикуется
-    через os.link() (атомарный create-if-not-exists) — lock-файл появляется
-    СРАЗУ с содержимым. Поэтому нет TOCTOU-окна «файл есть, но пустой»,
-    в котором второй процесс мог бы счесть живой lock stale и удалить его.
-    На ФС без hardlink — fallback: O_CREAT|O_EXCL + запись PID.
+    Основной путь — эксклюзивная блокировка файла (flock/msvcrt): ядро снимает
+    её при смерти процесса, поэтому stale-файл с «живым» PID больше не мешает
+    старту (Major-фикс: вечный рестарт-луп после SIGKILL/OOM/reboot).
+    Побочный эффект: TOCTOU-окна с unlink чужого живого lock нет — файл не
+    удаляется вовсе, «занято» определяется неудачей блокировки.
 
-    Returns True если lock получен, False если уже занят (sys.exit 1).
+    Fallback (блокировка недоступна) — прежняя PID-эвристика с атомарной
+    публикацией через os.link() и защитой от собственного PID.
+
+    Returns True если lock получен; при занятом lock — sys.exit(1).
+    """
+    global _LOCK_FD
+
+    fd: Optional[int] = None
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        fd = None
+
+    if fd is not None:
+        try:
+            got = _lock_fd_exclusive(fd)
+        except Exception:
+            got = None
+
+        if got is True:
+            _write_pid_to_fd(fd, my_pid)
+            _LOCK_FD = fd
+            return True
+
+        if got is False:
+            # Блокировку держит реальный живой владелец.
+            pid = _read_lock_pid(lock_path)
+            if pid is None:
+                # Владелец мог ещё не дописать PID — короткий повтор.
+                for _ in range(5):
+                    time.sleep(0.1)
+                    pid = _read_lock_pid(lock_path)
+                    if pid is not None:
+                        break
+            if pid is not None:
+                print(
+                    f"[newsbot] Уже запущен (pid {pid}). Выход.",
+                    file=sys.stderr,
+                )
+            else:
+                print("[newsbot] Уже запущен (lock занят). Выход.", file=sys.stderr)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            sys.exit(1)
+
+        # got is None → механизм недоступен, уходим в PID-fallback.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    return _acquire_lock_pid_fallback(lock_path, my_pid)
+
+
+def _acquire_lock_pid_fallback(lock_path: "Path", my_pid: int) -> bool:
+    """
+    Fallback-захват lock по PID-эвристике (если блокировка файла недоступна).
+
+    Атомарность публикации: PID пишется в temp-файл в той же директории и
+    публикуется через os.link() (атомарный create-if-not-exists) — lock-файл
+    появляется СРАЗУ с содержимым. На ФС без hardlink — O_CREAT|O_EXCL.
+
+    Отличие от прежней версии (Major, минимум): PID == собственный считается
+    stale, а перед unlink PID перечитывается (защита от TOCTOU).
+
+    Returns True если lock получен; при занятом lock — sys.exit(1).
     """
 
     def _publish() -> bool:
@@ -94,26 +277,26 @@ def _acquire_lock(lock_path: "Path", my_pid: int) -> bool:
     if _publish():
         return True
 
-    # Lock-файл существует → проверяем stale или живой.
-    def _read_pid() -> Optional[int]:
-        try:
-            return int(lock_path.read_text().strip())
-        except (ValueError, OSError):
-            return None
-
-    pid = _read_pid()
+    pid = _read_lock_pid(lock_path)
 
     # None = пустой/нечитаемый файл. Даём короткий шанс: возможно, другой
-    # процесс ещё дописывает содержимое. Затем считаем stale.
+    # процесс ещё дописывает содержимое.
     if pid is None:
         for _ in range(5):
             time.sleep(0.1)
-            pid = _read_pid()
+            pid = _read_lock_pid(lock_path)
             if pid is not None:
                 break
 
-    if pid is not None and _is_process_alive(pid):
+    if _pid_blocks_start(pid, my_pid):
         print(f"[newsbot] Уже запущен (pid {pid}). Выход.", file=sys.stderr)
+        sys.exit(1)
+
+    # TOCTOU: перечитываем PID непосредственно перед удалением — если владелец
+    # сменился на живой чужой, чужой lock не трогаем.
+    current = _read_lock_pid(lock_path)
+    if current != pid and _pid_blocks_start(current, my_pid):
+        print(f"[newsbot] Уже запущен (pid {current}). Выход.", file=sys.stderr)
         sys.exit(1)
 
     # Не живой (stale) → удаляем и пробуем снова.
@@ -219,11 +402,46 @@ def _is_process_alive(pid: int) -> bool:
 
 
 def _release_lock(lock_path: "Path") -> None:
-    """Удаляет lock-файл. Безопасна при отсутствии файла."""
+    """
+    Освобождает lock: снимает блокировку, закрывает fd, удаляет файл.
+
+    На POSIX unlink делается ДО close (пока мы владелец блокировки) — так
+    короче окно, в котором новый процесс успел бы открыть тот же inode.
+    На Windows файл нельзя удалить открытым — там unlink идёт после close.
+    Повторный unlink после close выполняется ТОЛЬКО на Windows: на POSIX он
+    удалил бы уже НОВЫЙ inode, созданный другим процессом в окне между нашим
+    unlink и close (два демона одновременно на разных inode).
+    Безопасна при отсутствии файла/блокировки.
+    """
+    global _LOCK_FD
+    fd, _LOCK_FD = _LOCK_FD, None
+
+    if fd is None:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+        return
+
     try:
-        lock_path.unlink()
+        lock_path.unlink()  # POSIX: пока держим flock
     except OSError:
         pass
+
+    _unlock_fd(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+    # Windows: удаление возможно только после close. На POSIX второй unlink
+    # запрещён — он мог бы удалить inode, созданный другим процессом в окне
+    # между unlink и close, и тогда два демона держали бы lock одновременно.
+    if sys.platform == "win32":
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
 
 
 def _signal_handler(signum, frame):
@@ -357,10 +575,22 @@ def main():
         # Не запускается в --once / --digest / --check-* (диагностика getUpdates несовместима).
         _maybe_start_poller(config, pipeline, logger)
 
-        interval = config["poll_interval_minutes"] * 60
+        # MAJOR-фикс: poll_interval_minutes приводим к int() — config.py уже
+        # валидирует/clamp'ит значение («15» → 15, null → дефолт), а здесь
+        # страхуемся от нечислового значения: раньше `slept >= interval`
+        # падал TypeError'ом ВНЕ try → демон умирал → рестарт-луп.
+        try:
+            interval_minutes = int(config["poll_interval_minutes"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "poll_interval_minutes=%r не число — используем 15 мин.",
+                config.get("poll_interval_minutes"),
+            )
+            interval_minutes = 15
+        interval = interval_minutes * 60
         logger.info(
             "Режим: бесконечный цикл, интервал %d мин.",
-            config["poll_interval_minutes"],
+            interval_minutes,
         )
 
         signal.signal(signal.SIGINT, _signal_handler)
@@ -408,7 +638,7 @@ def main():
             # C3: slept инициализируется КАЖДУЮ итерацию (в т.ч. после успешного цикла)
             slept = 0
             logger.info("Пауза %d мин. до следующего цикла...",
-                        config["poll_interval_minutes"])
+                        interval_minutes)
             # M1: event.wait с таймаутом — реагирует на /digest БЫСТРО
             # (не ждёт 15 мин, просыпается через 30 с или сразу при set)
             while not _shutdown_event.is_set():

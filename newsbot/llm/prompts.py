@@ -77,7 +77,8 @@ def sanitize_item_field(text: str) -> str:
       2. Neutralize prompt delimiters: ``<|`` and ``|>`` are broken
          by inserting a space (``< |`` / ``| >``). This blocks attempts
          to inject ``<|данные:N|>``, ``<|конец данных:N|>`` or ``<|пример: …|>``
-         inside data.
+         inside data. Fullwidth variants (``＜`` U+FF1C / ``｜`` U+FF5C)
+         are normalized to ASCII first — otherwise they bypassed the replace.
       3. P2-fix: escape a leading run of ``#`` as ``\\#``. Prompt section
          markers (``# Title``, ``# Content``, ``# Source:``, ``# Language:``)
          are line-oriented; without this a feed title like
@@ -94,6 +95,10 @@ def sanitize_item_field(text: str) -> str:
     # Step 2: neutralize prompt delimiters
     # ``<|`` → ``< |``  and  ``|>`` → ``| >``
     # After this, data cannot forge section markers.
+    # Minor-фикс: fullwidth-варианты (U+FF1C ``＜`` и U+FF5C ``｜``) не
+    # совпадали с ASCII-replace и проходили насквозь — модель могла увидеть
+    # делимитер вида ``＜｜данные:1｜>``. Нормализуем их в ASCII ДО замены.
+    s = s.replace("\uff1c", "<").replace("\uff5c", "|")
     s = s.replace("<|", "< |")
     s = s.replace("|>", "| >")
 

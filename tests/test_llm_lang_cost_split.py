@@ -888,6 +888,104 @@ class TestNumericFieldValidation:
 
 
 # ─────────────────────────────────────────────────────────────────
+# Non-finite числа в llm.* (Major: int(inf) → OverflowError)
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestNonFiniteNumericFields:
+    def test_max_tokens_inf_falls_back_to_default(self, caplog):
+        """Major-регресс: max_tokens: .inf → дефолт, а не OverflowError при старте."""
+        with caplog.at_level(logging.WARNING):
+            flt = LLMFilter({
+                "enabled": True,
+                "model": "m",
+                "api_key": "k",
+                "push_urgent_only": False,
+                "max_tokens": float("inf"),
+                "daily_cost_limit": 0,
+            })
+        try:
+            assert flt.client.max_tokens == 4096
+        finally:
+            flt.client.close()
+        assert _warnings(caplog.records, "max_tokens")
+
+    def test_push_threshold_inf_falls_back_to_default(self, caplog):
+        """push_threshold: .inf → дефолт 7 + warning, фильтр работает."""
+        client = _CountingClient()
+        with caplog.at_level(logging.WARNING):
+            flt = LLMFilter(
+                {
+                    "enabled": True,
+                    "model": "m",
+                    "api_key": "k",
+                    "push_urgent_only": False,
+                    "push_threshold": float("inf"),
+                },
+                client=client,
+            )
+        assert flt.push_threshold == 7
+        assert _warnings(caplog.records, "push_threshold")
+
+    def test_daily_cost_limit_nan_disables_guard(self, caplog):
+        """Minor-регресс: daily_cost_limit: .nan → guard выключен (дефолт 0).
+
+        Иначе `nan <= 0` == False → guard «активен», а `current < nan` всегда
+        False → ВСЕ LLM-вызовы блокируются каждый цикл.
+        """
+        client = _CountingClient()
+        with caplog.at_level(logging.WARNING):
+            flt = LLMFilter(
+                {
+                    "enabled": True,
+                    "model": "m",
+                    "api_key": "k",
+                    "push_urgent_only": False,
+                    "daily_cost_limit": float("nan"),
+                },
+                client=client,
+            )
+        assert flt._daily_cost_limit == 0.0
+        assert _warnings(caplog.records, "daily_cost_limit")
+        # guard действительно выключен — вызов не блокируется
+        assert flt._check_daily_cost() is True
+
+    def test_nan_pricing_entry_skipped(self, caplog, tmp_storage):
+        """Minor-регресс: pricing.<model>.input = .nan → запись пропущена.
+
+        Иначе cost=nan → персистентный meta "nan" → cost-guard блокирует все
+        вызовы до смены дня.
+        """
+        client = _CountingClient()
+        with caplog.at_level(logging.WARNING):
+            flt = LLMFilter(
+                {
+                    "enabled": True,
+                    "model": "m",
+                    "api_key": "k",
+                    "push_urgent_only": False,
+                    "daily_cost_limit": 1.0,
+                    "pricing": {
+                        "m": {"input": float("nan"), "output": 1.0},
+                        "ok": {"input": 1.0, "output": 2.0},
+                    },
+                },
+                client=client,
+                storage=tmp_storage,
+            )
+        assert "m" not in flt._pricing
+        assert flt._pricing["ok"] == {"input": 1.0, "output": 2.0}
+        assert _warnings(caplog.records, "pricing")
+
+        # NaN не должен просочиться в дневной счётчик meta
+        flt._accumulate_daily_cost(1000, 1000)
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        stored = float(tmp_storage.get_meta(f"llm_daily_cost_{today}") or "0")
+        assert stored == stored  # not NaN
+        assert stored == 0.0  # цена модели неизвестна → в клиенте нули
+
+
+# ─────────────────────────────────────────────────────────────────
 # Minor 3: LLMTruncationError вместо строкового детекта
 # ─────────────────────────────────────────────────────────────────
 

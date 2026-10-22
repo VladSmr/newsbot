@@ -17,6 +17,7 @@
 import re
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 _root = Path(__file__).parent.parent
 sys.path.insert(0, str(_root))
@@ -25,6 +26,7 @@ from newsbot.collector import NewsItem
 from newsbot.digest import (
     SECTION_TITLES,
     _TG_MESSAGE_MAX,
+    _send_digest_with_targets,
     build_digest_messages,
     infer_category,
 )
@@ -33,6 +35,11 @@ from newsbot.digest import (
 # =============================================================================
 # helpers
 # =============================================================================
+
+def _u16(s: str) -> int:
+    """Длина строки в UTF-16 code units — ровно так лимит считает Telegram."""
+    return len(s.encode("utf-16-le")) // 2
+
 
 def _mk_item(source="tass", title="Test Title", url=None, summary="Body.",
              llm_score=6, tags=None) -> NewsItem:
@@ -212,7 +219,7 @@ def test_pagination_repeats_section_header_when_section_split():
 
     assert len(groups) >= 2
     for msg, grp in groups:
-        assert len(msg) <= _TG_MESSAGE_MAX, f"превышен лимит 4096: {len(msg)}"
+        assert _u16(msg) <= _TG_MESSAGE_MAX, f"превышен лимит 4096 units: {_u16(msg)}"
         assert "<b>📰 Основные новости</b>" in msg
         # заголовок секции повторяется, но не дублируется внутри сообщения
         assert msg.count("<b>📰 Основные новости</b>") == 1
@@ -224,7 +231,7 @@ def test_pagination_repeats_section_header_when_section_split():
     assert f"из {total} новостей" in groups[0][0]
     last = groups[-1][0]
     assert f"из {total} новостей" in last
-    assert max(len(msg) for msg, _ in groups) <= _TG_MESSAGE_MAX
+    assert max(_u16(msg) for msg, _ in groups) <= _TG_MESSAGE_MAX
 
 
 def test_budget_priority_over_section_integrity():
@@ -251,7 +258,7 @@ def test_budget_priority_over_section_integrity():
     assert len(groups) == 2
 
     for msg, grp in groups:
-        assert len(msg) <= _TG_MESSAGE_MAX, f"превышен лимит 4096: {len(msg)}"
+        assert _u16(msg) <= _TG_MESSAGE_MAX, f"превышен лимит 4096 units: {_u16(msg)}"
         assert len(grp) > 0
         assert "<b>📰 Основные новости</b>" in msg
         # заголовок повторяется в каждом сообщении, но не дублируется внутри
@@ -335,7 +342,7 @@ def test_multi_message_numbering_continuous_intra_section_split():
 
         ranges = []
         for msg, grp in groups:
-            assert len(msg) <= _TG_MESSAGE_MAX, f"n={n}: превышен лимит 4096"
+            assert _u16(msg) <= _TG_MESSAGE_MAX, f"n={n}: превышен лимит 4096 units"
             # секция одна → её заголовок есть в каждом куске ровно один раз
             assert msg.count("<b>📰 Основные новости</b>") == 1, f"n={n}"
             start, end = _parse_msg_range(msg, n)
@@ -474,3 +481,101 @@ def test_transient_import_error_does_not_gate_forever(monkeypatch, caplog):
 
     assert infer_category(item) == "cinema"
     assert digest_mod._INFER_CATEGORY_UNAVAILABLE is False
+
+
+# =============================================================================
+# 7. Бюджет дайджеста — в UTF-16 code units (как считает Telegram)
+# =============================================================================
+
+def _emoji_overload_items(n: int = 20):
+    """
+    n новостей с эмодзи в заголовке и теле: code points << UTF-16 units.
+    Каждый футер содержит 🔗 (не-BMP, 2 units) — как и реальные футеры
+    дайджеста со ссылкой.
+    """
+    return [
+        _mk_item(
+            "tass",
+            title=f"🔥 Новость {i} " + "🔥" * 5,
+            summary="😀" * 400,
+            url=f"https://example.com/news/{i}",
+            llm_score=6,
+        )
+        for i in range(n)
+    ]
+
+
+def test_budget_counts_utf16_units_not_code_points():
+    """
+    Регресс (Critical): страница с ≥20 🔗-футерами и эмодзи-заголовками.
+
+    Раньше все оценки размера считались в code points (len), поэтому
+    страница ~4076 cp с не-BMP символами реально занимала 4100+ UTF-16
+    units → Telegram 400 «message is too long» → send_digest=False →
+    items оставались deferred и повторялись каждое окно до purge.
+
+    Проверяем: каждая часть ≤ 4096 UTF-16 units (len(utf-16-le)//2).
+    """
+    items = _emoji_overload_items(20)
+    groups, included, failed = build_digest_messages(
+        items, max_items_per_message=20
+    )
+
+    assert failed == []
+    assert len(included) == 20
+
+    # фича нагружена: суммарно НЕ влезает в одно сообщение
+    assert len(groups) >= 2
+    # все 🔗-футеры на месте (≥20 не-BMP символов в датасете)
+    assert sum(msg.count("🔗") for msg, _ in groups) == 20
+
+    for msg, grp in groups:
+        units = _u16(msg)
+        assert units <= _TG_MESSAGE_MAX, (
+            f"часть {units} UTF-16 units > 4096 "
+            f"(code points: {len(msg)}, items: {len(grp)})"
+        )
+
+    # эмодзи реально «удваивают» размер: units заметно больше code points
+    assert sum(_u16(m) for m, _ in groups) > sum(len(m) for m, _ in groups)
+
+    # ни одна новость не потеряна и не продублирована
+    titles = [it.title for _, grp in groups for it in grp]
+    assert sorted(titles) == sorted(it.title for it in items)
+
+
+def test_old_codepoint_budget_would_overflow():
+    """
+    Гард на сам тест: при старой оценке через len() (подменяем _utf16_units
+    на len) тот же датасет даёт часть > 4096 units — т.е. предыдущий тест
+    действительно ловит баг, а не проходит «по счастливой случайности».
+    """
+    items = _emoji_overload_items(20)
+    with patch("newsbot.digest._utf16_units", new=len):
+        groups, _, _ = build_digest_messages(items, max_items_per_message=20)
+    assert max(_u16(m) for m, _ in groups) > _TG_MESSAGE_MAX
+
+
+def test_send_digest_warning_uses_utf16_units(caplog):
+    """
+    Warning в _send_digest_with_targets тоже считает units: 4096 emoji
+    = 8192 units при 4096 code points (старый check молчал).
+    """
+    import logging
+
+    msg = "😀" * _TG_MESSAGE_MAX
+    assert len(msg) == _TG_MESSAGE_MAX
+    assert _u16(msg) > _TG_MESSAGE_MAX
+
+    delivery = MagicMock()
+    delivery.send_digest.return_value = True
+
+    with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
+        sent_count, _, _ = _send_digest_with_targets(
+            delivery, [(msg, [])], [[]]
+        )
+
+    assert sent_count == 0  # items нет — счётчик по items, не по сообщениям
+    warnings = [r.getMessage() for r in caplog.records]
+    assert any("UTF-16 units" in w for w in warnings), warnings
+    assert any(str(_u16(msg)) in w for w in warnings), warnings

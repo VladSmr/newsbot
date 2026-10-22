@@ -234,6 +234,10 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
         )
         llm_section["balance"] = copy.deepcopy(DEFAULT_CONFIG["llm"]["balance"])
 
+    # MAJOR-фикс: валидация poll_interval_minutes ДО нормализации None → {},
+    # иначе warning показывал бы {} вместо исходного null.
+    _validate_poll_interval(cfg)
+
     # Прочие None-значения верхнего уровня → {} (m1), чтобы .get-цепочки
     # по неизвестным секциям не падали на None.
     for key in list(cfg.keys()):
@@ -408,6 +412,63 @@ def _validate_telegram_poll_timeout(cfg: Dict[str, Any]) -> None:
         converted = _MAX_TELEGRAM_POLL_TIMEOUT
 
     tg_cfg["poll_timeout"] = converted
+
+
+# ── poll_interval_minutes ─────────────────────────────────────────────────────
+# Верхняя граница интервала основного цикла (мин). 240 (4 часа) — разумный
+# потолок: больше — новости устаревают, а «15» вместо 1500 почти всегда опечатка.
+_MAX_POLL_INTERVAL_MINUTES = 240
+
+
+def _validate_poll_interval(cfg: Dict[str, Any]) -> None:
+    """
+    Валидация ``poll_interval_minutes``: целое, 1.._MAX_POLL_INTERVAL_MINUTES.
+
+    Невалидное значение (строка-нечисло, bool, дробное, null) → warning +
+    дефолт из DEFAULT_CONFIG. Число < 1 → кламп до 1 (0/отрицательный интервал
+    превращал паузу в busy-loop). Число > максимума → кламп до максимума.
+    Строка с числом ("15") нормализуется к int — раньше она доезжала до
+    демона и роняла `slept >= interval` TypeError'ом (рестарт-луп).
+
+    Правит cfg in-place.
+    """
+    if "poll_interval_minutes" not in cfg:
+        return
+
+    default = DEFAULT_CONFIG["poll_interval_minutes"]
+    raw = cfg["poll_interval_minutes"]
+
+    converted = None
+    if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+        try:
+            f = float(raw)
+            if math.isfinite(f) and f == int(f):
+                converted = int(f)
+        except (TypeError, ValueError, OverflowError):
+            converted = None
+
+    if converted is None:
+        logger.warning(
+            "poll_interval_minutes=%r — ожидалось целое число, "
+            "используется дефолт %r",
+            raw, default,
+        )
+        cfg["poll_interval_minutes"] = default
+        return
+
+    if converted < 1:
+        logger.warning(
+            "poll_interval_minutes=%r < 1 — клампим до 1", raw,
+        )
+        converted = 1
+    elif converted > _MAX_POLL_INTERVAL_MINUTES:
+        logger.warning(
+            "poll_interval_minutes=%r превышает максимум %d — клампим до %d",
+            raw, _MAX_POLL_INTERVAL_MINUTES, _MAX_POLL_INTERVAL_MINUTES,
+        )
+        converted = _MAX_POLL_INTERVAL_MINUTES
+
+    cfg["poll_interval_minutes"] = converted
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:

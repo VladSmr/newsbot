@@ -769,6 +769,48 @@ def test_usage_stats_safe_int_non_numeric():
     assert _safe_int(42.5, 0) == 42      # float → int
 
 
+def test_usage_stats_safe_int_non_finite():
+    """Major-регресс: int(inf) → OverflowError не должен выбрасывать ответ LLM."""
+    from newsbot.llm.client import _safe_int
+
+    assert _safe_int(float("inf"), 0) == 0
+    assert _safe_int(float("-inf"), 7) == 7
+    assert _safe_int(float("nan"), 0) == 0
+    assert _safe_int("Infinity", 0) == 0   # ValueError → default
+
+
+def test_usage_stats_infinite_usage_values_do_not_crash():
+    """Major-регресс: usage с Infinity/NaN не роняет add_response (контракт клиента)."""
+    stats = UsageStats(model="deepseek-flash")
+    stats.add_response({
+        "usage": {
+            "prompt_tokens": float("inf"),
+            "completion_tokens": float("nan"),
+            "total_tokens": float("inf"),
+            "prompt_cache_hit_tokens": float("inf"),
+            "prompt_cache_miss_tokens": float("nan"),
+        }
+    })
+    assert stats.calls == 1
+    assert stats.prompt_tokens == 0
+    assert stats.completion_tokens == 0
+    assert stats.total_tokens == 0
+    assert stats.prompt_cache_hit_tokens == 0
+    assert stats.prompt_cache_miss_tokens == 0
+
+
+def test_sanitize_item_field_neutralizes_fullwidth_delimiters():
+    """Minor-регресс: fullwidth ＜｜ (U+FF1C/U+FF5C) не проходят sanitize."""
+    from newsbot.llm.prompts import sanitize_item_field
+
+    result = sanitize_item_field("\uff1c\uff5c\u0434\u0430\u043d\u043d\u044b\u0435:1\uff5c>")
+    assert "\uff1c" not in result
+    assert "\uff5c" not in result
+    assert "<|" not in result
+    assert "< |" in result
+    assert "| >" in result
+
+
 # ─────────────────────────────────────────────────────────────────
 # Tests: DeepSeekClient.get_balance — парсинг balance_infos
 # ─────────────────────────────────────────────────────────────────
@@ -1175,6 +1217,9 @@ if __name__ == "__main__":
         (lambda: test_chat_json_usage_only_cached_hit(), "test_chat_json_usage_only_cached_hit"),
         (lambda: test_usage_stats_reset_clears_counters(), "test_usage_stats_reset_clears_counters"),
         (lambda: test_usage_stats_safe_int_non_numeric(), "test_usage_stats_safe_int_non_numeric"),
+        (lambda: test_usage_stats_safe_int_non_finite(), "test_usage_stats_safe_int_non_finite"),
+        (lambda: test_usage_stats_infinite_usage_values_do_not_crash(), "test_usage_stats_infinite_usage_values_do_not_crash"),
+        (lambda: test_sanitize_item_field_neutralizes_fullwidth_delimiters(), "test_sanitize_item_field_neutralizes_fullwidth_delimiters"),
     ]
 
     passed = 0

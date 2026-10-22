@@ -331,20 +331,100 @@ def test_signal_handler_only_sets_events_no_blocking_join(tmp_path):
 # ══════════════════════════════════════════════════════════════════
 
 class TestSingleInstanceLock:
-    """Lock-файл: live pid → exit, stale → захватывается."""
+    """Lock: эксклюзивная блокировка файла (flock/msvcrt) + PID-fallback."""
 
-    def test_live_pid_exits(self, tmp_path, monkeypatch):
-        """Lock с живым PID → sys.exit(1)."""
+    @staticmethod
+    def _hold_lock(lock_path):
+        """
+        Берёт блокировку файла в текущем процессе (эмуляция ЖИВОГО владельца).
+        Возвращает fd; отпускать — _drop_lock.
+        """
+        import newsbot.__main__ as main_mod
+
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        assert main_mod._lock_fd_exclusive(fd) is True
+        return fd
+
+    @staticmethod
+    def _drop_lock(fd):
+        import newsbot.__main__ as main_mod
+
+        main_mod._unlock_fd(fd)
+        os.close(fd)
+
+    def test_live_lock_exits(self, tmp_path):
+        """Живой владелец держит блокировку → sys.exit(1)."""
         import newsbot.__main__ as main_mod
 
         lock_path = tmp_path / "newsbot.lock"
-        # Записываем PID текущего процесса (живой)
+        fd = self._hold_lock(lock_path)
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                main_mod._acquire_lock(lock_path, 99999)
+        finally:
+            self._drop_lock(fd)
+        assert exc_info.value.code == 1
+
+    def test_stale_lock_with_current_pid_can_be_taken(self, tmp_path):
+        """
+        MAJOR: lock с PID ТЕКУЩЕГО процесса, но без блокировки (SIGKILL/OOM/
+        reboot + PID-namespace контейнера) — НЕ повод отказывать в старте.
+        Раньше os.kill(pid, 0) отвечал «жив» (это сам себя) → вечный рестарт-луп.
+        """
+        import newsbot.__main__ as main_mod
+
+        lock_path = tmp_path / "newsbot.lock"
+        lock_path.write_text(str(os.getpid()), encoding="ascii")
+
+        assert main_mod._acquire_lock(lock_path, os.getpid()) is True
+        assert lock_path.read_text() == str(os.getpid())
+        assert list(tmp_path.glob("*.tmp")) == []
+        main_mod._release_lock(lock_path)
+
+    def test_lock_taken_after_owner_released(self, tmp_path):
+        """Владелец «умер» (блокировка снята) → lock берётся."""
+        import newsbot.__main__ as main_mod
+
+        lock_path = tmp_path / "newsbot.lock"
+        fd = self._hold_lock(lock_path)
+        try:
+            with pytest.raises(SystemExit):
+                main_mod._acquire_lock(lock_path, 111)
+        finally:
+            self._drop_lock(fd)
+
+        assert main_mod._acquire_lock(lock_path, 222) is True
+        assert lock_path.read_text() == "222"
+        main_mod._release_lock(lock_path)
+
+    def test_release_lock_frees_lock_and_removes_file(self, tmp_path):
+        """_release_lock снимает блокировку и удаляет файл; повторный захват ок."""
+        import newsbot.__main__ as main_mod
+
+        lock_path = tmp_path / "newsbot.lock"
+        assert main_mod._acquire_lock(lock_path, 333) is True
+        assert main_mod._LOCK_FD is not None
+
+        main_mod._release_lock(lock_path)
+        assert main_mod._LOCK_FD is None
+        assert not lock_path.exists()
+        assert main_mod._acquire_lock(lock_path, 444) is True
+        main_mod._release_lock(lock_path)
+
+    def test_live_pid_exits_in_pid_fallback(self, tmp_path, monkeypatch):
+        """
+        PID-fallback (блокировка файла недоступна): lock с живым PID → exit 1.
+        """
+        import newsbot.__main__ as main_mod
+
+        lock_path = tmp_path / "newsbot.lock"
         my_pid = os.getpid()
         lock_path.write_text(str(my_pid))
 
         monkeypatch.setattr(main_mod, "_LOCK_FILE", lock_path)
 
-        with patch.object(main_mod, "_is_process_alive", return_value=True):
+        with patch.object(main_mod, "_lock_fd_exclusive", return_value=None), \
+             patch.object(main_mod, "_is_process_alive", return_value=True):
             with pytest.raises(SystemExit) as exc_info:
                 main_mod._acquire_lock(lock_path, 99999)
         assert exc_info.value.code == 1
@@ -374,8 +454,8 @@ class TestSingleInstanceLock:
 
     def test_empty_lock_file_with_live_pid_not_stolen(self, tmp_path, monkeypatch):
         """
-        TOCTOU: пустой lock-файл (другой процесс ещё публикует) не приводит
-        к перехвату lock живого процесса — PID дочитывается повторно.
+        PID-fallback + TOCTOU: пустой lock-файл (другой процесс ещё публикует)
+        не приводит к перехвату lock живого процесса — PID дочитывается повторно.
         """
         import newsbot.__main__ as main_mod
 
@@ -393,7 +473,8 @@ class TestSingleInstanceLock:
 
         monkeypatch.setattr(Path, "read_text", flaky_read)
         try:
-            with patch.object(main_mod, "_is_process_alive", return_value=True):
+            with patch.object(main_mod, "_lock_fd_exclusive", return_value=None), \
+                 patch.object(main_mod, "_is_process_alive", return_value=True):
                 with pytest.raises(SystemExit) as exc_info:
                     main_mod._acquire_lock(lock_path, 777)
         finally:
@@ -421,6 +502,38 @@ class TestSingleInstanceLock:
         lock_path = tmp_path / "nonexistent.lock"
         # Не существует — не должно упасть
         main_mod._release_lock(lock_path)
+
+    def test_release_lock_second_unlink_only_on_windows(self, tmp_path):
+        """
+        Major: второй unlink (после close) — ТОЛЬКО на Windows.
+
+        На POSIX повторный unlink после close удалил бы новый inode, созданный
+        другим процессом в окне между нашим unlink и close → два демона
+        одновременно на разных inode. Проверяем ровно один unlink на POSIX.
+        """
+        import newsbot.__main__ as main_mod
+
+        lock_path = tmp_path / "newsbot.lock"
+        assert main_mod._acquire_lock(lock_path, os.getpid()) is True
+
+        real_unlink = type(lock_path).unlink
+        calls = []
+
+        def spy_unlink(self, *a, **kw):
+            calls.append(str(self))
+            return real_unlink(self, *a, **kw)
+
+        # pathlib биндит os.unlink на уровне класса, поэтому патчим Path.unlink.
+        with patch.object(type(lock_path), "unlink", spy_unlink):
+            main_mod._release_lock(lock_path)
+
+        assert not lock_path.exists()
+        if sys.platform == "win32":
+            assert len(calls) == 2, f"на win32 ожидались 2 unlink, было {calls}"
+        else:
+            assert len(calls) == 1, (
+                f"на POSIX второй unlink запрещён (риск удалить чужой inode): {calls}"
+            )
 
     def test_is_process_alive_true_for_current(self):
         """Текущий процесс — живой (безопасная проверка, без os.kill на win32)."""
@@ -747,3 +860,31 @@ def test_bind_without_set_chat_id_is_parser_error():
 
     assert exc.value.code == 2
     mock_pipeline.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════
+# MINOR: HTTP-таймаут клиента больше long-poll таймаута
+# ══════════════════════════════════════════════════════════════════
+
+
+def test_client_http_timeout_exceeds_poll_timeout():
+    """
+    Иначе httpx read-timeout срабатывает одновременно с ответом Telegram →
+    ложный TgApiError(timeout) → backoff и повторная обработка updates.
+    """
+    with patch("newsbot.telegram_io._TgClient") as MockClient:
+        TelegramPoller(
+            token="t", chat_id="1", db_path="unused.db",
+            on_digest=lambda: None, poll_timeout=25,
+        )
+    assert MockClient.call_args.kwargs["timeout"] == 35.0
+
+
+def test_client_http_timeout_follows_clamped_poll_timeout():
+    """poll_timeout=30 (кламп в config.py) → HTTP-таймаут 40 с."""
+    with patch("newsbot.telegram_io._TgClient") as MockClient:
+        TelegramPoller(
+            token="t", chat_id="1", db_path="unused.db",
+            on_digest=lambda: None, poll_timeout=30,
+        )
+    assert MockClient.call_args.kwargs["timeout"] == 40.0

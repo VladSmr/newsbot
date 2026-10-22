@@ -199,16 +199,30 @@ class LLMFilter:
                     )
                     continue
                 try:
-                    self._pricing[model_name] = {
-                        "input": float(prices.get("input", 0) or 0),
-                        "output": float(prices.get("output", 0) or 0),
-                    }
+                    in_price = float(prices.get("input", 0) or 0)
+                    out_price = float(prices.get("output", 0) or 0)
                 except (TypeError, ValueError):
                     logger.warning(
                         "llm.pricing[%r] содержит нечисловые цены (%r/%r) — "
                         "запись пропущена",
                         model_name, prices.get("input"), prices.get("output"),
                     )
+                    continue
+                # Minor-фикс: NaN/inf-цена (YAML `.nan`) давала cost=nan →
+                # персистентный meta "nan" → cost-guard блокировал ВСЕ вызовы
+                # до смены дня. Такая запись бесполезна для расчёта — пропускаем
+                # её (модель останется без цен → сработает _warn_if_cost_guard_blind).
+                if not math.isfinite(in_price) or not math.isfinite(out_price):
+                    logger.warning(
+                        "llm.pricing[%r] содержит не конечные цены (%r/%r) — "
+                        "запись пропущена (расход по модели не считается)",
+                        model_name, prices.get("input"), prices.get("output"),
+                    )
+                    continue
+                self._pricing[model_name] = {
+                    "input": in_price,
+                    "output": out_price,
+                }
         self._daily_cost_limit = self._parse_float_field(
             config_llm, "daily_cost_limit", 0.0
         )
@@ -270,9 +284,18 @@ class LLMFilter:
                 key, raw, default,
             )
             return default
+        # Major-фикс: int(float('inf')) бросает OverflowError, int(nan) —
+        # ValueError. OverflowError не был перехвачен → LLMFilter падал при
+        # старте на `max_tokens: .inf` / `push_threshold: .inf`.
+        if isinstance(raw, float) and not math.isfinite(raw):
+            logger.warning(
+                "llm.%s=%r — не конечное число, используется дефолт %r",
+                key, raw, default,
+            )
+            return default
         try:
             return int(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             logger.warning(
                 "llm.%s=%r — ожидалось целое число, используется дефолт %r",
                 key, raw, default,
@@ -308,13 +331,24 @@ class LLMFilter:
             )
             return default
         try:
-            return float(raw)
+            value = float(raw)
         except (TypeError, ValueError):
             logger.warning(
                 "llm.%s=%r — ожидалось число, используется дефолт %r",
                 key, raw, default,
             )
             return default
+        # Minor-фикс: `daily_cost_limit: .nan` проходил как «активный guard»
+        # (nan <= 0 == False), но `current < nan` всегда False → ВСЕ вызовы
+        # блокировались каждый цикл, items копились в pending. NaN/inf —
+        # невалидное конфиг-значение → warning + дефолт.
+        if not math.isfinite(value):
+            logger.warning(
+                "llm.%s=%r — не конечное число, используется дефолт %r",
+                key, raw, default,
+            )
+            return default
+        return value
 
     def _warn_if_cost_guard_blind(self) -> None:
         """

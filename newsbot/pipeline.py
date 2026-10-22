@@ -28,6 +28,7 @@ deferred-items (до max_items сообщений с ретраями Telegram A
 
 import logging
 import math
+import time as _time
 from datetime import datetime, timedelta, timezone as tz
 from email.utils import parsedate_to_datetime as _parsedate_to_dt
 from typing import Dict, List, Optional, Set
@@ -127,6 +128,91 @@ def _normalize_category_min(raw) -> Dict[str, int]:
             value, default=0, context="category_min[%s]" % cat,
         )
     return normalized
+
+
+# Дефолтные слоты расписания дайджеста. Синхронизировано с
+# config.DEFAULT_CONFIG["digest"]["times"] = ["08:00", "20:00"].
+_DEFAULT_DIGEST_TIMES = ("08:00", "20:00")
+
+
+def _normalize_digest_times(raw) -> List[tuple]:
+    """
+    Нормализует digest.times из YAML в список (hour, minute).
+
+    Раньше валидации не было, и любой мусор в конфиге убивал расписание:
+      (а) ["9:00", "21:00"] — int("9:") → ValueError перехвачен лишь
+          частично: слот молча выключался (1 дайджест в сутки вместо 2);
+      (б) [9:00] без кавычек — YAML sexagesimal → int 540 → `t[:2]` →
+          TypeError ВНЕ перехвата → _maybe_run_digest падал каждый цикл,
+          дайджест не запускался ВООБЩЕ;
+      (в) "08:00" строкой — итерация по символам ('0','8',':') → мусорные
+          слоты/TypeError.
+
+    Правила (все аномалии — warning, без исключений):
+      — не список/кортеж (в т.ч. строка) → warning + дефолт из config;
+      — None (ключа нет) → дефолт без warning;
+      — явный пустой список → расписание осознанно выключено → [];
+      — элемент не str (напр. int 540 из YAML sexagesimal) → warning + skip;
+      — str не парсится как HH:MM → warning + skip;
+      — "9:00"/" 9:00 " → нормализация в "09:00" с warning (однозначно
+        читаемое значение поддерживаем, а не выключаем слот молча);
+      — если после фильтрации не осталось ни одного слота, а конфиг был
+        непустой → warning + дефолт (иначе одна опечатка навсегда
+        отключала бы дайджест).
+
+    Парсинг через time.strptime: та же строгость, что у
+    datetime.strptime("%H:%M"), но не завязан на module-level
+    `datetime` (его подменяют в тестах расписания).
+    """
+    default_slots = [
+        (int(t[:2]), int(t[3:])) for t in _DEFAULT_DIGEST_TIMES
+    ]
+    if raw is None:
+        return default_slots
+    if not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "digest.times: ожидался список строк 'HH:MM', получено %r (%s) — "
+            "использую дефолт %s",
+            raw, type(raw).__name__, list(_DEFAULT_DIGEST_TIMES),
+        )
+        return default_slots
+    if not raw:
+        # Явный пустой список — штатное «расписание выключено» (без шума).
+        return []
+
+    slots: List[tuple] = []
+    for t in raw:
+        if not isinstance(t, str):
+            logger.warning(
+                "digest.times: элемент %r не строка (%s) — слот пропущен "
+                "(для YAML берите время в кавычках: \"09:00\")",
+                t, type(t).__name__,
+            )
+            continue
+        candidate = t.strip()
+        try:
+            parsed = _time.strptime(candidate, "%H:%M")
+        except (TypeError, ValueError):
+            logger.warning(
+                "digest.times: невалидное время %r (ожидалось 'HH:MM') — "
+                "слот пропущен",
+                t,
+            )
+            continue
+        norm = "%02d:%02d" % (parsed.tm_hour, parsed.tm_min)
+        if norm != candidate:
+            logger.warning(
+                "digest.times: время %r нормализовано в %r", t, norm,
+            )
+        slots.append((parsed.tm_hour, parsed.tm_min))
+
+    if not slots:
+        logger.warning(
+            "digest.times: ни одного валидного слота в %r — использую дефолт %s",
+            raw, list(_DEFAULT_DIGEST_TIMES),
+        )
+        return default_slots
+    return slots
 
 
 def _loc_day_key(item) -> Optional[tuple]:
@@ -2370,8 +2456,11 @@ class NewsPipeline:
         if not _parse_bool(digest_cfg.get("enabled", True)):
             return
 
-        times = digest_cfg.get("times", ["09:00", "21:00"])
-        if not times:
+        # Нормализация в точке чтения: невалидные слоты отфильтровываются
+        # с warning, не-список → дефолт; ни один слот не должен ронять
+        # _maybe_run_digest (TypeError вне try → дайджест не запускался бы).
+        slots = _normalize_digest_times(digest_cfg.get("times"))
+        if not slots:
             return
 
         now_local = datetime.now(tz.utc).astimezone()
@@ -2383,13 +2472,7 @@ class NewsPipeline:
             except Exception:
                 pass
 
-        for t in times:
-            try:
-                sched_hour, sched_min = int(t[:2]), int(t[3:])
-            except (ValueError, IndexError):
-                logger.warning("Дайджест: невалидное время %r в times", t)
-                continue
-
+        for sched_hour, sched_min in slots:
             # Сегодняшний scheduled момент (local tz)
             sched_today = now_local.replace(
                 hour=sched_hour, minute=sched_min, second=0, microsecond=0
