@@ -3,6 +3,7 @@
 
 Формирует текстовые сообщения для отправки владельцу:
   — собирает deferred items (top-N по llm_score DESC)
+  — группирует items по категориям (фиксированный порядок секций)
   — разбивает на блоки по max_items_per_message и лимиту 4096 символов
   — HTML-экранирование всех пользовательских данных
   — URL-whitelist: только http:// / https://
@@ -15,7 +16,7 @@ import html
 import logging
 import re
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .delivery import Delivery, format_time_utc
 from .delivery.telegram import is_valid_http_url
@@ -28,6 +29,12 @@ from .storage import NewsItem, Storage
 
 logger = logging.getLogger("newsbot.digest")
 
+# Флаг «импорт классификатора уже падал»: глушит повторные warning'и
+# (иначе ~50 warning'ов с traceback за дайджест при каждом запуске).
+# НЕ является гейтом импорта: попытка импорта делается при каждом вызове,
+# транзиентный ImportError не запирает процесс в fallback навсегда.
+_INFER_CATEGORY_UNAVAILABLE: bool = False
+
 # Лимит Telegram-сообщения
 _TG_MESSAGE_MAX = 4096
 # Резерв на футер + запас
@@ -37,6 +44,76 @@ _MARGIN = 20
 # Максимальный escaped overhead footer: "<a href=\"\">🔗</a>" ≈ 17 + url_esc + time_esc.
 # Максимальный footer с time≈20: 17+500+20 = 537 → footer << 4096.
 _MAX_FOOTER_URL_ESC_LEN = 500
+
+
+# =============================================================================
+# Секции дайджеста (фиксированный порядок вывода)
+# =============================================================================
+
+# (key, HTML-заголовок секции). Порядок — контракт рендера.
+SECTION_TITLES: List[Tuple[str, str]] = [
+    ("general", "📰 Основные новости"),
+    ("science", "🔬 Наука"),
+    ("space", "🚀 Космос"),
+    ("tech", "💻 Технологии"),
+    ("cinema", "🎬 Кино"),
+    ("games", "🎮 Игры"),
+    ("cyber", "🔐 Кибербезопасность"),
+]
+_SECTION_TITLE_BY_KEY = dict(SECTION_TITLES)
+
+
+def infer_category(item: NewsItem) -> str:
+    """
+    Категория item'а для группировки в дайджесте.
+
+    Единый источник истины — pipeline._infer_category (source + tags;
+    категории: cinema, games, space, tech, cyber, science + 'other').
+    Импорт ленивый: pipeline импортирует digest на уровне модуля,
+    top-level обратный импорт дал бы цикл.
+
+    Возвращает ключ из SECTION_TITLES; всё непонятное → 'general'.
+    """
+    global _INFER_CATEGORY_UNAVAILABLE
+
+    # Флаг — ТОЛЬКО глушитель повторных warning'ов, НЕ гейт импорта:
+    # транзиентный ImportError (цикл/частичная инициализация на старте)
+    # не должен навсегда запирать процесс в fallback «general».
+    # Успешный импорт после первого — lookup в sys.modules, дёшево.
+    try:
+        from .pipeline import _infer_category
+    except ImportError:
+        # Деградация секций не должна быть незаметной: без pipeline все
+        # items молча схлопнутся в «Основные новости». Поэтому warning
+        # с трейсбеком (диагностика проблем импорта/цикла) — один раз
+        # на процесс, дальше без шума. Импорт пробуем каждый раз.
+        if not _INFER_CATEGORY_UNAVAILABLE:
+            _INFER_CATEGORY_UNAVAILABLE = True
+            logger.warning(
+                "digest: не удалось импортировать pipeline._infer_category — "
+                "все новости попадут в секцию 'general'",
+                exc_info=True,
+            )
+        return "general"
+
+    if _INFER_CATEGORY_UNAVAILABLE:
+        # Импорт восстановился (транзиентный сбой был) — снимаем флаг.
+        _INFER_CATEGORY_UNAVAILABLE = False
+
+    try:
+        cat = _infer_category(item)
+    except Exception:
+        # Неожиданная ошибка классификатора на конкретном item: новость
+        # не теряем, но факт деградации виден в логах (warning + traceback).
+        logger.warning(
+            "digest: ошибка определения категории item (url=%r) — "
+            "новость отнесена к секции 'general'",
+            getattr(item, "url", None),
+            exc_info=True,
+        )
+        return "general"
+
+    return cat if cat in _SECTION_TITLE_BY_KEY else "general"
 
 
 # =============================================================================
@@ -123,17 +200,29 @@ def build_digest_messages(
     и укладывается в _TG_MESSAGE_MAX символов.
 
     Стратегия разбиения:
+      0. группировка по категориям (фиксированный порядок секций,
+         см. SECTION_TITLES); пустые секции не выводятся
       1. count limit: > max_items_per_message → новое сообщение
       2. budget limit: entry не влезает → flush + start fresh
+         (при переносе секция продолжается с повторным заголовком)
       3. oversized entry: single entry слишком большой → summary
          урезается ДО escape так, чтобы гарантированно влезть
 
     Формат сообщения:
       📰 Дайджест — N из TOTAL новостей — <дата/время>
       ─────────────────────────────
+      <b>Заголовок секции</b>
+
       <b>Title — Source</b>
       body
       footer
+
+      <b>Title — Source</b>
+      body
+      footer
+
+      <b>Заголовок следующей секции</b>
+      ...
 
     MAJOR 2-фикс: per-item try/except при рендеринге — битый item
     выпадает из groups, его url добавляется в build_failed_urls.
@@ -196,10 +285,17 @@ def build_digest_messages(
     message_groups: List[Tuple[str, List[NewsItem]]] = []
     all_included: List[NewsItem] = []
 
-    # Текущее сообщение
-    cur_entries: List[Tuple[str, NewsItem]] = []   # (entry_html, item)
+    # Текущее сообщение — список блоков (html, item|None);
+    # item is None → это заголовок секции (не новость).
+    cur_entries: List[Tuple[str, Optional[NewsItem]]] = []
     cur_raw: List[Tuple[str, str, str, str]] = []  # (title, source, body, footer)
+    cur_extra: int = 0  # суммарная длина заголовков секций в текущем сообщении
+    cur_section: Optional[str] = None  # ключ секции, которой принадлежит хвост
     msg_start_index: int = 0   # 1-based start item number для текущего msg
+
+    def _cur_items() -> List[NewsItem]:
+        """Items текущего сообщения (без заголовков секций)."""
+        return [it for _, it in cur_entries if it is not None]
 
     def _make_header(start: int, end: int) -> str:
         if start == end:
@@ -212,20 +308,41 @@ def build_digest_messages(
             + "─" * 40 + "\n"
         )
 
+    def _raw_size(raws: List[Tuple[str, str, str, str]]) -> int:
+        """Суммарная оценка размера накопленных entries (с разделителями)."""
+        return sum(
+            _entry_size(t, s, b, f) + 2 for t, s, b, f in raws
+        )
+
+    def _used_estimate(cur_count: int) -> int:
+        """
+        Верхняя оценка уже занятого места в текущем сообщении:
+        заголовок сообщения (с учётом cur_count) + entries + заголовки секций.
+        """
+        return (
+            len(_make_header(msg_start_index + 1, msg_start_index + cur_count))
+            + _raw_size(cur_raw)
+            + cur_extra
+        )
+
     def _emit() -> None:
         """Формирует и сохраняет текущее сообщение."""
-        nonlocal message_groups, all_included, cur_entries, cur_raw, msg_start_index
-        if not cur_entries:
+        nonlocal message_groups, all_included, cur_entries, cur_raw
+        nonlocal cur_section, cur_extra, msg_start_index
+        items = _cur_items()
+        if not items:
             return
         start = msg_start_index + 1
-        end = msg_start_index + len(cur_entries)
+        end = msg_start_index + len(items)
         header = _make_header(start, end)
-        body = "\n\n".join(html for html, _ in cur_entries)
+        body = "\n\n".join(block_html for block_html, _ in cur_entries)
         msg = header + "\n" + body
-        message_groups.append((msg, [item for _, item in cur_entries]))
-        all_included.extend(item for _, item in cur_entries)
+        message_groups.append((msg, items))
+        all_included.extend(items)
         cur_entries = []
         cur_raw = []
+        cur_extra = 0
+        cur_section = None
         msg_start_index = end
 
     def _assemble_entry(title_r: str, source_r: str, body_r: str,
@@ -275,37 +392,88 @@ def build_digest_messages(
 
         return f"<b>{title_esc} — {source_esc}</b>\n{body_esc}\n{footer_r}"
 
-    for title_r, source_r, body_r, footer_r, item in rendered:
-        if len(cur_entries) >= max_items_per_message:
-            _emit()
+    # ── Группировка по категориям ПОСЛЕ финального сорта ──────────────
+    # Порядок секций — фиксированный (SECTION_TITLES), внутри секции —
+    # исходный порядок items (score DESC). 'other' → 'general'.
+    sections: Dict[str, List[Tuple[str, str, str, str, NewsItem]]] = {
+        key: [] for key, _ in SECTION_TITLES
+    }
+    for entry in rendered:
+        sections[infer_category(entry[4])].append(entry)
 
-        if cur_entries:
-            # Есть накопленные: считаем бюджет
-            header = _make_header(msg_start_index + 1, msg_start_index + len(cur_entries) + 1)
-            used = len(header)
-            for t, s, b, f in cur_raw:
-                used += _entry_size(t, s, b, f) + 2
-            # entry + \n\n separator
-            entry_est = _entry_size(title_r, source_r, body_r, footer_r)
-            if used + 2 + entry_est > _TG_MESSAGE_MAX:
+    for sec_key, sec_title in SECTION_TITLES:
+        sec_items = sections.get(sec_key) or []
+        if not sec_items:
+            continue  # пустые секции не выводятся
+
+        sec_header = f"<b>{sec_title}</b>"
+        sec_sizes = [_entry_size(t, s, b, f) for t, s, b, f, _ in sec_items]
+        # Оценка «секция целиком» для атомарного переноса в новое сообщение.
+        sec_total = len(sec_header) + sum(size + 2 for size in sec_sizes)
+        # Ёмкость пустого сообщения. Заголовок берём с диапазоном
+        # «1–TOTAL» — он длиннее одиночного «1 из TOTAL». Оценка почти
+        # консервативна: при total ≥ 100 фактический заголовок может
+        # оказаться на 1–2 символа длиннее (напр. «99–100» против «1–100»),
+        # поэтому итоговый размер дополнительно ограничивается бюджетом ниже.
+        fresh_usable = _TG_MESSAGE_MAX - len(_make_header(1, total)) - _MARGIN
+        section_atomic = (
+            sec_total <= fresh_usable
+            and len(sec_items) <= max_items_per_message
+        )
+
+        for idx, (title_r, source_r, body_r, footer_r, item) in enumerate(sec_items):
+            entry_est = sec_sizes[idx]
+
+            # 1. count limit
+            if len(_cur_items()) >= max_items_per_message:
                 _emit()
 
-        if not cur_entries:
-            # Fresh message: считаем budget для одного entry
-            header = _make_header(msg_start_index + 1, msg_start_index + 1)
-            usable = _TG_MESSAGE_MAX - len(header) - _MARGIN
-            entry_html = _assemble_entry(
-                title_r, source_r, body_r, footer_r, usable
-            )
-            cur_entries.append((entry_html, item))
-            cur_raw.append((title_r, source_r, body_r, footer_r))
-        else:
-            # Добавляем к накопленным
-            cur_entries.append(
-                (_assemble_entry(title_r, source_r, body_r, footer_r,
-                                 usable=9999), item)
-            )
-            cur_raw.append((title_r, source_r, body_r, footer_r))
+            need_header = cur_section != sec_key
+
+            # 2. Не рвать секцию посреди: если секция целиком влезает в
+            # пустое сообщение, но не влезает в остаток текущего —
+            # переносим её целиком в новое сообщение.
+            if idx == 0 and need_header and section_atomic and cur_entries:
+                used = _used_estimate(len(_cur_items()) + len(sec_items))
+                if (used + 2 + sec_total > _TG_MESSAGE_MAX
+                        or len(_cur_items()) + len(sec_items) > max_items_per_message):
+                    _emit()
+                    need_header = True
+
+            # 3. budget limit (с учётом заголовка секции, если он нужен)
+            if cur_entries:
+                used = _used_estimate(len(_cur_items()) + 1)
+                extra = (len(sec_header) + 2) if need_header else 0
+                if used + 2 + extra + entry_est > _TG_MESSAGE_MAX:
+                    _emit()
+                    need_header = True
+
+            if not cur_entries:
+                # Fresh message: считаем budget для одного entry
+                header = _make_header(msg_start_index + 1, msg_start_index + 1)
+                usable = _TG_MESSAGE_MAX - len(header) - _MARGIN
+                if need_header:
+                    usable -= len(sec_header) + 2
+                entry_html = _assemble_entry(
+                    title_r, source_r, body_r, footer_r, usable
+                )
+                if need_header:
+                    cur_entries.append((sec_header, None))
+                    cur_section = sec_key
+                    cur_extra += len(sec_header) + 2
+                cur_entries.append((entry_html, item))
+                cur_raw.append((title_r, source_r, body_r, footer_r))
+            else:
+                # Добавляем к накопленным
+                if need_header:
+                    cur_entries.append((sec_header, None))
+                    cur_section = sec_key
+                    cur_extra += len(sec_header) + 2
+                cur_entries.append(
+                    (_assemble_entry(title_r, source_r, body_r, footer_r,
+                                     usable=9999), item)
+                )
+                cur_raw.append((title_r, source_r, body_r, footer_r))
 
     _emit()
     return message_groups, all_included, build_failed_urls

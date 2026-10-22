@@ -689,5 +689,30 @@ class TestConfigHardening:
         cfg = load_config(str(cfg_file))
         assert cfg["digest"]["cluster_duplicates"] is True
 
+    def test_broken_yaml_fails_fast(self, tmp_path, capsys):
+        """
+        P1-13: синтаксически битый YAML → одна понятная строка в stderr
+        и SystemExit(1) ДО setup_logging (не необработанный YAMLError).
+        """
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("feeds: [unclosed\n", encoding="utf-8")
+
+        with pytest.raises(SystemExit) as exc:
+            load_config(str(cfg_file))
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "config.yaml" in err
+        assert "синтаксическая ошибка" in err
+        assert "Traceback" not in err
+
+    def test_dedup_max_seen_titles_in_defaults(self):
+        """dedup.max_seen_titles есть в DEFAULT_CONFIG и равен 2000."""
+        from newsbot.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["dedup"]["max_seen_titles"] == 2000
+
 
 # --

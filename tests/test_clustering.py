@@ -2,7 +2,22 @@
 import pytest
 
 from newsbot.stemmer import normalize, stem_hash
-from newsbot.locations import extract_location, cluster_key, LOCATIONS
+from newsbot.locations import build_cluster_key, extract_location, LOCATIONS
+
+
+def _cluster_key(item) -> str:
+    """
+    Тестовый хелпер: воспроизводит прод-контракт вызова build_cluster_key
+    (collector.py:378-382) — локация из title, stem_hash из title, день
+    из published. Сама обёртка locations.cluster_key удалена как мёртвая.
+    """
+    return build_cluster_key(
+        extract_location(item.title),
+        stem_hash(item.title),
+        item.published,
+        title=item.title,
+    )
+
 
 
 class TestStemmer:
@@ -180,7 +195,7 @@ class TestLocations:
 
 
 class TestClusterKey:
-    """Тесты cluster_key()."""
+    """Тесты build_cluster_key() (через прод-контракт вызова)."""
 
     def test_cluster_key_structure(self):
         """cluster_key содержит локацию, stem, дату."""
@@ -188,7 +203,7 @@ class TestClusterKey:
             title = "France protests: police clash in Paris"
             published = "2026-10-18T20:00:00+00:00"
 
-        key = cluster_key(FakeItem())
+        key = _cluster_key(FakeItem())
         parts = key.split("|")
         assert len(parts) == 3
         assert parts[0] == "франция"
@@ -204,8 +219,8 @@ class TestClusterKey:
             title = "Paris protest clash: police in France"
             published = "2026-10-18T20:00:00+00:00"
 
-        k1 = cluster_key(Fake1())
-        k2 = cluster_key(Fake2())
+        k1 = _cluster_key(Fake1())
+        k2 = _cluster_key(Fake2())
         # stem одинаковый, локация и день совпадают
         assert k1 == k2
 
@@ -219,8 +234,8 @@ class TestClusterKey:
             title = "France protests in Paris"
             published = "2026-10-19T20:00:00+00:00"
 
-        k1 = cluster_key(Fake1())
-        k2 = cluster_key(Fake2())
+        k1 = _cluster_key(Fake1())
+        k2 = _cluster_key(Fake2())
         assert k1 != k2
         assert "2026-10-18" in k1
         assert "2026-10-19" in k2
@@ -231,7 +246,7 @@ class TestClusterKey:
             title = "Breaking news"
             published = None
 
-        key = cluster_key(FakeNoPub())
+        key = _cluster_key(FakeNoPub())
         parts = key.split("|")
         assert len(parts) == 3
         assert parts[2] == "unknown"
@@ -252,8 +267,8 @@ class TestClusterKey:
             title = "🚨"  # different pure emoji → different per-title hash
             published = "2026-10-21T14:00:00+00:00"
 
-        k1 = cluster_key(Fake1())
-        k2 = cluster_key(Fake2())
+        k1 = _cluster_key(Fake1())
+        k2 = _cluster_key(Fake2())
 
         # Оба → nostem (пустой stem_hash для этих заголовков)
         # Но РАЗНЫЕ title → РАЗНЫЕ per-title hash
@@ -273,7 +288,7 @@ class TestClusterKey:
             title = "Test headline"
             published = "2026-10-21T14:30:00+00:00"
 
-        key = cluster_key(FakeItem())
+        key = _cluster_key(FakeItem())
         parts = key.split("|")
         assert parts[2] == "2026-10-21", (
             f"day должен быть ISO YYYY-MM-DD, получил: {parts[2]}"
@@ -289,8 +304,8 @@ class TestClusterKey:
             title = "Same news"   # тот же title — тот же stem
             published = "2026-10-21T08:00:00+00:00"   # тот же published
 
-        k1 = cluster_key(Fake1())
-        k2 = cluster_key(Fake2())
+        k1 = _cluster_key(Fake1())
+        k2 = _cluster_key(Fake2())
         assert k1 == k2, "Один title + published → идентичный cluster_key"
 
 

@@ -11,6 +11,7 @@
 import copy
 import logging
 import os as _os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -136,6 +137,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "threshold": 0.95,      # порог SequenceMatcher ratio (0..1, clamp автоматический)
         "token_threshold": 0.8,  # порог Jaccard значащих токенов (0..1, clamp автоматический)
         "window_days": 3,       # окно сравнения для fuzzy и cross_source
+        "max_seen_titles": 2000,  # лимит выборки заголовков за окно (0 = без лимита)
         "llm_recent_limit": 20,  # недавних заголовков для LLM-дедупа
     },
 }
@@ -157,8 +159,24 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
 
     p = Path(config_path)
     if p.exists():
-        with open(p, encoding="utf-8") as f:
-            raw = yaml.safe_load(f) or {}
+        # P1-13: синтаксически битый YAML — fail-fast с понятным сообщением
+        # ДО setup_logging. Почему не warning+defaults: DEFAULT_CONFIG не
+        # содержит секции `sources` (фидов), т.е. запуск на дефолтах =
+        # пустой цикл без новостей. Для бота это нерабочее состояние,
+        # и тихий fallback лишь маскировал бы ошибку конфигурации
+        # (restart-луп с пустой конфигурацией хуже явной ошибки).
+        try:
+            with open(p, encoding="utf-8") as f:
+                raw = yaml.safe_load(f) or {}
+        except yaml.YAMLError as e:
+            mark = getattr(e, "problem_mark", None)
+            line_no = mark.line + 1 if mark is not None else "?"
+            detail = getattr(e, "problem", None) or str(e)
+            print(
+                f"config.yaml: синтаксическая ошибка в строке {line_no}: {detail}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         # Minor 5-фикс: YAML-корень должен быть словарём. Скаляр/список
         # (например случайная строка в конфиге) не должен ронять загрузку
         # TypeError'ом в _deep_merge/len().

@@ -1189,5 +1189,43 @@ class TestScoreScaleCriteria:
             assert phrase in BATCH_SYSTEM_PROMPT, f"'{phrase}' removed from BATCH_SYSTEM_PROMPT"
 
 
+class TestLanguageRule:
+    """v1.3.0: усиленное правило языка summary — per-item, без перевода в один язык."""
+
+    PHRASES = [
+        "Each summary MUST be written in the SAME language as that item's input news text",
+        "MUST get English summaries",
+        "MUST get Russian summaries",
+        "Do NOT translate summaries into a single common language",
+    ]
+
+    def test_language_rule_in_both_prompts(self):
+        """Новая формулировка присутствует и в SYSTEM_PROMPT, и в BATCH_SYSTEM_PROMPT."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        for phrase in self.PHRASES:
+            assert phrase in SYSTEM_PROMPT, \
+                f"'{phrase}' not found in SYSTEM_PROMPT"
+            assert phrase in BATCH_SYSTEM_PROMPT, \
+                f"'{phrase}' not found in BATCH_SYSTEM_PROMPT"
+
+    def test_summary_field_reminder(self):
+        """Напоминание в описании поля summary — в обоих промптах."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        reminder = "do not translate into Russian by default"
+        assert reminder in SYSTEM_PROMPT
+        assert reminder in BATCH_SYSTEM_PROMPT
+
+    def test_delimiters_and_json_format_unchanged(self):
+        """Делимитеры и JSON-формат не затронуты правилом языка."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        assert '"score"' in SYSTEM_PROMPT
+        assert '"summary"' in SYSTEM_PROMPT
+        assert '"results"' in BATCH_SYSTEM_PROMPT
+        assert '"id"' in BATCH_SYSTEM_PROMPT
+        # дедуп-промпт правилом языка не трогали
+        from newsbot.llm.prompts import DEDUP_SYSTEM_PROMPT
+        assert "MUST get English summaries" not in DEDUP_SYSTEM_PROMPT
+
+
 if __name__ == "__main__":
     sys.exit(_run_tests())

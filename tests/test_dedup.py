@@ -1189,6 +1189,121 @@ class TestDedupNoNPlusOne(unittest.TestCase):
 
 
 # =============================================================================
+# LIMIT: кросс-source дедуп не должен усекаться 500 самыми свежими
+# =============================================================================
+
+class TestSeenTitlesLimit(unittest.TestCase):
+    """Регресс: жёсткий LIMIT 500 молча усекал покрытие дедупа."""
+
+    def _fill_seen_titles(self, path, count, target_hash, target_norm):
+        """Пишет count свежих строк + 1 старую (target) в seen_titles."""
+        import sqlite3
+
+        now = datetime.now(timezone.utc)
+        fresh = now.isoformat()
+        old = (now - timedelta(days=2)).isoformat()
+        expires = (now + timedelta(days=30)).isoformat()
+        rows = [(target_hash, "SourceB", old, expires, target_norm)]
+        for i in range(count):
+            rows.append((
+                f"filler{i:05d}",
+                "SourceB",
+                fresh,
+                expires,
+                f"filler unique headline {i}",
+            ))
+        conn = sqlite3.connect(path)
+        try:
+            conn.executemany(
+                "INSERT INTO seen_titles "
+                "(title_hash, source, fetched_at, expires_at, title_normalized) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_oldest_title_beyond_500_participates(self):
+        """601-й (самый старый) заголовок окна участвует в дедупе."""
+        path = _tmp_db()
+        try:
+            cfg = {"cross_source": True, "fuzzy": False, "window_days": 3}
+            st = Storage(Path(path), dedup_config=cfg)
+            item = _mk_item(
+                title="Target exclusive orbital station update",
+                source="SourceA",
+                url="https://a.com/target",
+            )
+            norm = item.title_normalized()
+            self._fill_seen_titles(path, 600, norm, norm)
+
+            new_items, total, dup = filter_new([item], st, dedup_config=cfg)
+
+            self.assertEqual(dup, 1, "Старый дубль вне топ-500 должен ловиться")
+            self.assertEqual(len(new_items), 0)
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_limit_warning_logged_once_per_cycle(self):
+        """Достижение лимита → один WARNING за цикл (не на каждый item)."""
+        path = _tmp_db()
+        try:
+            cfg = {
+                "cross_source": True,
+                "fuzzy": False,
+                "window_days": 3,
+                "max_seen_titles": 100,
+            }
+            st = Storage(Path(path), dedup_config=cfg)
+            item = _mk_item(
+                title="Another unique target headline",
+                source="SourceA",
+                url="https://a.com/x",
+            )
+            norm = item.title_normalized()
+            self._fill_seen_titles(path, 150, norm, norm)
+
+            with self.assertLogs("newsbot.dedup", level="WARNING") as cm:
+                filter_new([item], st, dedup_config=cfg)
+
+            warnings = [m for m in cm.output if "усеч" in m]
+            self.assertEqual(len(warnings), 1,
+                             f"Ожидался 1 warning об усечении, got: {cm.output}")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_limit_zero_returns_entire_window(self):
+        """limit=0 → LIMIT-клаузы нет, возвращаются ВСЕ строки окна.
+
+        Покрывает ветку storage.get_recent_normalized_titles: limit_sql
+        добавляется только при limit > 0.
+        """
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            total_rows = 251
+            self._fill_seen_titles(path, total_rows - 1, "targethash", "target norm")
+
+            rows_unlimited = st.get_recent_normalized_titles(window_days=3, limit=0)
+            self.assertEqual(
+                len(rows_unlimited), total_rows,
+                f"limit=0 должен вернуть все {total_rows} строк окна, "
+                f"got {len(rows_unlimited)}",
+            )
+
+            # sanity: при limit > 0 выборка действительно усекается
+            rows_limited = st.get_recent_normalized_titles(window_days=3, limit=10)
+            self.assertEqual(len(rows_limited), 10,
+                             "limit>0 должен усекать выборку до LIMIT")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+
+# =============================================================================
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

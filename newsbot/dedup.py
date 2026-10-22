@@ -272,6 +272,21 @@ def filter_new(
     token_threshold = float(cfg.get("token_threshold", 0.8))
     window_days = int(cfg.get("window_days", 3))
 
+    # Лимит выборки заголовков за окно. None/невалидное/отрицательное → 2000
+    # (дефолт), 0 в конфиге → без лимита (только окно). Жёсткий LIMIT 500 молча
+    # усекал кросс-source дедуп при >500 заголовках за окно.
+    # Отрицательное значение (опечатка вроде -5) НЕ превращается в 0: это молча
+    # снимало бы страховку от неограниченной выборки, поэтому → дефолт 2000.
+    max_seen_titles = cfg.get("max_seen_titles", 2000)
+    if isinstance(max_seen_titles, bool):
+        max_seen_titles = 2000
+    try:
+        max_seen_titles = int(max_seen_titles)
+    except (TypeError, ValueError):
+        max_seen_titles = 2000
+    if max_seen_titles < 0:
+        max_seen_titles = 2000
+
     # clamp thresholds
     threshold = max(0.0, min(1.0, threshold))
     token_threshold = max(0.0, min(1.0, token_threshold))
@@ -288,6 +303,8 @@ def filter_new(
     # Таблица seen_titles не меняется в этом цикле — результат стабилен.
     # Один запрос на уникальный exclude_source (а не O(N) запросов).
     _recent_cache: dict = {}
+    # Флаг «выборка упёрлась в лимит» — warning один раз за цикл, не на item.
+    _recent_limit_hit = False
 
     # Предварительно собираем множество source'ов, которые встретятся
     # в цикле, чтобы запросить их ДО начала основного цикла.
@@ -297,11 +314,14 @@ def filter_new(
             if _is_meaningful_title(item):
                 src = item.source
                 if src not in _recent_cache:
-                    _recent_cache[src] = storage.get_recent_normalized_titles(
+                    rows = storage.get_recent_normalized_titles(
                         window_days=window_days,
-                        limit=500,
+                        limit=max_seen_titles,
                         exclude_source=src,
                     )
+                    _recent_cache[src] = rows
+                    if max_seen_titles and len(rows) >= max_seen_titles:
+                        _recent_limit_hit = True
 
     for item in items:
         # (a) точный URL в БД
@@ -385,6 +405,12 @@ def filter_new(
 
         new_items.append(item)
 
+    if _recent_limit_hit:
+        logger.warning(
+            "Выборка дедупа усечена лимитом: проверено не более %d заголовков "
+            "за окно (dedup.max_seen_titles; 0 = без лимита)",
+            max_seen_titles,
+        )
     if cross_source_skipped:
         logger.info("Дедуп: отфильтровано %d cross-source дублей", cross_source_skipped)
     if fuzzy_skipped:

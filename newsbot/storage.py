@@ -2284,7 +2284,7 @@ class Storage:
     def get_recent_normalized_titles(
         self,
         window_days: int,
-        limit: int = 500,
+        limit: int = 0,
         exclude_source: Optional[str] = None,
     ) -> List[tuple]:
         """
@@ -2297,7 +2297,8 @@ class Storage:
 
         Args:
             window_days: окно в днях
-            limit: лимит возвращаемых записей
+            limit: лимит возвращаемых записей; 0 (дефолт) — без лимита,
+                выборка только по окну fetched_at (индекс idx_seen_fetched)
             exclude_source: исключить source при поиске кросс-источниковых дублей
         """
         conn = self._connect()
@@ -2311,6 +2312,11 @@ class Storage:
             source_filter = " AND source != ?"
             params.append(exclude_source)
 
+        limit_sql = ""
+        if limit and limit > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+
         # title_normalized может отсутствовать (старые записи до v9)
         rows = conn.execute(
             f"""
@@ -2320,10 +2326,9 @@ class Storage:
                    fetched_at
             FROM seen_titles
             WHERE fetched_at > ?{source_filter}
-            ORDER BY fetched_at DESC
-            LIMIT ?
+            ORDER BY fetched_at DESC{limit_sql}
             """,
-            params + [limit],
+            params,
         ).fetchall()
         return [(r[0], r[1], r[2], r[3]) for r in rows]
 

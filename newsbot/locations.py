@@ -113,7 +113,7 @@ def build_cluster_key(
 ) -> str:
     """
     Minor 6-фикс: единая реализация сборки cluster_key.
-    Публичный helper — вызывается из collector и из locations.cluster_key().
+    Публичный helper — вызывается из collector (prod).
 
     Per-title fallback (Variant B, CRITICAL-1): при пустом stem_hash
     (emoji-only, пустой normalize, не-Latin/Cyrillic заголовки) хешируется
@@ -148,16 +148,5 @@ def build_cluster_key(
         else:
             title_hash = hashlib.md5(b'').hexdigest()[:12]
         return f"{location}|nostem:{title_hash}|{pub_day}"
-
-
-def cluster_key(item) -> str:
-    """
-    Minor 6-фикс: wrapper над build_cluster_key для обратной совместимости.
-    Все вызовы в production идут через collector.build_cluster_key().
-    """
-    from .stemmer import stem_hash
-    location = extract_location(item.title)
-    stem = stem_hash(item.title)
-    return build_cluster_key(location, stem, item.published, title=item.title)
 
 
