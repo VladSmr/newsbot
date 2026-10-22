@@ -115,7 +115,7 @@ def build_digest_messages(
     items: List[NewsItem],
     max_items_per_message: int = 20,
     local_now: datetime = None,
-) -> Tuple[List[Tuple[str, List[NewsItem]]], List[NewsItem]]:
+) -> Tuple[List[Tuple[str, List[NewsItem]]], List[NewsItem], List[str]]:
     """
     Формирует список сообщений дайджеста.
 
@@ -135,17 +135,22 @@ def build_digest_messages(
       body
       footer
 
+    MAJOR 2-фикс: per-item try/except при рендеринге — битый item
+    выпадает из groups, его url добавляется в build_failed_urls.
+
     Args:
         items: отсортированный список (score DESC, fetched_at ASC).
         max_items_per_message: новостей на сообщение (минимум 1).
         local_now: текущее время для заголовка.
 
     Returns:
-        Tuple[List[Tuple[str, List[NewsItem]]], List[NewsItem]]:
+        Tuple[List[Tuple[str, List[NewsItem]]], List[NewsItem], List[str]]:
           message_groups: список (html_message, items_in_message).
           all_included_items: плоский список всех включённых items
                               (для отладки / отчёта).
-        Пустой items → ([], []).
+          build_failed_urls: urls items, выпавших из-за исключения при
+                              рендеринге. Эти items помечаются 'failed'.
+        Пустой items → ([], [], []).
     """
     if local_now is None:
         local_now = datetime.now(timezone.utc).astimezone()
@@ -153,15 +158,29 @@ def build_digest_messages(
     max_items_per_message = max(1, max_items_per_message)
 
     time_str = local_now.strftime("%d.%m.%Y %H:%M")
-    total = len(items)
 
     if not items:
-        return [], []
+        return [], [], []
 
-    # Каждый элемент: (title_raw, source_raw, body_raw, footer_raw, item)
-    rendered: List[Tuple[str, str, str, str, NewsItem]] = [
-        (*_render_item_raw(it), it) for it in items
-    ]
+    # Каждый элемент: (title_raw, source_raw, body_raw, footer_raw, item).
+    # MAJOR 2-фикс: per-item try/except — битый item не падает на весь дайджест.
+    build_failed_urls: List[str] = []
+    rendered: List[Tuple[str, str, str, str, NewsItem]] = []
+    for it in items:
+        try:
+            rendered.append((*_render_item_raw(it), it))
+        except Exception as e:
+            logger.warning(
+                "build_digest: item '%s' исключение при рендеринге: %s — "
+                "исключается из дайджеста, будет помечен 'failed'",
+                (it.title or "")[:60], e,
+            )
+            build_failed_urls.append(it.url)
+
+    # Nit-фикс: «N из TOTAL» считает только фактически отрендеренные items.
+    # Выпавшие при рендеринге (build_failed_urls) в знаменатель не входят —
+    # иначе сплошная нумерация даёт «29 из 30» при 29 отрендеренных.
+    total = len(rendered)
 
     def _entry_size(title_raw: str, source_raw: str, body_raw: str,
                     footer_raw: str) -> int:
@@ -289,7 +308,7 @@ def build_digest_messages(
             cur_raw.append((title_r, source_r, body_r, footer_r))
 
     _emit()
-    return message_groups, all_included
+    return message_groups, all_included, build_failed_urls
 
 
 # =============================================================================
@@ -311,6 +330,10 @@ def _send_digest_with_targets(
     При частичном сбое — отправленные → digested, остаток → deferred
     (at-least-once: retry в следующем окне).
 
+    M1-фикс: try/except — ВНУТРИ цикла по сообщениям (как в send_text-ветке).
+    Исключение на одном сообщении НЕ обрывает отправку остальных:
+    ошибка логируется warning'ом с номером/URL, цикл продолжается.
+
     N1: send_digest от delivery — возвращает bool (succ/fail).
     N3: лимит 4096 проверен на уровне build_digest_messages;
         консервативно: если текст всё равно >4096 — логируем warning.
@@ -318,63 +341,71 @@ def _send_digest_with_targets(
     sent_urls: List[str] = []
     sent_groups: List[Tuple[str, List[NewsItem]]] = []
 
-    try:
-        # Minor-фикс: zip молча обрезает хвост при рассинхроне длин.
-        # Логируем рассинхрон и дополняем пустыми кнопками, чтобы
-        # ни одна группа не потерялась.
-        n_groups = len(groups)
-        n_buttons = len(item_buttons_per_msg)
-        if n_groups != n_buttons:
+    # Minor-фикс: zip молча обрезает хвост при рассинхроне длин.
+    # Логируем рассинхрон и дополняем пустыми кнопками, чтобы
+    # ни одна группа не потерялась.
+    n_groups = len(groups)
+    n_buttons = len(item_buttons_per_msg)
+    if n_groups != n_buttons:
+        logger.warning(
+            "Дайджест: рассинхрон groups=%d vs item_buttons_per_msg=%d — "
+            "%s",
+            n_groups, n_buttons,
+            "дополняем пустыми кнопками для лишних групп"
+            if n_groups > n_buttons
+            else "обрезаем лишние кнопки",
+        )
+        if n_groups > n_buttons:
+            item_buttons_per_msg = list(item_buttons_per_msg) + [
+                [] for _ in range(n_groups - n_buttons)
+            ]
+        else:
+            item_buttons_per_msg = list(item_buttons_per_msg[:n_groups])
+
+    for i, ((msg, group_items), item_buttons) in enumerate(
+        zip(groups, item_buttons_per_msg), 1
+    ):
+        if not msg.strip():
+            continue
+
+        # N3: консервативный check на превышение 4096
+        if len(msg) > _TG_MESSAGE_MAX:
             logger.warning(
-                "Дайджест: рассинхрон groups=%d vs item_buttons_per_msg=%d — "
-                "%s",
-                n_groups, n_buttons,
-                "дополняем пустыми кнопками для лишних групп"
-                if n_groups > n_buttons
-                else "обрезаем лишние кнопки",
+                "Дайджест msg[%d/%d]: %d символов (>%d лимит)",
+                i, n_groups, len(msg), _TG_MESSAGE_MAX,
             )
-            if n_groups > n_buttons:
-                item_buttons_per_msg = list(item_buttons_per_msg) + [
-                    [] for _ in range(n_groups - n_buttons)
-                ]
-            else:
-                item_buttons_per_msg = list(item_buttons_per_msg[:n_groups])
 
-        for i, ((msg, group_items), item_buttons) in enumerate(
-            zip(groups, item_buttons_per_msg), 1
-        ):
-            if not msg.strip():
-                continue
-
-            # N3: консервативный check на превышение 4096
-            if len(msg) > _TG_MESSAGE_MAX:
-                logger.warning(
-                    "Дайджест msg[%d/%d]: %d символов (>%d лимит)",
-                    i, n_groups, len(msg), _TG_MESSAGE_MAX,
-                )
-
+        # M1-фикс: try/except ВНУТРИ цикла — падение одного сообщения
+        # не отменяет отправку остальных.
+        try:
             ok = delivery.send_digest(msg, item_buttons)
-            if ok:
-                sent_urls.extend(item.url for item in group_items)
-                sent_groups.append((msg, group_items))
-                logger.debug(
-                    "Дайджест msg[%d/%d]: ok (%d items)",
-                    i, n_groups, len(group_items),
-                )
-            else:
-                logger.warning(
-                    "Дайджест msg[%d/%d]: send_digest=False — "
-                    "%d items остаются deferred",
-                    i, n_groups,
-                    sum(len(it) for _, it in groups[i - 1:]),
-                )
-                # continue: остальные сообщения дайджеста должны уйти
-                # (at-least-once: отправленные → digested, этот item → deferred,
-                # retry в следующем окне)
+        except Exception as e:
+            logger.warning(
+                "Дайджест msg[%d/%d]: исключение при отправке (%s): %s — "
+                "%d items остаются deferred, остальные сообщения отправляются",
+                i, n_groups,
+                group_items[0].url if group_items else "—",
+                e, len(group_items),
+            )
+            continue
 
-    except Exception as e:
-        logger.error("Дайджест: исключение при отправке: %s", e)
-        # sent_urls/sent_groups содержит то, что отправлено до исключения
+        if ok:
+            sent_urls.extend(item.url for item in group_items)
+            sent_groups.append((msg, group_items))
+            logger.debug(
+                "Дайджест msg[%d/%d]: ok (%d items)",
+                i, n_groups, len(group_items),
+            )
+        else:
+            logger.warning(
+                "Дайджест msg[%d/%d]: send_digest=False — "
+                "%d items остаются deferred",
+                i, n_groups,
+                sum(len(it) for _, it in groups[i - 1:]),
+            )
+            # continue: остальные сообщения дайджеста должны уйти
+            # (at-least-once: отправленные → digested, этот item → deferred,
+            # retry в следующем окне)
 
     if not sent_urls:
         logger.info("Дайджест: ни одно сообщение не доставлено.")
@@ -394,7 +425,8 @@ def run_digest(
     max_items_per_message: int = 20,
     item_buttons_per_msg: List[List[dict]] = None,
     groups: List[Tuple[str, List[NewsItem]]] = None,
-) -> Tuple[int, List[str]]:
+    failed_urls_in: List[str] = None,
+) -> Tuple[int, List[str], List[str]]:
     """
     Выполняет дайджест: собирает deferred → формирует сообщения →
     отправляет → помечает digested.
@@ -404,6 +436,10 @@ def run_digest(
 
     m2-фикс: если groups передан — использует их напрямую (единый источник
     с pipeline, без пересчёта). Иначе — строит сам (обратная совместимость).
+
+    MAJOR 2-фикс: run_digest возвращает 3-tuple, включая all_failed_urls —
+    urls items, исключённых из отправки (per-item исключение при рендеринге
+    ИЛИ при создании feedback-target). Pipeline помечает их 'failed'.
 
     Args:
         storage: экземпляр Storage
@@ -416,11 +452,16 @@ def run_digest(
         groups: готовые группы сообщений (msg, items).
                 Если None — строится из storage.get_deferred_items
                 (обратная совместимость для внешних вызовов).
+        failed_urls_in: urls items, исключённых ПЕРЕД вызовом run_digest
+                        (битый feedback-target). Объединяется с build_failed_urls.
 
     Returns:
-        Tuple[int, List[str]]: (count, urls_digested)
-            count: число items помеченных digested
-            urls_digested: их URLs
+        Tuple[int, List[str], List[str]]: (sent_count, sent_urls, all_failed_urls)
+            sent_count: число отправленных items (помечены digested).
+            sent_urls: их URLs.
+            all_failed_urls: urls всех items, исключённых из отправки
+                             (рендеринг + feedback-target + build_failed).
+                             Pipeline помечает их 'failed'.
     """
     # m2: groups может быть передан из pipeline (единый источник).
     # При отсутствии — строим сами (old calls, тесты).
@@ -428,18 +469,28 @@ def run_digest(
         items = storage.get_deferred_items(limit=max_items)
         if not items:
             logger.info("Дайджест: нет отложенных новостей.")
-            return 0, []
+            all_failed = list(failed_urls_in) if failed_urls_in else []
+            return 0, [], all_failed
         logger.info("Дайджест: собрано %d отложенных новостей (лимит %d)",
                     len(items), max_items)
-        groups, all_included = build_digest_messages(
+        groups, all_included, build_failed_urls = build_digest_messages(
             items,
             max_items_per_message=max_items_per_message,
         )
     else:
         all_included = [item for _, grp in groups for item in grp]
+        build_failed_urls = []
+
+    # Собираем все failed_urls: build_failed (рендеринг) + failed_urls_in (feedback)
+    all_failed_urls: List[str] = list(build_failed_urls)
+    if failed_urls_in:
+        for url in failed_urls_in:
+            if url not in all_failed_urls:
+                all_failed_urls.append(url)
+
     if not groups:
         logger.info("Дайджест: нет сообщений для отправки.")
-        return 0, []
+        return 0, [], all_failed_urls
 
     logger.info("Дайджест: %d сообщений, %d items", len(groups), len(all_included))
 
@@ -451,34 +502,41 @@ def run_digest(
             delivery, groups, item_buttons_per_msg
         )
     else:
-        # Обратная совместимость: send_text (old pipeline / test calls)
-        try:
-            for i, (msg, group_items) in enumerate(groups, 1):
-                if not msg.strip():
-                    continue
-                if len(msg) > _TG_MESSAGE_MAX:
-                    logger.warning(
-                        "Дайджест msg[%d]: %d символов (>%d лимит)",
-                        i, len(msg), _TG_MESSAGE_MAX,
-                    )
+        # Обратная совместимость: send_text (old pipeline / test calls).
+        # MAJOR 2-фикс: per-message try/except — исключение на одном сообщении
+        # НЕ прерывает цикл отправки остальных. Остальные сообщения дайджеста
+        # уходят; битый item отмечается на уровне pipeline (по returned failed_urls).
+        for i, (msg, group_items) in enumerate(groups, 1):
+            if not msg.strip():
+                continue
+            if len(msg) > _TG_MESSAGE_MAX:
+                logger.warning(
+                    "Дайджест msg[%d]: %d символов (>%d лимит)",
+                    i, len(msg), _TG_MESSAGE_MAX,
+                )
+            try:
                 ok = delivery.send_text(msg)
-                if ok:
-                    sent_urls.extend(item.url for item in group_items)
-                else:
-                    logger.warning(
-                        "Дайджест msg[%d]: send_text=False — "
-                        "%d items остаются deferred",
-                        i, sum(len(it) for _, it in groups[i - 1:]),
-                    )
-                    # continue: остальные сообщения дайджеста должны уйти
-                    # (at-least-once сохраняется)
-        except Exception as e:
-            logger.error("Дайджест: исключение при отправке: %s", e)
-            # sent_urls содержит то, что отправлено до исключения
+            except Exception as e:
+                logger.warning(
+                    "Дайджест msg[%d]: исключение при отправке: %s — "
+                    "%d items исключены, остальные отправляются",
+                    i, e, len(group_items),
+                )
+                continue
+            if ok:
+                sent_urls.extend(item.url for item in group_items)
+            else:
+                logger.warning(
+                    "Дайджест msg[%d]: send_text=False — "
+                    "%d items остаются deferred",
+                    i, sum(len(it) for _, it in groups[i - 1:]),
+                )
+                # continue: остальные сообщения дайджеста должны уйти
+                # (at-least-once сохраняется)
         sent_count = len(sent_urls)
 
     if not sent_urls:
-        return 0, []
+        return 0, [], all_failed_urls
 
     try:
         marked = storage.set_digested(sent_urls)
@@ -488,4 +546,4 @@ def run_digest(
         # Данные отправлены, но не помечены → допустимый at-least-once.
         # Следующий дайджест может продублировать, но не потерять.
 
-    return sent_count, sent_urls
+    return sent_count, sent_urls, all_failed_urls

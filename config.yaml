@@ -123,8 +123,9 @@ database:
   retention_days: 1        # удалять delivered/skipped/failed/digested + 'new' items старше N дней
   retry_threshold_sec: 60 # pending считается зависшим через N секунд
   max_retries: 8           # лимит retry попыток → state=failed
-  deferred_retention_days: 1  # удалять старые deferred-items старше N дней (не попали в digest)
-                                  # 1 день = сутки хранения для дайджеста; старые очищаются при purge
+  deferred_retention_days: 3  # удалять старые deferred-items старше N дней (не попали в digest).
+                                  # 3 дня = запас на 6 дайджестов (08:00/21:00) при паузе/пропуске;
+                                  # deferred теперь НЕ удаляется при закрытии окна (v1.1.5).
   recovery_new_limit: 500     # макс. 'new'-items, загружаемых в RAM при K1-recovery за один цикл
                                   # (при долгой паузе 'new' накапливаются; лимит защищает RAM)
 
@@ -239,3 +240,10 @@ llm:
   # B12: system_prompt очищен. Источник истины — newsbot/llm/prompts.py.
   # Раскомментируйте и заполните только для override; иначе используется код.
   # system_prompt: ""
+  # Pricing: USD per 1M tokens (verify current DeepSeek prices before production)
+  pricing:
+    deepseek-flash:  {input: 0.27, output: 1.10}   # TODO: verify with DeepSeek docs
+    deepseek-v4-pro: {input: 0.50, output: 2.00}   # TODO: verify with DeepSeek docs
+  # Daily cost limit per model (USD per UTC day); 0 = disabled
+  # Items exceeding the limit remain pending and retry in the next cycle
+  daily_cost_limit: 0.50

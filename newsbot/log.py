@@ -105,6 +105,29 @@ class VersionFilter(logging.Filter):
         return True
 
 
+def _minimal_sanitizer_handler() -> None:
+    """
+    Минимальный санирующий handler на stderr — без полного логирования.
+    Ставится ДО CLI-ветвления (--check-telegram / --set-chat-id / --check-llm),
+    чтобы токены не попали в логи при ранних исключениях.
+
+    Добавляет StreamHandler с TokenSanitizer, НЕ трогает root handlers
+    (конфликт с test setup).
+    """
+    import sys
+    root = logging.getLogger()
+    # проверим что ещё не добавлен наш handler (idempotent)
+    for h in root.handlers:
+        if getattr(h, "_sanitizer_installed", False):
+            return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    handler.addFilter(TokenSanitizer())
+    handler._sanitizer_installed = True  # noqa: B010
+    root.addHandler(handler)
+
+
 def setup_logging(cfg: dict) -> None:
     """
     Конфигурирует корневой логгер и обработчики.

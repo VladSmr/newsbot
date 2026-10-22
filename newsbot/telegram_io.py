@@ -625,7 +625,7 @@ class TelegramPoller:
             time.sleep(min(step, seconds - slept))
             slept += step
 
-    def close(self) -> None:
+    def close(self, join_timeout: Optional[float] = None) -> None:
         """
         Закрывает HTTP-клиент poller.
         m2: НЕ закрывает Storage — это делает _run_loop в finally (в poller thread).
@@ -634,11 +634,23 @@ class TelegramPoller:
         Без set(): если поток в long-poll (25 с), close() без stop() ждёт
         все 30 с — лишнее ожидание. С set() поток проснётся сразу (через
         _sleep_backoff с is_set()-проверкой).
+
+        Параметры
+        ----------
+        join_timeout : float, optional
+            Явный таймаут join. Нужен для единого дедлайна shutdown: если
+            stop() уже ждал поток, close() не должен повторно ждать полные
+            poll_timeout+5. None (по умолчанию) — прежнее поведение.
         """
         # Minor-фикс: выставить флаг ДО join — снимает лишнее ожидание
         # и защищает от close() без предварительного stop().
         self._stop_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._log.debug("close: waiting for poller thread to finish...")
-            self._thread.join(timeout=self._poll_timeout + 5)
+            timeout = (
+                self._poll_timeout + 5
+                if join_timeout is None
+                else max(0.0, float(join_timeout))
+            )
+            self._thread.join(timeout=timeout)
         self._client.close()

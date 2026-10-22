@@ -1,5 +1,6 @@
 """Простой stemmer для кластеризации новостей. CPU, без зависимостей."""
 import re
+from typing import Optional
 
 STOP_WORDS = {
     # EN
@@ -83,14 +84,22 @@ def _stem_word(w: str) -> str:
 def normalize(text: str) -> str:
     """Нормализует заголовок: числа, стоп-слова, суффиксы, сортировка."""
     text = re.sub(r'\d+([.,]\d+)?', ' ', text.lower())
-    text = re.sub(r'[^a-z\u0430-\u044f\u0451\s]', ' ', text)
+    # Minor 7-фикс: добавлены укр. буквы і/ї/є/ґ (U+0456/U+0457/U+0454/U+0491)
+    text = re.sub(r'[^a-zA-Z\u0430-\u044f\u0451\u0456\u0457\u0454\u0491\s]', ' ', text)
     words = text.split()
     words = [_stem_word(w) for w in words]
     words = [w for w in words if w not in STOP_WORDS and len(w) > 2]
     return ' '.join(sorted(words))
 
 
-def stem_hash(text: str) -> str:
-    """Хеш нормализованного stem для кластеризации."""
+def stem_hash(text: str) -> Optional[str]:
+    """
+    Хеш нормализованного stem для кластеризации.
+    Minor 7-фикс: при пустом normalize (empty stem → md5("") коллизия)
+    возвращает None. Вызывающий код должен обработать sentinel.
+    """
     import hashlib
-    return hashlib.md5(normalize(text).encode()).hexdigest()[:8]
+    norm = normalize(text)
+    if not norm:
+        return None
+    return hashlib.md5(norm.encode()).hexdigest()[:8]

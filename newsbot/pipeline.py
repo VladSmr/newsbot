@@ -77,8 +77,35 @@ def _infer_category(item) -> str:
     """
     Определяет категорию новости по source + tags.
     categories: cinema, games, space, tech, cyber, science
+
+    source нормализуется: lowercase + убирается пунктуация/апострофы.
+    Словарь алиасов → канонический ключ.
     """
-    source = (item.source or "").lower()
+    raw = (item.source or "").lower()
+    import re
+    # Убираем всё что не буква/цифра (включая Unicode-апострофы, тире, пробелы)
+    # "Tom's Hardware" → "tomshardware"; "Krebs On Security" → "krebsonsecurity"
+    normalized = re.sub(r"[^\w]", "", raw, flags=re.UNICODE)
+
+    # Словарь алиасов → каноническое имя
+    _SOURCE_ALIASES = {
+        # Все пробелы/апострофы удаляются: "Tom's Hardware"→"tomshardware",
+        # "Krebs On Security"→"krebsonsecurity", "nasa spaceflight"→"nasaspaceflight"
+        "tomshardware": "tomshardware",
+        "krebsonsecurity": "krebs",
+        "nasaspaceflight": "nasaspaceflight",
+        "habr": "habr",
+        "habrnews": "habr",
+        "statnews": "statnews",
+        "stat": "statnews",
+        "sciencedaily": "sciencedaily",
+        "physorg": "physorg",
+        "bleepingcomputer": "bleepingcomputer",
+        "n1": "n1",
+        "nplus1": "n1",
+    }
+    source = _SOURCE_ALIASES.get(normalized, normalized)
+
     tags = _parse_tags(getattr(item, 'tags', None))
     tags_lower = [t.lower() for t in tags]
 
@@ -102,19 +129,19 @@ def _infer_category(item) -> str:
         return 'space'
 
     # Тех
-    if source in ('tom shardware', 'habr', 'techcrunch'):
+    if source in ('tomshardware', 'habr', 'techcrunch'):
         return 'tech'
     if any(t in tags_lower for t in ('technology', 'ai', 'tech', 'software', 'hardware')):
         return 'tech'
 
     # Кибербезопасность
-    if source in ('krebs on security', 'bleepingcomputer'):
+    if source in ('krebs', 'bleepingcomputer'):
         return 'cyber'
     if any(t in tags_lower for t in ('cyber', 'security', 'malware', 'hack', 'vulnerability')):
         return 'cyber'
 
     # Наука
-    if source in ('science daily', 'phys.org', 'n+1', 'naked science', 'statnews'):
+    if source in ('sciencedaily', 'physorg', 'n1', 'naked science', 'statnews'):
         return 'science'
     if any(t in tags_lower for t in ('science', 'research', 'study', 'discovery', 'medical', 'health')):
         return 'science'
@@ -131,11 +158,12 @@ def _cap_by_location(
 
     Для каждой пары (локация, день публикации) оставляет не более
     max_per_location новостей. Items с cluster_key=None или корзиной
-    'other' пропускаются (кэп на них не распространяется).
+    'other' пропускаются (кэп на них не распространяется — MAJOR 4-фикс:
+    'other' не ограничивается локацией и не считается в pre_cap_loc_day).
 
     Алгоритм: итерация по порядку, для каждой (локация, день) сохраняются
     первые max_per_location items — остальные отфильтровываются.
-    Вызывается в run_digest ПОСЛЕ backfill, ДО _category_guarantee.
+    Вызывается в run_digest ПОСЛЕ _category_guarantee, ДО backfill.
     """
     if max_per_location <= 0 or not items:
         return list(items)
@@ -320,9 +348,21 @@ def _iso_dt(value: str):
 
 
 class NewsPipeline:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, shutdown_event=None):
+        """
+        Parameters
+        ----------
+        config : dict
+            Полный конфиг приложения.
+        shutdown_event : threading.Event, optional
+            Событие graceful shutdown. Пробрасывается в TelegramDelivery,
+            чтобы его 429/pacing-ожидания прерывались при остановке
+            (иначе stop_grace_period истекает → SIGKILL).
+            None → прежнее поведение (ожидания не прерываются).
+        """
         self.config = config
         self.sources = config.get("sources", []) or []
+        self._shutdown_event = shutdown_event
 
         db_path = self._resolve_db_path(config)
         dedup_cfg = config.get("dedup", {})
@@ -622,7 +662,11 @@ class NewsPipeline:
 
         if token and chat_id:
             logger.info("Telegram token обнаружен — TelegramDelivery")
-            return TelegramDelivery(token=token, chat_id=chat_id)
+            return TelegramDelivery(
+                token=token,
+                chat_id=chat_id,
+                shutdown_event=self._shutdown_event,
+            )
         else:
             logger.info("Telegram token пуст — ConsoleDelivery")
             return ConsoleDelivery()
@@ -645,7 +689,9 @@ class NewsPipeline:
             return None
 
         try:
-            flt = LLMFilter(llm_cfg)
+            # storage необходим cost-guard'у (дневной лимит llm.daily_cost_limit):
+            # без него _check_daily_cost всегда возвращает True.
+            flt = LLMFilter(llm_cfg, storage=self.storage)
             mode = "urgent-only" if flt.push_urgent_only else "legacy"
             logger.info("LLM-фильтр инициализирован (%s / th=%d / mode=%s)",
                          flt.model, flt.push_threshold, mode)
@@ -1017,9 +1063,7 @@ class NewsPipeline:
                         reason=item.llm_reason or "",
                         urgent=bool(item.llm_urgent) if item.llm_urgent is not None else False,
                     )
-                    self._apply_result(item, res, push_th, digest_th,
-                                       push_urgent_only, skipped_urls, deferred_urls,
-                                       to_deliver, llm_batch_records)
+                    item._batch_result = res
 
                 # ── fresh: батч-оценка через LLM ──
                 if fresh_batch:
@@ -1034,38 +1078,57 @@ class NewsPipeline:
                     self._llm_calls_left -= len(fresh_batch)
                     llm_call_count += 1
 
+                    # M1: собираем результаты, но НЕ применяем route() сразу —
+                    # сначала вычислим cluster-max, потом применим.
                     for item, res in zip(fresh_batch, batch_results):
                         # сохраняем результат в item (всегда, даже ok=False)
                         item.llm_score = res.score
                         item.llm_summary = res.summary
                         item.llm_reason = res.reason
-                        self._apply_result(item, res, push_th, digest_th,
-                                           push_urgent_only, skipped_urls, deferred_urls,
-                                           to_deliver, llm_batch_records)
+                        item._batch_result = res
 
             logger.debug("LLM-вызовов за батч: %d", llm_call_count)
 
-            # сохраняем все llm-результаты батчем (push + deferred + skipped)
-            if llm_batch_records:
-                self.storage.update_llm_results_batch(llm_batch_records)
-
-            # ── Pre-LLM кластеризация: распределить максимальный score по кластеру ──
+            # CRITICAL #1-фикс: кластеризация ограничена items_to_llm (бюджетный
+            # срез). Items за пределами бюджета остаются pending, их llm_score
+            # не персистится → propagation для них не нужна.
             from collections import defaultdict
             cluster_scores: Dict[str, float] = defaultdict(lambda: 0.0)
             cluster_members: Dict[str, List[NewsItem]] = defaultdict(list)
-
-            for item in items:
+            for item in items_to_llm:
                 if getattr(item, "cluster_key", None):
                     cluster_members[item.cluster_key].append(item)
                     if item.llm_score is not None and item.llm_score > cluster_scores[item.cluster_key]:
                         cluster_scores[item.cluster_key] = float(item.llm_score)
 
-            # Распределить максимальный score обратно по кластеру
+            # CRITICAL #1-фикс: распространяем максимальный score обратно по кластеру.
+            # Цикл ограничен items_to_llm (бюджетный срез не трогаем —
+            # его items остаются pending без персиста). Мутируем res.score
+            # ДО route(), чтобы маршрутизация и запись в llm_batch_records
+            # согласованно видели повышенный score.
             for key, members in cluster_members.items():
                 best_score = cluster_scores[key]
                 for item in members:
                     if item.llm_score is None or item.llm_score < best_score:
                         item.llm_score = int(best_score)
+                        # Мутируем FilterResult, привязанный к item.
+                        # route() увидит согласованный score → правильная маршрутизация.
+                        res = getattr(item, "_batch_result", None)
+                        if res and res.ok:
+                            res.score = int(best_score)
+
+            # ── теперь route(): применяем результаты ко ВСЕМ items ──────────
+            for item in items_to_llm:
+                res = getattr(item, "_batch_result", None)
+                if res is None:
+                    continue
+                self._apply_result(item, res, push_th, digest_th,
+                                   push_urgent_only, skipped_urls, deferred_urls,
+                                   to_deliver, llm_batch_records)
+
+            # сохраняем все llm-результаты батчем (push + deferred + skipped)
+            if llm_batch_records:
+                self.storage.update_llm_results_batch(llm_batch_records)
 
             # ── фиксируем state и логируем итоговые счётчики (одна INFO-строка) ──
             n_skipped = len(skipped_urls)
@@ -1130,7 +1193,7 @@ class NewsPipeline:
                 except Exception as e:
                     logger.warning(
                         "feedback: не удалось создать target для '%s': %s",
-                        item.title[:60], e,
+                        (item.title or "")[:60], e,
                     )
 
         try:
@@ -1195,6 +1258,16 @@ class NewsPipeline:
         Вызывается из _process_batch после evaluate / synthesize (retry).
         """
         if not res.ok:
+            if res.cost_blocked:
+                # Дневной лимит LLM исчерпан: вызова не было, деньги не
+                # потрачены, завтра счётчик обнулится → item НЕ трогаем:
+                # остаётся 'pending' (как off-peak-гейт), не deferred/failed.
+                # Warning «лимит исчерпан» уже дан один раз за день в filter.
+                logger.debug(
+                    "cost-blocked: '%s' остаётся pending (дневной лимит LLM)",
+                    item.url,
+                )
+                return
             # M2-фикс: fallback при push_urgent_only=True → deferred (дайджест).
             # Это защищает от спама пушами: сбой LLM не означает срочность.
             # При push_urgent_only=False — прежнее поведение (push).
@@ -1329,6 +1402,16 @@ class NewsPipeline:
             )
         on_empty = digest_cfg.get("on_empty", "skip")
 
+        # M2: грейс published-фильтра: новости с published РАНЬШЕ window_start
+        # на poll_interval выпадали навсегда. Расширяем фильтр:
+        # published >= window_start - poll_interval.
+        # poll_interval из конфига, default 15 мин.
+        try:
+            poll_interval_minutes = int(self.config.get("poll_interval_minutes", 15))
+        except (TypeError, ValueError):
+            poll_interval_minutes = 15  # константа: 15 мин
+        grace_delta = timedelta(minutes=poll_interval_minutes)
+
         # ── Оконная логика: граница окна ───────────────────────────────────
         now_utc = datetime.now(tz.utc).replace(microsecond=0)
         digest_started_iso = now_utc.isoformat()
@@ -1351,12 +1434,21 @@ class NewsPipeline:
         # При bootstrap (граница не из meta) фильтр НЕ применяется —
         # это защищает тесты без явной границы и первый запуск на свежей БД.
         # Следующий цикл уже имеет границу в meta и будет фильтровать.
+        # Minor 3-фикс: проводка digest.max_age_hours (ранее мёртвый кноб).
+        max_age_hours: Optional[int] = None
+        try:
+            raw_age = digest_cfg.get("max_age_hours")
+            if raw_age is not None:
+                max_age_hours = int(raw_age)
+        except (TypeError, ValueError):
+            pass
         deferred_items = self.storage.get_deferred_items(
             # M3-фикс: берём с запасом, чтобы Python-фильтр по published
             # не «съел» нужные items (SQL LIMIT отрабатывает ДО фильтра).
             # Окончательная обрезка — deferred_items[:max_items] ниже.
             limit=max_items * 2 if (max_items and max_items > 0) else None,
             since_iso=window_start_iso if raw_boundary is not None else None,
+            max_age_hours=max_age_hours,
         )
         # Кросс-дайджест дедуп: items с published РАНЬШЕ начала окна не
         # попадают в дайджест (late-posted старые новости). Фильтр в Python:
@@ -1368,6 +1460,9 @@ class NewsPipeline:
         # — он будет использован для бэкфилла и гарантии по категориям.
         # Сохраняем ДО обрезки: это pool за пределами top-N.
         deferrable_post_published = list(deferred_items)
+        # M6: счётчики стадий
+        n_sql = len(deferred_items)
+        n_published = n_sql  # default: published-фильтр не отсеял ничего (bootstrap)
 
         if raw_boundary is not None:
             ws_dt = _iso_dt(window_start_iso)
@@ -1378,6 +1473,8 @@ class NewsPipeline:
                 # трактовала бы его как локальное время → граница съезжает на offset.
                 # Лечим: naive оставляем как есть, aware нормализуем.
                 ws_naive = ws_dt if ws_dt.tzinfo is None else ws_dt.astimezone(tz.utc).replace(tzinfo=None)
+                # M2: граница с учётом грейса (published может быть чуть раньше window_start)
+                ws_grace_naive = ws_naive - grace_delta
                 filtered = []
                 for it in deferrable_post_published:
                     pub_str = str(it.published or "")
@@ -1391,9 +1488,10 @@ class NewsPipeline:
                             pub_dt_norm = pub_dt.astimezone(tz.utc).replace(tzinfo=None)
                         else:
                             pub_dt_norm = pub_dt
-                        if pub_dt_norm >= ws_naive:
+                        if pub_dt_norm >= ws_grace_naive:
                             filtered.append(it)
                 deferrable_post_published = filtered
+                n_published = len(filtered)
 
         # Minor 2 (NIT 1): обрезаем СРАЗУ после published-фильтра, ДО кластеризации.
         # SQL-запас *2 оставлен (страхует от того, чтобы published-фильтр не «съел»
@@ -1405,6 +1503,7 @@ class NewsPipeline:
             if (max_items and max_items > 0)
             else deferrable_post_published
         )
+        n_top_n = len(deferred_items)
 
         logger.info(
             "Дайджест: старт — newsbot v%s, deferred=%d",
@@ -1436,6 +1535,7 @@ class NewsPipeline:
         _dup_urls = self._cluster_deferred_duplicates(deferred_items)
         if _dup_urls:
             deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
+        n_dedup = len(deferred_items)
 
         # ── Задача A: бэкфилл после LLM-дедупа ──────────────────────────────
         # Если в топе оказались дубли — дайджест недобирается (буфер max_items..2*max_items
@@ -1463,6 +1563,7 @@ class NewsPipeline:
                     "Дайджест: бэкфилл добавил %d items из пула (top-N был неполным)",
                     backfill_added,
                 )
+        n_backfill = len(deferred_items)
 
         # ── Задача B: гарантия по категориям с возможностью ПДТЯГИВАНИЯ ──────
         # Pool для гарантии: deferrable_post_published минус всё, что уже в
@@ -1481,25 +1582,121 @@ class NewsPipeline:
         category_min = digest_cfg.get("category_min", {})
         if category_min:
             deferred_items = _category_guarantee(deferred_items, category_min, pool=category_pool)
+        n_guarantee = len(deferred_items)
 
         # MAJOR: cap by location/day — СТРОГО ПОСЛЕДНИЙ, после всех свапов.
         # Инвариант «≤max_per_location на (локация, день)» держится железно,
         # cap не может обнулить список (max_per_location>0 → в каждой группе ≥1).
-        max_per_location = digest_cfg.get("max_per_location", 2)
+        # Minor 1-фикс: нормализация — None/0 → 0 (без ограничений), int для safety.
+        raw_max = digest_cfg.get("max_per_location", 2)
+        max_per_location = int(raw_max) if raw_max else 0
+        # MAJOR 3-фикс: cap by location/day. Считаем исчерпанные пары ДО cap
+        # (count >= max_per_location), чтобы логировать. Само ограничение
+        # выполняется _cap_by_location().
+        capped_count = 0
+        from collections import Counter
         if max_per_location and max_per_location > 0 and deferred_items:
+            pre_cap: Counter = Counter()
+            for it in deferred_items:
+                ck = getattr(it, 'cluster_key', None)
+                if ck:
+                    parts = ck.split('|')
+                    if len(parts) >= 3 and parts[0] != 'other':
+                        pre_cap[(parts[0], parts[2])] += 1
+            capped_count = sum(1 for cnt in pre_cap.values() if cnt >= max_per_location)
             deferred_items = _cap_by_location(
                 deferred_items, max_per_location=max_per_location,
             )
             if deferred_items:
                 logger.info(
-                    "Дайджест: location-cap оставил %d items",
-                    len(deferred_items),
+                    "Дайджест: location-cap оставил %d items (%d локаций исчерпано)",
+                    len(deferred_items), capped_count,
                 )
+        # Minor 2-фикс: n_cap фиксируется сразу после cap, ДО позднего backfill.
+        n_cap = len(deferred_items)
+        n_late_backfill = 0
+
+        # M4: добор после cap. Если остались свободные слоты — добираем
+        # из deferrable_post_published: items НЕ вошедшие в deferred_items
+        # из-за общего top_n, но чья (локация, день) ещё не исчерпана.
+        # Гарантия категорий: guarantee-items не вытесняются backfill'ом
+        # (guarantee уже выполнена и гарантийные items уже в deferred_items).
+        # Minor 2-фикс: комментарий уточнён — возраст уже отфильтрован в SQL
+        # get_deferred_items (max_age_hours передаётся в SQL-запрос).
+        backfill_added = 0
+        if len(deferred_items) < max_items and deferrable_post_published:
+            included_urls = {it.url for it in deferred_items}
+            # MAJOR 3-фикс (wave 2): единый проход отбора — проверка и инкремент
+            # running_counts В ОДНОМ цикле, где принимается решение об append.
+            # Старый баг: backfill_candidates наполнялся ПОЛНЫМ проходом
+            # (filter-only), а инкремент был в ОТДЕЛЬНОМ цикле ПОСЛЕ —
+            # все кандидаты одной (loc,day) проходили одновременно,
+            # превышая max_per_location.
+            # running_counts инициализируется из post-cap deferred_items
+            # (deferred_items уже прошли cap → реальные числа в дайджесте).
+            # Counter импортирован выше (Minor 3-фикс).
+            running_counts: Counter = Counter()
+            if max_per_location and max_per_location > 0:
+                for it in deferred_items:
+                    ck = getattr(it, 'cluster_key', None)
+                    if ck:
+                        parts = ck.split('|')
+                        if len(parts) >= 3 and parts[0] != 'other':
+                            running_counts[(parts[0], parts[2])] += 1
+            backfill_candidates: List[NewsItem] = []
+            for it in deferrable_post_published:
+                if it.url in included_urls:
+                    continue
+                # M1: пропускаем LLM-дубли (не были в deferred_items после dedup,
+                # но они в deferrable_post_published)
+                if it.url in _dup_urls:
+                    continue
+                # Единый проход: проверка + инкремент сразу, до следующего кандидата.
+                # 'other' или отсутствие cluster_key не ограничивается локацией.
+                # Minor 1-фикс: guard max_per_location > 0 — без него 0>=0=True,
+                # backfill отбрасывает всех (тихая деградация при max_per_location=0).
+                ck = getattr(it, 'cluster_key', None)
+                if ck and max_per_location > 0:
+                    parts = ck.split('|')
+                    if len(parts) >= 3 and parts[0] != 'other':
+                        loc_day = (parts[0], parts[2])
+                        if running_counts[loc_day] >= max_per_location:
+                            continue
+                        running_counts[loc_day] += 1
+                backfill_candidates.append(it)
+            # Сортировка: score DESC (fetched_at ASC уже в исходном порядке из SQL)
+            backfill_candidates.sort(key=lambda x: -(x.llm_score or 0))
+            for it in backfill_candidates:
+                if len(deferred_items) >= max_items:
+                    break
+                deferred_items.append(it)
+                n_late_backfill += 1
+            if n_late_backfill:
+                logger.info(
+                    "Дайджест: backfill после cap добавил %d items "
+                    "(loc free slots used)",
+                    n_late_backfill,
+                )
+        # Minor 2-фикс: n_backfill_total = после ВСЕГО добора (ранний + поздний).
+        # Ранний backfill считал items_added; поздний — n_late_backfill.
+        n_backfill_total = n_backfill + n_late_backfill
 
         # Финальный сорт — по llm_score DESC (состав уже зафиксирован гарантийными
         # свапами; сорт только порядок вывода). Финальный slice ПОСЛЕ гарантии.
         deferred_items.sort(key=lambda x: x.llm_score or 0, reverse=True)
         deferred_items = deferred_items[:max_items]
+        n_final = len(deferred_items)
+
+        # M6: единый INFO-лог стадий (воронка: sql → published → top_n → dedup →
+        #      early_backfill → guarantee → cap → late_backfill → final).
+        # Minor 2-фикс: backfill_total = ранний + поздний добор; cap фиксируется
+        # после cap, до позднего backfill.
+        logger.info(
+            "Дайджест stages: sql=%d published=%d top_n=%d dedup=%d "
+            "early_backfill=%d guarantee=%d cap=%d late_backfill=%d final=%d",
+            n_sql, n_published, n_top_n, n_dedup, n_backfill,
+            n_guarantee, n_cap, n_late_backfill, n_final,
+        )
 
         # ── Feedback targets + передача готовых groups в digest ──
         # F2: только при TelegramDelivery + feedback.enabled + digest_enabled.
@@ -1524,18 +1721,23 @@ class NewsPipeline:
             and isinstance(self.delivery, TelegramDelivery)
         )
 
-        groups, _ = build_digest_messages(
+        # CRITICAL-фикс: инициализация ДО использования.
+        # Раньше: `failed_digest_urls` объявлялась ПОСЛЕ build_digest_messages —
+        # при исключении в рендеринге → UnboundLocalError → весь дайджест падал,
+        # set_state('failed') не вызывался, маркеры окна не двигались.
+        failed_digest_urls: List[str] = []
+
+        groups, _, _build_failed = build_digest_messages(
             deferred_items,
             max_items_per_message=max_items_per_message,
         )
 
-        # Major 2: считаем сколько items реально уйдёт (для проверки полного успеха).
-        # total_to_send — items в groups (отфильтрованные дубли не попадают сюда).
-        # Критерий полного успеха дайджеста: все items из groups отправлены
-        # (sent_count >= total_to_send). При частичном сбое
-        # (sent_count < total_to_send) — лидер(ы) помечены digest.run_digest,
-        # дубли НЕ терминализируются (retry в след.окне).
-        total_to_send = sum(len(grp) for _, grp in groups)
+        # MAJOR 2-фикс: _build_failed — items, выпавшие при рендеринге
+        # (уже исключены из groups). Добавляем к feedback-failed для set_state('failed').
+        if _build_failed:
+            for url in _build_failed:
+                if url not in failed_digest_urls:
+                    failed_digest_urls.append(url)
 
         # Фикс: оригинальное условие, но с правильным приоритетом скобок.
         # Оригинальное: not groups and not (not deferred_items and on_empty == "send")
@@ -1549,6 +1751,28 @@ class NewsPipeline:
         #   - НЕ выходим: on_empty="send" + groups пустые + deferred_items ПУСТЫЕ
         #     → отправляем уведомление "нет новостей"
         if not groups and (on_empty != "send" or deferred_items):
+            # CRITICAL-фикс (3): все items упали при рендеринге — ранний выход,
+            # но _build_failed urls ДОЛЖНЫ быть помечены 'failed', иначе они
+            # вечно останутся deferred (маркеры окна двигаются при return 0,
+            # но state='deferred' → при следующем окне они снова выберутся).
+            # Minor 2-фикс: границу окна двигает ТОЛЬКО успех. Если
+            # set_state('failed') упал — НЕ двигаем digest_window_started_at
+            # (иначе оставшиеся deferred окажутся позади новой границы,
+            # отсекутся published-фильтром и молча потеряются) и выходим.
+            if _build_failed:
+                logger.warning(
+                    "Дайджест: %d items выпали при рендеринге — помечаются 'failed'",
+                    len(_build_failed),
+                )
+                try:
+                    self.storage.set_state(_build_failed, "failed")
+                except Exception as e:
+                    logger.warning(
+                        "Дайджест: set_state('failed') упал: %s — "
+                        "граница окна НЕ сдвинута, items остаются deferred",
+                        e,
+                    )
+                    return 0
             logger.info("Дайджест: нет сообщений для отправки.")
             # M2: пишем маркер окна и при force+empty, чтобы _maybe_run_digest
             # не спамил повторно в следующем цикле.
@@ -1562,7 +1786,10 @@ class NewsPipeline:
             self.storage.set_meta("digest_window_started_at", new_boundary)
             return 0
 
-        item_buttons_per_msg: List[List[dict]]
+        # ── M3: финальная сборка item_buttons_per_msg с изоляцией битых items ──
+        # Карта url → target_id для ВСЕХ успешно созданных targets: после
+        # пересборки сообщений (m1-фикс ниже) кнопки восстанавливаются по ней.
+        target_id_by_url: Dict[str, Optional[int]] = {}
         if should_feedback:
             item_buttons_per_msg = []
             for msg, group_items in groups:
@@ -1573,35 +1800,159 @@ class NewsPipeline:
                             item, "digest"
                         )
                     except Exception as e:
+                        # MAJOR 2a-фикс: per-item poison pill — изолируем битый item.
+                        # Он помечается 'failed' и не вернётся в следующие окна.
                         logger.warning(
-                            "feedback: не удалось создать target для '%s': %s",
-                            item.title[:60], e,
+                            "digest: item '%s' исключение при feedback-target: %s — "
+                            "помечается 'failed'",
+                            (item.title or "")[:60], e,
                         )
+                        failed_digest_urls.append(item.url)
                         target_id = None
-                    # NOTE: поле "url" намеренно НЕ передаётся — send_digest()
-                    # использует только target_id. Ссылка на новость уже в тексте
-                    # дайджеста (<a href> в digest.py footer); дублирование
-                    # кнопкой отключено (URL-кнопка сломала бы экранирование).
+                    if target_id is not None:
+                        target_id_by_url[item.url] = target_id
                     item_buttons.append({
                         "target_id": target_id,
                     })
                 item_buttons_per_msg.append(item_buttons)
         else:
-            # ConsoleDelivery или feedback выключен — пустые кнопки
             item_buttons_per_msg = None  # type: ignore[assignment]
 
+        # ── MAJOR 2-фикс: убираем failed_digest_urls из groups ДО отправки ──
+        # Критично: item с упавшим target НЕ должен отправляться (он уже
+        # зафиксирован как 'failed' и при sent→digested перезатрётся в 'failed').
+        # Также: total_to_send пересчитывается от отфильтрованных groups.
+        #
+        # MAJOR m1-фикс: текст сообщения ПЕРЕСОБИРАЕТСЯ из оставшихся items.
+        # Раньше msg собирался в build_digest_messages (:1730) ДО выбивания
+        # item'ов, поэтому выбитый item оставался виден в тексте, а кнопок
+        # для него уже не было → 👍/👎 следующих новостей визуально
+        # сдвигались (неверная атрибуция фидбэка), а сам item не помечался
+        # digested и дублировался в следующем окне. Теперь его нет ни в
+        # тексте (включая заголовок «N из M»), ни в кнопках; он помечается
+        # 'failed' ниже (:1939) и повторно не отправляется.
+        if failed_digest_urls:
+            failed_set = set(failed_digest_urls)
+            dropped_from_text = any(
+                it.url in failed_set for _, grp in groups for it in grp
+            )
+            if dropped_from_text:
+                surviving_items = [
+                    it for _, grp in groups for it in grp
+                    if it.url not in failed_set
+                ]
+                if surviving_items:
+                    groups, _, _rebuild_failed = build_digest_messages(
+                        surviving_items,
+                        max_items_per_message=max_items_per_message,
+                    )
+                    # Пересборка идемпотентна (items уже рендерились), но
+                    # подстраховываемся: выпавшие и здесь — тоже 'failed'.
+                    for url in _rebuild_failed:
+                        if url not in failed_set:
+                            failed_set.add(url)
+                            failed_digest_urls.append(url)
+                else:
+                    groups = []
+            if item_buttons_per_msg is not None:
+                # Кнопки — строго по items финальных groups (по url), чтобы
+                # 👍/👎 каждой новости соответствовали её target_id.
+                item_buttons_per_msg = [
+                    [
+                        {"target_id": target_id_by_url.get(it.url)}
+                        for it in grp
+                    ]
+                    for _, grp in groups
+                ]
+
+        # total_to_send — от отфильтрованных groups (items без упавших target).
+        # При частичном сбое отправки (sent_count < total_to_send) лидеры,
+        # дошедшие до получателя, помечены digest; дубли НЕ трогаем.
+        total_to_send = sum(len(grp) for _, grp in groups)
+
+        # ── M3: счётчик подряд идущих неудачных запусков дайджеста ──────────
+        failure_count = 0
+        try:
+            raw_fail = self.storage.get_meta("digest_failure_count")
+            if raw_fail is not None:
+                failure_count = int(raw_fail)
+        except (TypeError, ValueError):
+            failure_count = 0
+
+        if failure_count >= 3:
+            # C1-фикс: 3-strike НЕ сдвигает границу окна и не теряет items.
+            # Границу двигает ТОЛЬКО успешное закрытие окна (см. ниже).
+            # Иначе неотправленный deferred-бэклог оставался бы позади новой
+            # границы, отсекался published-фильтром и молча вымывался
+            # purge_items (deferred_retention_days). Items остаются deferred
+            # и повторятся; цикл ограничен digest_failure_count + retention.
+            sample_urls = [it.url for _, grp in groups for it in grp][:5]
+            logger.warning(
+                "Дайджест: пропущен (%d неудачных попыток подряд) — "
+                "%d items остаются deferred, граница окна НЕ сдвинута, "
+                "счётчик сброшен; примеры url: %s",
+                failure_count, total_to_send, ", ".join(sample_urls) or "—",
+            )
+            self.storage.set_meta("digest_failure_count", "0")
+            self.storage.set_meta("last_digest_at", digest_started_iso)
+            return 0
+
         # ── Отправляем через digest (с готовыми groups + buttons) ──
-        sent_count, sent_urls = _run_digest(
-            storage=self.storage,
-            delivery=self.delivery,
-            groups=groups,
-            item_buttons_per_msg=item_buttons_per_msg,
-        )
+        try:
+            sent_count, sent_urls, digest_failed_urls = _run_digest(
+                storage=self.storage,
+                delivery=self.delivery,
+                groups=groups,
+                item_buttons_per_msg=item_buttons_per_msg,
+                failed_urls_in=failed_digest_urls,
+            )
+        except Exception as e:
+            # C1-фикс: неуспешная попытка НЕ двигает digest_window_started_at —
+            # границу окна сдвигает ТОЛЬКО успешное закрытие окна (ниже).
+            # Раньше здесь писался digest_started_iso («сейчас»), после чего
+            # published-фильтр (грейс = poll_interval) отсекал все
+            # неотправленные deferred старше ~15 мин → накопленный бэклог
+            # навсегда выпадал из дайджеста и тихо вымывался purge_items.
+            # Зацикливание ограничено digest_failure_count (3-strike warning)
+            # и штатным deferred_retention_days в purge_items.
+            logger.warning(
+                "Дайджест: исключение при отправке: %s — items остаются "
+                "deferred, граница окна НЕ сдвинута",
+                e,
+            )
+            failure_count += 1
+            self.storage.set_meta("digest_failure_count", str(failure_count))
+            logger.info(
+                "Дайджест: счётчик неудачных попыток %d/3",
+                failure_count,
+            )
+            self.storage.set_meta("last_digest_at", digest_started_iso)
+            return 0
+
+        # MAJOR 2-фикс: per-item poison pill — изолируем битые items.
+        # digest_failed_urls содержит: build_failed_urls (рендеринг) +
+        # failed_digest_urls (feedback-target). Все они исключены из groups
+        # ДО отправки (не отправлялись, не помечены digested).
+        # Pipeline помечает их 'failed' — они НЕ вернутся в следующие окна.
+        if digest_failed_urls:
+            try:
+                marked = self.storage.set_state(digest_failed_urls, "failed")
+                logger.info(
+                    "digest: %d/%d items → 'failed' (per-item исключение: "
+                    "рендеринг +/ feedback-target)",
+                    marked, len(digest_failed_urls),
+                )
+            except Exception as e:
+                logger.warning("digest: set_state('failed') упал: %s", e)
 
         # Critical-фикс: retry_count для deferred НЕ инкрементируется,
         # deferred НЕ терминализируются. При транзиентном сбое они остаются
-        # в очереди и повторяются в следующем окне. last_digest_at пишется
-        # только при успешной отправке (sent_count>0), обеспечивая retry.
+        # в очереди и повторяются в следующем окне.
+        # C1-фикс: digest_window_started_at двигает ТОЛЬКО успешное закрытие
+        # окна (ветка sent_count >= total_to_send ниже). Неуспешные ветки
+        # пишут только last_digest_at / digest_failure_count — граница окна
+        # остаётся прежней, поэтому неотправленный бэклог не выпадает из
+        # published-фильтра и не теряется.
         # Retention-purge для deferred реализован в purge_items
         # (deferred_retention_days), но терминализация по retry НЕ применяется.
 
@@ -1611,8 +1962,9 @@ class NewsPipeline:
         #     слать нечего → пишем маркер (не спамим в следующем цикле).
         # (в) пустой deferred + on_empty=send: пустое уведомление отправлено → окно обработано.
         # (г) on_empty=send + force + пустой deferred: тоже пишем маркер.
-        # При транзиентном сбое (все отправки failed) окно НЕ помечается
-        # обработанным — retry в следующем цикле, а не через 12ч.
+        # При транзиентном сбое last_digest_at пишется при 3-strike — чтобы не
+        # спамить попытками до следующего scheduled, — но граница окна
+        # НЕ сдвигается, поэтому items доживают до следующей попытки.
         now_iso = datetime.now(tz.utc).replace(microsecond=0).isoformat()
         # (a) sent_count >= total_to_send: все items дайджеста отправлены →
         #     digest.run_digest уже пометил их 'digested' через sent_urls.
@@ -1622,6 +1974,8 @@ class NewsPipeline:
         #     остаётся deferred и повторится в следующем окне (at-least-once).
         if sent_count >= total_to_send and sent_count > 0:
             logger.info("Дайджест: %d новостей → 'digested'", sent_count)
+            # M3: сброс счётчика неудачных попыток при успехе
+            self.storage.set_meta("digest_failure_count", "0")
             self.storage.set_meta("last_digest_at", now_iso)
             if _dup_urls:
                 try:
@@ -1652,30 +2006,22 @@ class NewsPipeline:
                         "граница окна отодвинута", unprocessed,
                     )
             try:
-                # Удаляем ровно окно: всё, что собрано ДО старта дайджеста
-                # (отправленное, отсеянное фильтром, не влезшее в лимит).
-                # new/ pending защищены на уровне storage.
-                # Пришедшее во время отправки (fetched_at >= digest_started_iso)
+                # Удаляем ровно окно: всё, что собрано ДО window_start_iso.
+                # new/pending защищены на уровне storage.
+                # Пришедшее во время отправки (fetched_at >= window_start_iso)
                 # остаётся — уйдёт в следующее окно.
-                deleted = self.storage.delete_items_before(digest_started_iso)
+                # FIX: digest_started_iso (NOW) заменён на window_start_iso (логическая
+                # граница). При bootstrap NOW-24h мог быть МЕНЬШЕ fetched_at
+                # только-что сохранённого item, и он бы удалялся на первом же
+                # digest. На повторных — NOW меняется, window_start_iso фиксирована
+                # из meta, и item между ними тоже бы удалился. window_start_iso
+                # стабильна: bootstrap фиксирует её в meta после первого digest.
+                deleted = self.storage.delete_items_before(window_start_iso)
                 logger.info("Дайджест: окно закрыто, удалено %d items", deleted)
             except Exception as e:
                 logger.error("Дайджест: не удалось очистить окно: %s", e)
             else:
                 self.storage.set_meta("digest_window_started_at", new_boundary)
-        elif not deferred_items and on_empty == "skip":
-            # M2: окно проверено, слать нечего → пишем маркер чтобы
-            # _maybe_run_digest не запускал повторно в следующем цикле.
-            logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
-            self.storage.set_meta("last_digest_at", now_iso)
-            # Закрываем окно с откатом границы при наличии необработанных.
-            unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-            new_boundary = digest_started_iso
-            if isinstance(unprocessed, str):
-                udt = _iso_dt(unprocessed)
-                if udt is not None and udt < now_utc:
-                    new_boundary = unprocessed
-            self.storage.set_meta("digest_window_started_at", new_boundary)
         elif not deferred_items and on_empty == "send":
             # on_empty=send: отправляем пустое уведомление
             empty_msg = "📰 Дайджест — нет новых новостей."
@@ -1694,9 +2040,51 @@ class NewsPipeline:
             except Exception as e:
                 logger.warning("Дайджест: пустой дайджест не отправлен: %s", e)
         else:
-            # sent_count==0 при непустом deferred — транзиентный сбой,
-            # маркер НЕ пишем, retry в следующем цикле.
-            logger.debug("Дайджест: пропущен (empty, force=%s)", force)
+            # sent_count < total_to_send при непустом deferred, ИЛИ
+            # total_to_send == 0 (все items выбиты фильтрацией target'ов).
+            # C1-фикс: граница окна НЕ сдвигается — её двигает только успешное
+            # закрытие окна. Иначе неотправленный бэклог с published старше
+            # новой границы отсекался published-фильтром и молча вымывался
+            # purge_items по deferred_retention_days.
+            # MAJOR 2b-фикс: reset счётчика — только после 3-strike (чтобы
+            # бот сам восстанавливался после разового внешнего сбоя).
+            # Minor 1-фикс: счётчик 3-strike инкрементируется ТОЛЬКО при
+            # полном провале доставки (sent_count == 0 AND total_to_send > 0).
+            # Частичный успех (часть сообщений доставлена) — не failure:
+            # иначе 3 частичных успеха подряд приводили к пропуску следующего
+            # scheduled-окна. total_to_send == 0 (все items выбиты фильтрацией
+            # target'ов) — тоже не failure: они помечены 'failed', а не
+            # потеряны.
+            if sent_count == 0 and total_to_send > 0:
+                failure_count += 1
+                self.storage.set_meta("digest_failure_count", str(failure_count))
+                if failure_count >= 3:
+                    remaining = max(0, total_to_send - sent_count)
+                    sample_urls = [
+                        it.url for _, grp in groups for it in grp
+                        if it.url not in set(sent_urls)
+                    ][:5]
+                    logger.warning(
+                        "Дайджест: %d неудачных попыток подряд — %d items остаются "
+                        "deferred, граница окна НЕ сдвинута (повтор в следующем окне), "
+                        "счётчик сброшен; примеры url: %s",
+                        failure_count, remaining, ", ".join(sample_urls) or "—",
+                    )
+                    # reset после 3-strike — бот сам восстанавливается после
+                    # разового внешнего сбоя (сеть/Telegram API transient).
+                    self.storage.set_meta("digest_failure_count", "0")
+                    self.storage.set_meta("last_digest_at", now_iso)
+                else:
+                    logger.debug(
+                        "Дайджест: пропущен (sent_count=%d/%d, failures=%d/3)",
+                        sent_count, total_to_send, failure_count,
+                    )
+            else:
+                logger.debug(
+                    "Дайджест: частичная доставка или пустой набор "
+                    "(sent_count=%d/%d) — 3-strike не инкрементируется",
+                    sent_count, total_to_send,
+                )
 
         return sent_count
 

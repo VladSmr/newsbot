@@ -388,20 +388,20 @@ class TestBatchPromptContent:
         FakeChatCompletionBatch.uninstall()
 
     def test_user_message_contains_data_markers(self):
-        """User-сообщение содержит <|данные:N|> и <|конец данных:N|>."""
+        """User-сообщение содержит <|data:N|> и <|end data:N|>."""
         from newsbot.llm.prompts import build_batch_user_message, build_feedback_block
 
         items = [make_item(f"https://x.com/{i}", f"Title{i}", f"Sum{i}") for i in range(1, 4)]
         msg = build_batch_user_message(items)
 
         # маркировка ДАННЫХ
-        assert "ДАННЫЕ" in msg
-        assert "<|данные:1|>" in msg
-        assert "<|данные:2|>" in msg
-        assert "<|данные:3|>" in msg
-        assert "<|конец данных:1|>" in msg
-        assert "<|конец данных:2|>" in msg
-        assert "<|конец данных:3|>" in msg
+        assert "DATA" in msg
+        assert "<|data:1|>" in msg
+        assert "<|data:2|>" in msg
+        assert "<|data:3|>" in msg
+        assert "<|end data:1|>" in msg
+        assert "<|end data:2|>" in msg
+        assert "<|end data:3|>" in msg
 
         # titles на месте
         assert "Title1" in msg
@@ -415,7 +415,7 @@ class TestBatchPromptContent:
         ctx = ([{"title": "Bad", "source": "Src"}], [])  # dislikes
         msg = build_batch_user_message(items, feedback_context=ctx)
 
-        assert "ДАННЫЕ" in msg
+        assert "DATA" in msg
         assert "Bad" in msg
 
 
@@ -440,23 +440,23 @@ class TestBatchSanitization:
         msg = build_batch_user_message([item])
 
         # Сырых \\n в title из данных — нет (санитизирован)
-        lines = msg.split("# Заголовок\n")
+        lines = msg.split("# Title\n")
         assert len(lines) >= 2
         title_part = lines[1].split("\n")[0]
         assert "\n" not in title_part, \
             f"Raw newline in sanitized title: {repr(title_part)}"
 
         # Summary санитизирован
-        if "# Содержание\n" in msg:
-            lines2 = msg.split("# Содержание\n")
+        if "# Content\n" in msg:
+            lines2 = msg.split("# Content\n")
             if len(lines2) >= 2:
                 summary_part = lines2[1].split("\n")[0]
                 assert "\n" not in summary_part, \
                     f"Raw newline in sanitized summary: {repr(summary_part)}"
 
         # Source санитизирован
-        if "# Источник:" in msg:
-            src_line = [l for l in msg.split("\n") if l.startswith("# Источник:")][0]
+        if "# Source:" in msg:
+            src_line = [l for l in msg.split("\n") if l.startswith("# Source:")][0]
             assert "\n" not in src_line, \
                 f"Raw newline in sanitized source: {repr(src_line)}"
 
@@ -471,8 +471,8 @@ class TestBatchSanitization:
         )
         msg = build_batch_user_message([item])
 
-        # Валидный делимитер <|данные:1|> — на месте
-        assert "<|данные:1|>" in msg
+        # Валидный делимитер <|data:1|> — на месте
+        assert "<|data:1|>" in msg
         # Поддельный <|данные:999|> — нейтрализован (< |данные:999|>)
         assert "< |" in msg
         assert "<|данные:999|>" not in msg, \
@@ -514,7 +514,7 @@ class TestBatchSanitization:
         msg = build_batch_user_message([item])
 
         # Убеждаемся что title однострочный (без \\n)
-        lines = msg.split("# Заголовок\n")
+        lines = msg.split("# Title\n")
         title_part = lines[1].split("\n")[0]
         assert "\n" not in title_part
         assert "\r" not in title_part
@@ -526,20 +526,20 @@ class TestBatchSanitization:
         FakeChatCompletionBatch.uninstall()
 
     def test_user_message_contains_data_markers(self):
-        """User-сообщение содержит <|данные:N|> и <|конец данных:N|>."""
+        """User-сообщение содержит <|data:N|> и <|end data:N|>."""
         from newsbot.llm.prompts import build_batch_user_message, build_feedback_block
 
         items = [make_item(f"https://x.com/{i}", f"Title{i}", f"Sum{i}") for i in range(1, 4)]
         msg = build_batch_user_message(items)
 
         # маркировка ДАННЫХ
-        assert "ДАННЫЕ" in msg
-        assert "<|данные:1|>" in msg
-        assert "<|данные:2|>" in msg
-        assert "<|данные:3|>" in msg
-        assert "<|конец данных:1|>" in msg
-        assert "<|конец данных:2|>" in msg
-        assert "<|конец данных:3|>" in msg
+        assert "DATA" in msg
+        assert "<|data:1|>" in msg
+        assert "<|data:2|>" in msg
+        assert "<|data:3|>" in msg
+        assert "<|end data:1|>" in msg
+        assert "<|end data:2|>" in msg
+        assert "<|end data:3|>" in msg
 
         # titles на месте
         assert "Title1" in msg
@@ -553,7 +553,7 @@ class TestBatchSanitization:
         ctx = ([{"title": "Bad", "source": "Src"}], [])  # dislikes
         msg = build_batch_user_message(items, feedback_context=ctx)
 
-        assert "ДАННЫЕ" in msg
+        assert "DATA" in msg
         assert "Bad" in msg
 
 
@@ -601,7 +601,7 @@ class TestPromptFieldCapping:
         """Длинный title обрезается до MAX_PROMPT_TITLE_CHARS."""
         from newsbot.collector import NewsItem
 
-        long_title = "B" * 500  #远超 200
+        long_title = "B" * 500  # far exceeds 200 chars limit
         item = NewsItem(
             source="Test",
             url="https://x.com/1",

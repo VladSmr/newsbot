@@ -40,6 +40,37 @@ class TestStemmer:
         assert "в" not in result
         assert "белгородск" in result or "област" in result
 
+    def test_normalize_russian_drone_headline(self):
+        """Русский заголовок → не пустой hash (не md5(''))."""
+        result = normalize("Сбито 80 БПЛА в Крыму")
+        assert result.strip() != "", (
+            "normalize() не должен возвращать пустую строку для русского заголовка. "
+            "Это указывает на потерю кириллицы при нормализации."
+        )
+        assert len(result) > 0
+
+    def test_normalize_russian_vs_other_different(self):
+        """Два разных русских заголовка → разные строки."""
+        r1 = normalize("Сбито 80 БПЛА в Крыму")
+        r2 = normalize("Другая новость в Крыму")
+        assert r1 != r2, "Разные заголовки должны давать разные стемы"
+
+    def test_stem_hash_cyrillic_nonempty(self):
+        """stem_hash() для русского заголовка — не md5('')."""
+        h = stem_hash("Сбито 80 БПЛА в Крыму")
+        MD5_EMPTY = "d41d8cd98f00b204e9800998ecf8427e"
+        assert h != MD5_EMPTY, (
+            f"stem_hash вернул md5('') = {h}. Кириллица теряется при нормализации!"
+        )
+        assert len(h) == 8, "stem_hash должен быть 8-символьным"
+
+    def test_normalize_emoji_headline(self):
+        """Emoji/Unicode в заголовке — нормализация не падает, hash не пустой."""
+        result = normalize("Breaking 🚨 News 🔥 in Tokyo")
+        assert result.strip() != "", "Emoji-заголовок не должен давать пустой normalize()"
+        h = stem_hash("Breaking 🚨 News 🔥 in Tokyo")
+        assert h != "d41d8cd9", "Emoji-заголовок не должен давать md5('')"
+
     def test_stem_suffix_stripping(self):
         """Суффиксы корректно убираются."""
         result = normalize("protesting protesters protestation")
@@ -70,11 +101,82 @@ class TestLocations:
         """Без совпадения возвращается 'other'."""
         assert extract_location("Something happened somewhere") == "other"
 
-    def test_extract_location_first_match(self):
+    def test_extract_location_two_word(self):
+        """2-словная локация: 'South Africa' → 'юар' (n-грамма 2)."""
+        assert extract_location("Mining boom in South Africa") == "юар"
+        assert extract_location("South Africa elections: what to expect") == "юар"
+
+    def test_extract_location_us_not_helps_us(self):
+        """'helps us understand' → НЕ локация US (строчная 'us')."""
+        assert extract_location("Study helps us understand the brain") == "other"
+        # Но заглавная US как отдельное слово → сша
+        assert extract_location("US announces new tariffs on China") == "сша"
+        assert extract_location("The US president signed the bill") == "сша"
+
+    def test_extract_location_no_punct_glue(self):
+        """Пунктуация не склеивает токены: 'Moscow,' — москва."""
+        assert extract_location("Moscow, rain expected today") == "москва"
+        # Точка внутри слова — не матчится
+        assert extract_location("U.S. sanctions announced") == "other"
+
+    def test_extract_location_cyrillic_ngram(self):
+        """3-грамма 'белгородская область' → россия."""
+        assert extract_location("В Белгородской области прошли события") == "россия"
+        assert extract_location(
+            "В Белгородской области прошли события и обстрелы"
+        ) == "россия"
         """extract_location возвращает первую найденную."""
         # "France" — первое слово — должно вернуть "франция"
         result = extract_location("France and Germany sign deal in Berlin")
         assert result == "франция"
+
+    def test_extract_location_typographic_quotes(self):
+        """NIT: «ёлочки»/многоточие/тире снимаются с краёв токена."""
+        assert extract_location("«Москва» — новости дня") == "москва"
+        assert extract_location("Москва…") == "москва"
+        assert extract_location("Москва — новости дня") == "москва"
+        assert extract_location("«Киев»: подробности") == "киев"
+
+    def test_locations_no_duplicate_kiev(self):
+        """
+        NIT: в исходнике LOCATIONS нет дублирующихся строковых ключей.
+
+        Проверка через импортированный dict бесполезна: в dict-литерале
+        дубликат молча перекрывается ещё при создании объекта, и тест
+        `LOCATIONS["kiev"] == "киев"` проходит даже при наличии мёртвой
+        записи. Поэтому парсим исходник locations.py и ищем повторы ключей
+        в присваивании LOCATIONS.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        import newsbot.locations as locations_mod
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(locations_mod)))
+        key_counts = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
+            if "LOCATIONS" not in targets or not isinstance(node.value, ast.Dict):
+                continue
+            for key_node in node.value.keys:
+                if isinstance(key_node, ast.Constant) and isinstance(
+                    key_node.value, str
+                ):
+                    key_counts[key_node.value] = (
+                        key_counts.get(key_node.value, 0) + 1
+                    )
+
+        duplicates = sorted(k for k, n in key_counts.items() if n > 1)
+        assert not duplicates, (
+            f"в LOCATIONS дубли ключей (перекрываются молча): {duplicates}"
+        )
+
+        # Семантика: 'kiev' — город, 'kyiv' — страна (разные ключи).
+        assert LOCATIONS["kiev"] == "киев"
+        assert LOCATIONS["kyiv"] == "украина"
 
 
 class TestClusterKey:
@@ -122,6 +224,74 @@ class TestClusterKey:
         assert k1 != k2
         assert "2026-10-18" in k1
         assert "2026-10-19" in k2
+
+    def test_cluster_key_unknown_day(self):
+        """Без published → day='unknown'."""
+        class FakeNoPub:
+            title = "Breaking news"
+            published = None
+
+        key = cluster_key(FakeNoPub())
+        parts = key.split("|")
+        assert len(parts) == 3
+        assert parts[2] == "unknown"
+
+    def test_cluster_key_nostem_per_title_unique(self):
+        """
+        CRITICAL 1 Regression: два разных nostem-заголовка (empty stem)
+        в одной локации и в один день → РАЗНЫЕ cluster_key.
+        Раньше: md5(location) для пустого stem → все nostem items сливались
+        в один cluster_key → domain_recent_duplicate блокировал 2-й+ item.
+        Теперь: per-title hash по исходному title.
+        """
+        class Fake1:
+            title = "🛑"  # pure emoji → empty stem → nostem per-title
+            published = "2026-10-21T12:00:00+00:00"
+
+        class Fake2:
+            title = "🚨"  # different pure emoji → different per-title hash
+            published = "2026-10-21T14:00:00+00:00"
+
+        k1 = cluster_key(Fake1())
+        k2 = cluster_key(Fake2())
+
+        # Оба → nostem (пустой stem_hash для этих заголовков)
+        # Но РАЗНЫЕ title → РАЗНЫЕ per-title hash
+        assert k1 != k2, (
+            f"Разные nostem-заголовки должны давать РАЗНЫЕ cluster_key. "
+            f"k1={k1!r}, k2={k2!r}"
+        )
+        # Оба содержат nostem:xxx (per-title hash) и день
+        assert "nostem:" in k1, f"Expected nostem: in k1={k1!r}"
+        assert "nostem:" in k2, f"Expected nostem: in k2={k2!r}"
+        assert "2026-10-21" in k1
+        assert "2026-10-21" in k2
+
+    def test_cluster_key_iso_date_format(self):
+        """cluster_key содержит ISO-дату YYYY-MM-DD из published."""
+        class FakeItem:
+            title = "Test headline"
+            published = "2026-10-21T14:30:00+00:00"
+
+        key = cluster_key(FakeItem())
+        parts = key.split("|")
+        assert parts[2] == "2026-10-21", (
+            f"day должен быть ISO YYYY-MM-DD, получил: {parts[2]}"
+        )
+
+    def test_cluster_key_date_from_published_not_fetched(self):
+        """cluster_key использует published, не fetched_at."""
+        class Fake1:
+            title = "Same news"
+            published = "2026-10-21T08:00:00+00:00"
+
+        class Fake2:
+            title = "Same news"   # тот же title — тот же stem
+            published = "2026-10-21T08:00:00+00:00"   # тот же published
+
+        k1 = cluster_key(Fake1())
+        k2 = cluster_key(Fake2())
+        assert k1 == k2, "Один title + published → идентичный cluster_key"
 
 
 class TestCollectorClusterKey:

@@ -926,7 +926,7 @@ def test_filter_score_6_digest():
     import httpx
     import newsbot.llm.client as client_module
 
-    resp = {"score": 6, "summary": "Слабо релевантно", "reason": "边缘"}
+    resp = {"score": 6, "summary": "Слабо релевантно", "reason": "edge case"}
 
     class _Mock:
         is_closed = False

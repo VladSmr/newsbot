@@ -2,8 +2,8 @@ r"""
 Дедупликация: обёртка над Storage.
 
 Внутри-доменный дедуп (Задача 2.4):
-  Если один и тот же source уже выдавал новость за последние 2 часа —
-  пропускаем новый item как потенциальный дубль этого же события.
+  Если один и тот же cluster_key (тема+день) за последние 2 часа,
+  независимо от source — пропускаем новый item как потенциальный дубль.
   Выполняется ДО fuzzy-дедупа (быстрая отсечка).
 
 Дедуп по двум уровням (оба конфигурируемые):
@@ -47,20 +47,7 @@ logger = logging.getLogger("newsbot.dedup")
 
 # ─── Внутри-доменный дедуп (Задача 2.4) ──────────────────────────────────────
 
-def _stem_duplicate(item: NewsItem, storage: Storage, cutoff_hours: int = 2) -> bool:
-    """
-    Проверяет: один source + недавний item (≤cutoff_hours) → пропускаем как дубль.
-    Быстрая отсечка ДО fuzzy-дедупа: если source уже выдавал что-то за 2 часа —
-    это с высокой вероятностью то же событие (репост/обновление).
-    """
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=cutoff_hours)).isoformat()
-    conn = storage._connect()
-    row = conn.execute("""
-        SELECT 1 FROM items
-        WHERE source = ? AND fetched_at >= ? AND state IN ('new', 'deferred')
-        LIMIT 1
-    """, (item.source, cutoff)).fetchone()
-    return row is not None
+
 
 
 def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -> bool:
@@ -72,7 +59,6 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
     cluster_key = getattr(item, 'cluster_key', None)
     if not cluster_key:
         return False
-    from datetime import datetime, timedelta, timezone
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
         conn = storage._connect()
@@ -81,7 +67,8 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
             (cluster_key, cutoff),
         ).fetchone()
         return row is not None
-    except Exception:
+    except Exception as e:
+        logger.warning("Доменный дедуп: ошибка, fail-open: %s", e)
         return False
 
 
@@ -256,7 +243,9 @@ def filter_new(
           (per-source дедуп, существующее поведение)
       (c) [опц.] кросс-источниковый точный дедуп: title_hash БЕЗ source
           в пределах dedup.window_days (cross_source=true)
-      (d) [опц.] нечёткое сравнение (SequenceMatcher) кросс-источник,
+      (d) быстрый доменный дедуп: тот же cluster_key (тема+день) за последние
+          2 часа, независимо от source
+      (e) [опц.] нечёткое сравнение (SequenceMatcher) кросс-источник,
           только для осмысленных заголовков, ТОЛЬКО когда cross_source=true
           (fuzzy=true И cross_source=true)
 
@@ -362,17 +351,7 @@ def filter_new(
             )
             continue
 
-        # ── Внутри-доменный дедуп: source недавно выдавал новость → дубль ──
-        if _stem_duplicate(item, storage):
-            storage.save_skipped(item)
-            dup_count += 1
-            logger.debug(
-                "Внутри-доменный дубль пропущен: source=%s title=%r",
-                item.source, item.title[:60],
-            )
-            continue
-
-        # ── Быстрый доменный дедуп: тот же source за последние 2 часа ──
+        # ── Быстрый доменный дедуп: тот же cluster_key за последние 2 часа ──
         if _domain_recent_duplicate(item, storage):
             storage.save_skipped(item)
             dup_count += 1

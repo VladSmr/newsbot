@@ -50,7 +50,7 @@ class Storage:
     Идемпотентность: user_version выставляется ПОСЛЕ успешной миграции.
     """
 
-    SCHEMA_VERSION = 12
+    SCHEMA_VERSION = 13
     STATES = ("new", "pending", "delivered", "skipped", "deferred", "failed", "digested")
     DEFAULT_RETENTION_DAYS = 90
     DEFAULT_RETRY_THRESHOLD_SECONDS = 60
@@ -59,11 +59,11 @@ class Storage:
     # Порог для warning по deferred-items.
     DEFERRED_WARN_THRESHOLD = 500
     # Окно хранения deferred-items: старые неотправленные новости удаляются.
-    # 14 дней достаточно: deferred накапливаются между дайджестами (09:00/21:00),
-    # при паузе или длительной недоступности дайджеста — не более 14 суток.
-    # Для VPS с 1 GB RAM это критично: низкоско́рые deferred накапливались
-    # бесконечно (digest берёт топ-30, остаток копился вечно).
-    DEFAULT_DEFERRED_RETENTION_DAYS = 14
+    # Minor 1-фикс: 14→3 дня — deferred живут между дайджестами (09:00/21:00),
+    # digest.max_age_hours (24 ч) ограничивает выборку; items старше 3 дней
+    # — либо уже отправлены (digested/delivered), либо потеряли актуальность.
+    # 3 суток = запас на 1 пропущенное окно + 12 ч grace на retry/Telegram.
+    DEFAULT_DEFERRED_RETENTION_DAYS = 3
     # 'new' не прошли скоринг — держим их дольше, чтобы пауза/долгий цикл
     # не уничтожил ещё не обработанные новости. Терминальные состояния
     # чистятся по retention_days (сутки).
@@ -119,19 +119,61 @@ class Storage:
             raise
 
     def _current_version(self) -> int:
+        """
+        Читает PRAGMA user_version.
+
+        Storage Minor 2: fail-closed. Раньше любая ошибка → return 0, что
+        обезоруживало downgrade-guard (0 < SCHEMA_VERSION → «старая БД»),
+        и более новая БД могла быть мигрирована старым кодом. Теперь
+        пробрасываем RuntimeError с внятным сообщением — Storage.__init__
+        падает на старте, демон перезапускается (лучше явный отказ,
+        чем тихая порча схемы).
+        """
         conn = self._connect()
         try:
             row = conn.execute("PRAGMA user_version").fetchone()
-            return int(row[0]) if row else 0
         except Exception as e:
-            # NIT: PRAGMA не должен падать — это ошибка конфигурации БД или corruption.
-            logger.error("Не удалось прочитать PRAGMA user_version: %s", e)
-            return 0
+            raise RuntimeError(
+                f"Не удалось прочитать PRAGMA user_version для БД "
+                f"{self.db_path}: {e}. Проверьте целостность файла БД и права "
+                f"доступа — миграция без версии небезопасна."
+            ) from e
+        return int(row[0]) if row else 0
 
     def _init_db(self) -> None:
+        """
+        Инициализация/миграция схемы.
+
+        Storage Minor 3: при исключении транзакция откатывается (ROLLBACK
+        в try — она могла быть уже откачена/не начата) и соединение
+        закрывается, иначе остаётся открытая транзакция и write-lock на файле.
+        """
         conn = self._connect()
+        try:
+            self._init_db_body(conn)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass  # транзакция могла не начаться или уже откачена
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self._conn = None
+            raise
+
+    def _init_db_body(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         current_version = self._current_version()
+
+        # ── 0. Downgrade guard ──────────────────────────────────────────────
+        if current_version > self.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"БД создана более новой версией newsbot (v{current_version}), "
+                f"запущена v{self.SCHEMA_VERSION} — откат невозможен. "
+                f"Обновите newsbot до v{current_version} или новее."
+            )
 
         # ── 1. Миграция ──
         self._migrate(conn, current_version)
@@ -147,6 +189,7 @@ class Storage:
                 published   TEXT,
                 tags        TEXT,
                 cluster_key TEXT,
+                lang        TEXT,
                 fetched_at  TEXT    NOT NULL,
                 state       TEXT    NOT NULL DEFAULT 'new',
                 state_at    TEXT    NOT NULL,
@@ -268,6 +311,19 @@ class Storage:
                     raise
                 logger.info("v10 post-check: колонка llm_urgent уже существует")
 
+        # ── 5c. v13: defensive post-check для lang ──────────────────
+        # Аналогично v10: при user_version=13 без колонки (конкурентная
+        # миграция) — добавляем идемпотентно.
+        it_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+        if "lang" not in it_cols:
+            try:
+                conn.execute("ALTER TABLE items ADD COLUMN lang TEXT")
+                logger.info("v13 post-check: добавлена колонка items.lang")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+                logger.info("v13 post-check: колонка lang уже существует")
+
         logger.debug("БД инициализирована (v%d): %s", self.SCHEMA_VERSION, self.db_path)
 
     def _create_indexes(self, conn: sqlite3.Connection) -> None:
@@ -283,6 +339,11 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_seen_fetched ON seen_titles(fetched_at)",
             # Minor#7: составной индекс для purge и get_recent_titles
             "CREATE INDEX IF NOT EXISTS idx_items_state_state_at ON items(state, state_at)",
+            # Волна 2: составные индексы для горячего пути дедупа и get_recent_titles.
+            # (source, fetched_at) — SELECT WHERE source=? AND fetched_at>? из dedup.py.
+            # (cluster_key, fetched_at) — SELECT WHERE cluster_key=? для кластеризации.
+            "CREATE INDEX IF NOT EXISTS idx_items_source_fetched ON items(source, fetched_at)",
+            "CREATE INDEX IF NOT EXISTS idx_items_cluster_key_fetched ON items(cluster_key, fetched_at)",
         ):
             try:
                 conn.execute(stmt)
@@ -312,18 +373,34 @@ class Storage:
 
         if "feedback_targets" in existing_tables:
             # F1/Minor#4: UNIQUE-индекс (url, kind) для feedback_targets.
-            # Для старых БД: v11-миграция дедуплицирует дубли и создаёт UNIQUE INDEX.
-            # Для новых БД: CREATE UNIQUE INDEX IF NOT EXISTS.
-            try:
-                conn.execute(
-                    "DROP INDEX IF EXISTS idx_feedback_targets_url_kind"
-                )
-                conn.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_targets_url_kind "
-                    "ON feedback_targets(url, kind)"
-                )
-            except (sqlite3.IntegrityError, sqlite3.OperationalError):
-                pass  # дубли в данных или конкурентный процесс
+            # Для старых БД: дедуплицируем дубли и создаём UNIQUE INDEX.
+            #
+            # Storage Minor 1: DROP только если существующий индекс НЕ unique.
+            # Раньше индекс безусловно дропался и пересоздавался на каждом
+            # старте, а ошибки глотались → при неудачном CREATE уникальность
+            # терялась молча (и при следующем старте дубли уже успевали
+            # накопиться). Теперь: (а) DROP только для non-unique индекса,
+            # (б) IntegrityError при CREATE → warning + одноразовый дедуп
+            # (по образцу v11-миграции) + повторный CREATE.
+            name = "idx_feedback_targets_url_kind"
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
+                (name,),
+            ).fetchone()
+            existing_sql = str(row[0]) if row and row[0] else ""
+            if existing_sql and "UNIQUE" not in existing_sql.upper():
+                try:
+                    conn.execute(f"DROP INDEX IF EXISTS {name}")
+                    logger.info(
+                        "feedback_targets: non-unique %s удалён, "
+                        "пересоздаём как UNIQUE", name,
+                    )
+                except sqlite3.OperationalError as e:
+                    logger.warning(
+                        "feedback_targets: не удалось удалить non-unique %s: %s",
+                        name, e,
+                    )
+            self._ensure_unique_feedback_targets_index(conn, name)
             self._create_index_ignore_errors(
                 conn, "idx_feedback_targets_created",
                 "feedback_targets", "created_at",
@@ -342,6 +419,148 @@ class Storage:
                 conn, "idx_feedback_updated",
                 "feedback", "updated_at",
             )
+
+    def _ensure_unique_feedback_targets_index(
+        self, conn: sqlite3.Connection, name: str,
+    ) -> None:
+        """
+        Storage Minor 1: создаёт UNIQUE INDEX (url, kind) на feedback_targets.
+        При IntegrityError (дубли в данных — например, БД, где уникальность
+        когда-то потерялась) — одноразовый дедуп по образцу v11-миграции
+        и повторный CREATE. Ошибку не глотаем молча: пишем warning.
+        """
+        stmt = f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON feedback_targets(url, kind)"
+        try:
+            conn.execute(stmt)
+            return
+        except sqlite3.IntegrityError as e:
+            logger.warning(
+                "feedback_targets: UNIQUE %s не создан (дубли url,kind): %s. "
+                "Выполняем одноразовый дедуп и повторяем.",
+                name, e,
+            )
+        except sqlite3.OperationalError as e:
+            logger.warning(
+                "feedback_targets: UNIQUE %s не создан (OperationalError): %s",
+                name, e,
+            )
+            return
+
+        self._dedupe_feedback_targets(conn)
+        try:
+            conn.execute(stmt)
+            logger.info("feedback_targets: UNIQUE %s создан после дедупа", name)
+        except (sqlite3.IntegrityError, sqlite3.OperationalError) as e:
+            logger.warning(
+                "feedback_targets: UNIQUE %s так и не создан: %s. "
+                "Дедуп не помог — проверьте данные вручную.",
+                name, e,
+            )
+
+    def _dedupe_feedback_targets(self, conn: sqlite3.Connection) -> None:
+        """
+        Удаляет дубли feedback_targets(url, kind), оставляя запись
+        с НАИМЕНЬШИМ id (первую по времени) — тот же паттерн, что в
+        v11-миграции. Нужен перед созданием UNIQUE-индекса.
+
+        Storage Minor: перед удалением «младших» target-строк перенаправляем
+        привязанные к ним feedback.target_id на выживший MIN(id). FK между
+        таблицами не включён, поэтому без перенаправления feedback становился
+        бы осиротевшим: get_feedback_target() вернул бы None и поздний клик
+        пользователя терялся бы. У feedback действует UNIQUE(target_id),
+        поэтому при конфликте оставляем более свежий голос
+        (COALESCE(updated_at, created_at)). Уже осиротевшие feedback
+        (target удалён ранее, например prune'ом) не трогаем, но фиксируем
+        warning с их числом — молча терять данные нельзя.
+        """
+        try:
+            tables = {str(r[0]) for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            has_feedback = "feedback" in tables
+
+            redirect_count = 0
+            removed_feedback = 0
+            if has_feedback:
+                rows = conn.execute("""
+                    SELECT f.id AS feedback_id,
+                           COALESCE(f.updated_at, f.created_at) AS f_ts,
+                           keeper.keeper_id AS keeper_id
+                    FROM feedback f
+                    JOIN feedback_targets t ON t.id = f.target_id
+                    JOIN (
+                        SELECT url, kind, MIN(id) AS keeper_id
+                        FROM feedback_targets
+                        GROUP BY url, kind
+                    ) keeper ON keeper.url = t.url AND keeper.kind = t.kind
+                    WHERE f.target_id <> keeper.keeper_id
+                """).fetchall()
+                for row in rows:
+                    feedback_id = row["feedback_id"]
+                    keeper_id = row["keeper_id"]
+                    existing = conn.execute(
+                        "SELECT id, COALESCE(updated_at, created_at) AS ts "
+                        "FROM feedback WHERE target_id = ? AND id <> ?",
+                        (keeper_id, feedback_id),
+                    ).fetchone()
+                    if existing is None:
+                        conn.execute(
+                            "UPDATE feedback SET target_id = ? WHERE id = ?",
+                            (keeper_id, feedback_id),
+                        )
+                        redirect_count += 1
+                    elif (row["f_ts"] or "") > (existing["ts"] or ""):
+                        # более свежий голос переезжает на выживший target
+                        conn.execute(
+                            "DELETE FROM feedback WHERE id = ?", (existing["id"],)
+                        )
+                        conn.execute(
+                            "UPDATE feedback SET target_id = ? WHERE id = ?",
+                            (keeper_id, feedback_id),
+                        )
+                        redirect_count += 1
+                        removed_feedback += 1
+                    else:
+                        conn.execute(
+                            "DELETE FROM feedback WHERE id = ?", (feedback_id,)
+                        )
+                        removed_feedback += 1
+
+            cur = conn.execute("""
+                DELETE FROM feedback_targets
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM feedback_targets
+                    GROUP BY url, kind
+                )
+            """)
+            deleted = cur.rowcount
+            if deleted:
+                logger.info(
+                    "feedback_targets: дедуплицировано %d дублей (url, kind)",
+                    deleted,
+                )
+            if redirect_count or removed_feedback:
+                logger.info(
+                    "feedback: перенаправлено %d голосов на выживший target, "
+                    "удалено %d дублей голосов",
+                    redirect_count, removed_feedback,
+                )
+            if has_feedback:
+                orphans = conn.execute("""
+                    SELECT COUNT(*) FROM feedback
+                    WHERE target_id NOT IN (SELECT id FROM feedback_targets)
+                """).fetchone()[0]
+                if orphans:
+                    logger.warning(
+                        "feedback: %d записей ссылаются на несуществующий "
+                        "target_id (осиротели до дедупа или после prune) — "
+                        "get_feedback_target() вернёт для них None, поздний "
+                        "клик не запишется.",
+                        orphans,
+                    )
+        except sqlite3.OperationalError as e:
+            logger.warning("feedback_targets: дедуп пропущен: %s", e)
 
     def _create_index_ignore_errors(
         self, conn: sqlite3.Connection, name: str, table: str, cols: str,
@@ -708,18 +927,9 @@ class Storage:
         ).fetchall()}:
             # Дедуп: удаляем строки с дублирующимися (url, kind),
             # оставляя запись с НАИМЕНЬШИМ id (первая по времени).
-            try:
-                conn.execute("""
-                    DELETE FROM feedback_targets
-                    WHERE id NOT IN (
-                        SELECT MIN(id)
-                        FROM feedback_targets
-                        GROUP BY url, kind
-                    )
-                """)
-                logger.info("v11: дедуплицированы дубли feedback_targets")
-            except sqlite3.OperationalError as e:
-                logger.warning("v11: дедуп feedback_targets пропущен: %s", e)
+            # Storage Minor: общий helper сначала перенаправляет feedback
+            # дублей на выживший target, чтобы не плодить осиротевшие голоса.
+            self._dedupe_feedback_targets(conn)
             # Создаём UNIQUE INDEX. DROP INDEX IF EXISTS для безопасности
             # (в старых БД может быть не-unique idx_feedback_targets_url_kind).
             try:
@@ -750,6 +960,22 @@ class Storage:
                     if "duplicate column" not in str(e).lower():
                         raise
                     logger.info("v12: колонка cluster_key уже существует (конкурентный процесс)")
+
+        # (й) v13: lang TEXT для языка фида (проводка config → БД → prompt).
+        # Идемпотентно: try/except для конкурентной миграции.
+        # Для свежей БД колонка добавляется через post-check (как llm_urgent v10).
+        if "items" in existing_tables:
+            current_items_cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(items)"
+            ).fetchall()}
+            if "lang" not in current_items_cols:
+                try:
+                    conn.execute("ALTER TABLE items ADD COLUMN lang TEXT")
+                    logger.info("Миграция v13: добавлена колонка items.lang")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+                    logger.info("v13: колонка lang уже существует (конкурентный процесс)")
 
         conn.commit()
 
@@ -819,9 +1045,9 @@ class Storage:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO items
-                    (source, url, title, summary, published, tags, cluster_key,
+                    (source, url, title, summary, published, tags, cluster_key, lang,
                      fetched_at, state, state_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
                     """,
                     (
                         item.source,
@@ -831,6 +1057,7 @@ class Storage:
                         item.published,
                         getattr(item, "tags", None),
                         getattr(item, "cluster_key", None),
+                        getattr(item, "lang", None),
                         now_iso,
                         now_iso,
                     ),
@@ -839,6 +1066,10 @@ class Storage:
 
                 # seen_titles индексируется только для осмысленных заголовков
                 # (normalized >= MIN_TITLE_LEN) — чтобы пустые title не ложно схлопывались.
+                # Sliding TTL: при повторной встрече title_hash обновляем
+                # fetched_at/expires_at, чтобы активные темы не выпадали из дедупа
+                # при длинных окнах (30 дней). Поведение: upsert, не INSERT OR REPLACE
+                # (сохраняет id/title_normalized, не теряет UNIQUE-конфликты для отладки).
                 if len(normalized) >= MIN_TITLE_LEN:
                     if self._has_title_normalized:
                         conn.execute(
@@ -849,6 +1080,14 @@ class Storage:
                             """,
                             (normalized, item.source, now_iso, expires_iso, normalized),
                         )
+                        conn.execute(
+                            """
+                            UPDATE seen_titles
+                            SET fetched_at = ?, expires_at = ?
+                            WHERE title_hash = ? AND source = ?
+                            """,
+                            (now_iso, expires_iso, normalized, item.source),
+                        )
                     else:
                         conn.execute(
                             """
@@ -857,6 +1096,14 @@ class Storage:
                             VALUES (?, ?, ?, ?)
                             """,
                             (normalized, item.source, now_iso, expires_iso),
+                        )
+                        conn.execute(
+                            """
+                            UPDATE seen_titles
+                            SET fetched_at = ?, expires_at = ?
+                            WHERE title_hash = ? AND source = ?
+                            """,
+                            (now_iso, expires_iso, normalized, item.source),
                         )
 
             return inserted > 0
@@ -898,9 +1145,9 @@ class Storage:
                     cur = conn.execute(
                         """
                         INSERT OR IGNORE INTO items
-                        (source, url, title, summary, published, tags, cluster_key,
+                        (source, url, title, summary, published, tags, cluster_key, lang,
                          fetched_at, state, state_at, retry_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, 0)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, 0)
                         """,
                         (
                             item.source,
@@ -910,14 +1157,17 @@ class Storage:
                             item.published,
                             getattr(item, "tags", None),
                             getattr(item, "cluster_key", None),
-                            now_iso,
-                            now_iso,
+                            getattr(item, "lang", None),
+                            now_iso,          # fetched_at
+                            now_iso,          # state_at
                         ),
                     )
                     if cur.rowcount:
                         inserted_items.append(item)
 
                         # seen_titles — только для осмысленных заголовков
+                        # Sliding TTL: обновляем fetched_at/expires_at при повторном
+                        # появлении, чтобы активные темы не выпадали из дедупа.
                         if len(normalized) >= MIN_TITLE_LEN:
                             # внутрибатчевый дедуп: не добавлять повторный key
                             key = f"{normalized}|{item.source}"
@@ -931,6 +1181,14 @@ class Storage:
                                         """,
                                         (normalized, item.source, now_iso, expires_iso, normalized),
                                     )
+                                    conn.execute(
+                                        """
+                                        UPDATE seen_titles
+                                        SET fetched_at = ?, expires_at = ?
+                                        WHERE title_hash = ? AND source = ?
+                                        """,
+                                        (now_iso, expires_iso, normalized, item.source),
+                                    )
                                 else:
                                     conn.execute(
                                         """
@@ -940,12 +1198,26 @@ class Storage:
                                         """,
                                         (normalized, item.source, now_iso, expires_iso),
                                     )
+                                    conn.execute(
+                                        """
+                                        UPDATE seen_titles
+                                        SET fetched_at = ?, expires_at = ?
+                                        WHERE title_hash = ? AND source = ?
+                                        """,
+                                        (now_iso, expires_iso, normalized, item.source),
+                                    )
                                 seen_keys.add(key)
 
             return inserted_items
         except sqlite3.IntegrityError:
             # Штатный дедуп: конфликт UNIQUE — не ошибка, просто пропускаем батч.
-            return inserted_items  # уже вставленные items остаются
+            # M3: IntegrityError внутри транзакции → ROLLBACK, возвращать
+            # inserted_items нельзя (pipeline считает их сохранёнными → дубль).
+            logger.warning(
+                "save_many(%d items): IntegrityError → ROLLBACK, "
+                "%d вставленных потеряно", len(items), len(inserted_items)
+            )
+            return []
         except Exception as e:
             # M2: логируем на уровне error. Сюда попадают I/O, corruption, etc.
             logger.exception("Ошибка save_many(%d items): %s", len(items), e)
@@ -1014,7 +1286,7 @@ class Storage:
         ).isoformat()
         rows = conn.execute(
             """
-            SELECT source, url, title, summary, published, tags, cluster_key, fetched_at,
+            SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at,
                    llm_score, llm_summary, llm_reason, llm_urgent, retry_count
             FROM items
             WHERE state = 'pending'
@@ -1186,7 +1458,7 @@ class Storage:
     def get_all_by_state(self, state: str, limit: Optional[int] = None) -> List[NewsItem]:
         conn = self._connect()
         sql = """
-            SELECT source, url, title, summary, published, tags, cluster_key, fetched_at, state_at,
+            SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at, state_at,
                    llm_score, llm_summary, llm_reason, llm_urgent
             FROM items
             WHERE state = ?
@@ -1224,10 +1496,10 @@ class Storage:
             limit: если задано — LIMIT в SQL.
             since_iso: если задано — выборка ограничена fetched_at >= since_iso
                        (ISO-8601, например fromisoformat() или datetime.isoformat()).
-            max_age_hours: если задано — выборка ограничена fetched_at >=
-                           now - max_age_hours. None означает «без ограничения».
-                           Приоритет: max_age_hours вычисляется из since_iso,
-                           если оба не заданы — ограничения по возрасту нет.
+            max_age_hours: если задано — fetched_at >= now - max_age_hours.
+                           При задании ОБОИХ параметров (since_iso и max_age_hours)
+                           берётся MAX(since_iso, now - max_age_hours) —
+                           более поздняя граница. None означает «без ограничения».
             published_since: DEPRECATED. Фильтрация по published выполняется на
                               стороне pipeline (Python), т.к. формат published в БД
                               неоднородный (ISO / 'DD.MM.YYYY HH:MM') и SQLite
@@ -1237,18 +1509,31 @@ class Storage:
         conn = self._connect()
         params: list = []
         sql = """
-            SELECT source, url, title, summary, published, tags, cluster_key, fetched_at, state_at,
+            SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at, state_at,
                    llm_score, llm_summary, llm_reason, llm_urgent
             FROM items
             WHERE state = 'deferred'
         """
         effective_since = since_iso
+        # Minor 1-фикс: max_age_hours НЕ перекрывает since_iso — берём MAX
+        # обоих (более поздняя граница = более свежие items).
+        # Например: since_iso=5ч назад, max_age_hours=24 → fetched_at>=5ч назад
+        # (окно уже ограничивает сильнее). since_iso=1ч назад, max_age=24ч
+        # → fetched_at>=1ч назад (max_age не ужесточает). Оба None → без фильтра.
         if max_age_hours is not None:
-            effective_since = (
+            max_age_iso = (
                 datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
             ).isoformat()
+            if effective_since is None:
+                effective_since = max_age_iso
+            elif max_age_iso > effective_since:
+                # max_age_iso более свежая (более поздняя) → ограничивает сильнее
+                effective_since = max_age_iso
         if effective_since is not None:
-            sql += " AND julianday(fetched_at) >= julianday(?)"
+            # fetched_at всегда tz-aware ISO (см. save/_rows_to_items),
+            # строковое сравнение корректно (лексикографически для ISO+00:00);
+            # julianday() блокировал индекс и был NULL-небезопасен.
+            sql += " AND fetched_at >= ?"
             params.append(effective_since)
         # DEPRECATED: published_since фильтрация вынесена в pipeline (Python),
         # т.к. julianday() по published ненадёжен (неоднородный формат в БД).
@@ -1267,20 +1552,25 @@ class Storage:
 
     def delete_items_before(self, cutoff_iso: str) -> int:
         """
-        Удаляет items в терминальных состояниях (delivered/skipped/deferred/
-        digested/failed) с fetched_at < cutoff_iso.
+        Удаляет items в терминальных состояниях (delivered/skipped/digested/
+        failed) с fetched_at < cutoff_iso.
         'new' и 'pending' НЕ удаляются — они ещё не прошли скоринг и могут
         попасть в следующее окно.
-        'deferred' включён: items, отправленные в текущем digest и оставшиеся
-        в БД, безопасно удаляются — они уже помечены как 'digested'.
+        'deferred' НЕ удаляется здесь: deferred хранится до 3 дней
+        (deferred_retention_days, v1.1.5) и очищается отдельным purge_items
+        по state_at.
+
+        fetched_at всегда tz-aware ISO (см. save/_rows_to_items),
+        строковое сравнение корректно (лексикографически для ISO+00:00);
+        julianday() блокировал индекс и был NULL-небезопасен.
 
         Возвращает количество удалённых строк items.
         """
         with self._tx() as conn:
             cur = conn.execute(
                 "DELETE FROM items "
-                "WHERE julianday(fetched_at) < julianday(?) "
-                "  AND state IN ('delivered','skipped','deferred','digested','failed')",
+                "WHERE fetched_at < ? "
+                "  AND state IN ('delivered','skipped','digested','failed')",
                 (cutoff_iso,),
             )
             return cur.rowcount
@@ -1315,9 +1605,19 @@ class Storage:
                 try:
                     fetched_at = datetime.fromisoformat(fetched_at_raw)
                 except Exception:
-                    fetched_at = datetime.now(timezone.utc)
+                    logger.warning(
+                        "_rows_to_items: fetched_at=%r не распознан как ISO, "
+                        "fallback на datetime.min UTC. url=%s",
+                        fetched_at_raw, row["url"][:80],
+                    )
+                    fetched_at = datetime.min.replace(tzinfo=timezone.utc)
             else:
-                fetched_at = datetime.now(timezone.utc)
+                logger.warning(
+                    "_rows_to_items: fetched_at NULL для url=%s, "
+                    "fallback на datetime.min UTC",
+                    row["url"][:80],
+                )
+                fetched_at = datetime.min.replace(tzinfo=timezone.utc)
 
             llm_score = None
             llm_summary = None
@@ -1366,15 +1666,56 @@ class Storage:
             except Exception:
                 pass
 
+            # lang: может отсутствовать в старых записях (до v13)
+            lang_val = None
+            try:
+                lang_val = row["lang"]
+            except Exception:
+                pass
+
+            # published_parsed: восстанавливаем из published (ISO) при чтении,
+            # чтобы round-trip save→read сохранял данные.
+            # published может быть в формате "DD.MM.YYYY HH:MM" или ISO,
+            # поэтому try/except для каждого формата.
+            published_val = row["published"]
+            published_parsed_val = None
+            if published_val:
+                try:
+                    published_parsed_val = datetime.fromisoformat(published_val)
+                except Exception:
+                    # Minor 2-фикс: парсим прод-формат "DD.MM.YYYY HH:MM UTC"
+                    # (основной формат на проде, collector._format_pubdate).
+                    if published_val.endswith(" UTC"):
+                        base = published_val[:-4]
+                        for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S"):
+                            try:
+                                published_parsed_val = datetime.strptime(
+                                    base, fmt,
+                                ).replace(tzinfo=timezone.utc)
+                                break
+                            except ValueError:
+                                continue
+                    if published_parsed_val is None:
+                        # DD.MM.YYYY или DD.MM.YYYY HH:MM без суффикса
+                        for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y"):
+                            try:
+                                published_parsed_val = datetime.strptime(
+                                    published_val, fmt,
+                                )
+                                break
+                            except ValueError:
+                                continue
+
             ni = NewsItem(
                 source=row["source"],
                 url=row["url"],
                 title=row["title"],
                 summary=row["summary"],
-                published=row["published"] or "—",
+                published=published_val or "—",
                 tags=tags_val,
-                published_parsed=None,
+                published_parsed=published_parsed_val,
                 cluster_key=cluster_key,
+                lang=lang_val,
                 fetched_at=fetched_at,
                 llm_score=llm_score,
                 llm_summary=llm_summary,
@@ -1592,7 +1933,7 @@ class Storage:
                     parts.append(f"deferred={deferred_del}")
                 logger.info("purge_items: удалено %s", " + ".join(parts))
         except Exception as e:
-            logger.warning("purge_items: %s", e)
+            logger.error("purge_items: ошибка очистки — %s", e)
 
         # prune feedback_targets отдельно (свой retention)
         if feedback_retention_days is not None:
@@ -1614,7 +1955,7 @@ class Storage:
                 logger.info("purge_seen_titles: удалено %d записей", deleted)
             return deleted
         except Exception as e:
-            logger.warning("purge_seen_titles: %s", e)
+            logger.error("purge_seen_titles: ошибка очистки — %s", e)
             return 0
 
     # ------------------------------------------------------------------
@@ -1634,20 +1975,29 @@ class Storage:
         Создаёт запись target для будущего фидбэка.
         kind: 'push' или 'digest'.
 
+        Storage Minor 4: INSERT OR IGNORE + SELECT — таблица имеет
+        UNIQUE(url, kind), поэтому голый INSERT падал IntegrityError
+        при повторе (retry/повторная доставка). Поведение теперь
+        идемпотентно: возвращается id существующей записи.
+
         Returns:
-            id новой записи feedback_targets.
+            id новой (или уже существующей для url+kind) записи feedback_targets.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
         with self._tx() as conn:
-            cur = conn.execute(
+            conn.execute(
                 """
-                INSERT INTO feedback_targets
+                INSERT OR IGNORE INTO feedback_targets
                 (url, source, title, summary, llm_score, kind, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (url, source, title, summary, llm_score, kind, now_iso),
             )
-            return cur.lastrowid  # type: ignore
+            row = conn.execute(
+                "SELECT id FROM feedback_targets WHERE url = ? AND kind = ?",
+                (url, kind),
+            ).fetchone()
+            return row[0]  # type: ignore
 
     def add_feedback_target_from_item(self, item, kind: str) -> int:
         """
@@ -2040,7 +2390,7 @@ class Storage:
 
         Returns True если ВСТАВЛЕН (URL ещё не было), False если IGNORE.
         """
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         MAX_SUMMARY_CHARS = 6000
         summary = item.summary[:MAX_SUMMARY_CHARS]
 
@@ -2049,9 +2399,9 @@ class Storage:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO items
-                    (source, url, title, summary, published, tags, cluster_key,
+                    (source, url, title, summary, published, tags, cluster_key, lang,
                      fetched_at, state, state_at, retry_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'skipped', ?, 0)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', ?, 0)
                     """,
                     (
                         item.source,
@@ -2061,8 +2411,9 @@ class Storage:
                         item.published,
                         getattr(item, "tags", None),
                         getattr(item, "cluster_key", None),
-                        now_iso,
-                        now_iso,
+                        getattr(item, "lang", None),
+                        now_iso,          # fetched_at
+                        now_iso,          # state_at
                     ),
                 )
                 return cur.rowcount > 0

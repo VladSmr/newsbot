@@ -176,6 +176,11 @@ def deepseek_api_key() -> str:
     return get_env("DEEPSEEK_API_KEY", "")
 
 
+def telegram_owner_id() -> str:
+    """Owner ID из env. Если задан — привязка chat_id идёт ТОЛЬКО к нему."""
+    return get_env("TELEGRAM_OWNER_ID", "")
+
+
 def _write_env(key: str, value: str) -> None:
     """
     Перезаписывает KEY=VALUE в .env (пишет в _env_path(), не site-packages).

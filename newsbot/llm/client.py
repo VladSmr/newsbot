@@ -83,6 +83,30 @@ class UsageStats:
     prompt_cache_miss_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    # Цены из конфига (USD за 1M токенов)
+    _input_price: float = 0.0
+    _output_price: float = 0.0
+
+    def set_prices(self, input_price: float, output_price: float) -> None:
+        """Устанавливает цены модели (USD за 1M токенов)."""
+        self._input_price = input_price
+        self._output_price = output_price
+
+    @property
+    def total_cost_usd(self) -> float:
+        """
+        Вычисляет общую стоимость всех вызовов в USD.
+        Формула: (prompt_tokens * input + completion_tokens * output) / 1_000_000
+        Кэшированные токены не вычитаются (cached токены стоят дешевле,
+        но модель считает их по полной в prompt_tokens).
+        Для учёта кэшированных токенов используйте реальные цены DeepSeek
+        с дисконтом на cached (input * 0.1).
+        """
+        cost = (
+            self.prompt_tokens * self._input_price
+            + self.completion_tokens * self._output_price
+        ) / 1_000_000
+        return cost
 
     def add_response(self, data: Dict[str, Any]) -> None:
         """Добавляет usage из ответа API (data — распарсенный JSON). Безопасно при отсутствии."""
@@ -122,10 +146,25 @@ class UsageStats:
         self.prompt_cache_miss_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
+        # Цены сохраняются при reset
 
 
 class LLMError(Exception):
     """Единая ошибка LLM-слоя: любая неудача при вызове API или парсинге ответа."""
+
+    pass
+
+
+class LLMTruncationError(LLMError):
+    """
+    Ответ LLM усечён по max_tokens (finish_reason=length).
+
+    Отдельный подкласс LLMError, чтобы вызывающая сторона (llm/filter.py)
+    могла отличить усечение от прочих ошибок по ТИПУ исключения,
+    а не по разбору текста сообщения.
+    Наследуется от LLMError — существующие `except LLMError` продолжают
+    ловить эту ошибку без изменений.
+    """
 
     pass
 
@@ -175,6 +214,8 @@ class DeepSeekClient:
         max_retries: int = 3,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        input_price: float = 0.0,
+        output_price: float = 0.0,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -192,6 +233,8 @@ class DeepSeekClient:
         # один HTTP-клиент на весь жизненный цикл — переиспользуем соединения
         self._http = httpx.Client(timeout=self.timeout, trust_env=True)  # подхватывает HTTP_PROXY / HTTPS_PROXY из окружения (Docker)
         self.usage_stats = UsageStats(model=model)
+        # Устанавливаем цены для расчёта стоимости
+        self.usage_stats.set_prices(input_price, output_price)
 
     def close(self) -> None:
         """Закрывает HTTP-клиент. Идемпотентен."""
@@ -253,6 +296,13 @@ class DeepSeekClient:
                         f"получен {type(data).__name__}"
                     )
 
+                # MINOR-фикс: аккумулируем usage СРАЗУ после проверки «data — dict».
+                # Токены уже списаны провайдером на любой ветке (в т.ч. raise на
+                # choices/message/пустом content/finish_reason=length), поэтому
+                # учёт делается ровно один раз на полученный response.
+                # Ниже дублирующих вызовов НЕТ (идемпотентность по построению).
+                self._log_usage_debug(data)
+
                 choices: Any = data.get("choices")
                 if not isinstance(choices, list) or not choices:
                     raise LLMError("Пустой или отсутствующий массив choices в ответе API")
@@ -275,18 +325,19 @@ class DeepSeekClient:
                 # (а не парсил битый JSON молча).
                 finish_reason: Any = first_choice.get("finish_reason")
                 if finish_reason == "length":
+                    # usage уже аккумулирован выше (сразу после проверки dict) —
+                    # токены учтены даже при length-truncation.
                     logger.warning(
                         "LLM ответ усечён (finish_reason=length, max_tokens=%d) — "
                         "fallback для батча: шлём непрофильтрованными",
                         self.max_tokens,
                     )
-                    raise LLMError(
+                    raise LLMTruncationError(
                         f"LLM-ответ усечён (finish_reason=length, max_tokens={self.max_tokens}). "
                         f"JSON может быть неполным — fallback (ok=False для всех items батча)."
                     )
 
-                # ── usage-логирование (DEBUG, на каждый вызов) ──
-                self._log_usage_debug(data)
+                # ── usage-логирование уже выполнено выше (одно на response) ──
 
                 result: Any = json.loads(content)
                 # Модель может вернуть массив или примитив

@@ -25,9 +25,24 @@ cd newsbot
 # На GitHub основная ветка — main (не master):
 git checkout main
 
-# Вариант B: scp / rsync
-scp -r ./newsbot user@vps:/opt/newsbot/
-ssh user@vps "cd /opt/newsbot && ..."
+# Вариант B: rsync (основной способ, в т.ч. для обновлений)
+# Копируем каталог проекта (Dockerfile, docker-compose.yml, config.yaml,
+# newsbot/ и т.д.) — иначе `docker compose up --build` на сервере не соберётся.
+#
+# ВАЖНО: 'data/' и '.env' ИСКЛЮЧЕНЫ. Иначе обновление перезапишет продовую
+# БД (data/newsbot.db) и серверные секреты локальными копиями.
+rsync -av --exclude '.git' --exclude '__pycache__' \
+      --exclude 'data/' --exclude '.env' \
+      ./ user@vps:/opt/newsbot/
+
+# На сервере после первого копирования создайте .env (см. раздел 3):
+# ssh user@vps "cd /opt/newsbot && cp .env.example .env && nano .env"
+
+# Вариант C: scp — ТОЛЬКО первая установка на ПУСТОЙ сервер.
+# `scp -r .` копирует ВСЁ, включая локальные data/ и .env: на существующем
+# сервере это затрёт продовую БД и секреты. Для обновлений используйте rsync выше.
+scp -r . user@vps:/opt/newsbot/
+ssh user@vps "cd /opt/newsbot && cp .env.example .env && nano .env"
 ```
 
 ## 3. Файл секретов `.env`
@@ -143,7 +158,20 @@ docker compose logs -f
 
 # Логи только бота (без перезапуска)
 docker compose logs -f newsbot
+
+# Проверка healthcheck
+docker compose ps  # healthcheck → healthy / starting
+docker inspect $(docker compose ps -q newsbot) --format '{{.State.Health.Status}}'
 ```
+
+> **Healthcheck** проверяет SQLite-файл БД (`SELECT 1`) без вызовов LLM/Telegram.
+> Фактические параметры (`docker-compose.yml`): `interval: 5m`, `timeout: 10s`,
+> `retries: 3`, `start_period: 30s`. Первая проверка выполняется после
+> `start_period` (≈30 с от старта), далее — раз в 5 минут. `start_period`
+> исключает неудачные проверки первых 30 с из счётчика `retries`, поэтому
+> «healthy» появляется не мгновенно, а после первой успешной проверки.
+> При unhealthy контейнер **не перезапускается** автоматически (`restart: unless-stopped`
+> срабатывает только при exit code, не при healthcheck). Следите за логами.
 
 ---
 
@@ -169,12 +197,21 @@ docker compose up -d --build
 База `newsbot.db` хранится в `./data/` на хосте (монтируется в `/app/data`).
 
 ```bash
-# Бэкап
-cp data/newsbot.db "data/newsbot.db.backup-$(date +%Y%m%d-%H%M%S)"
+# Бэкап. БД работает в journal_mode=WAL: обычный `cp` файла .db
+# неконсистентен (часть данных ещё в -wal). Используйте sqlite3 .backup —
+# он делает консистентный снимок на живой БД.
+sqlite3 data/newsbot.db ".backup 'data/newsbot.db.backup-$(date +%F)'"
+
+# Если sqlite3 на хосте нет — консистентный вариант через остановку:
+#   docker compose stop newsbot
+#   cp data/newsbot.db "data/newsbot.db.backup-$(date +%F)"
+#   docker compose up -d
+# (пока контейнер остановлен, WAL уже смержен в .db)
 
 # Восстановление
 #   docker compose down
-#   cp data/newsbot.db.backup-YYYYMMDD-HHMMSS data/newsbot.db
+#   cp data/newsbot.db.backup-YYYY-MM-DD data/newsbot.db
+#   rm -f data/newsbot.db-wal data/newsbot.db-shm   # остатки WAL от старой БД
 #   docker compose up -d
 ```
 
@@ -233,7 +270,14 @@ environment:
 Если прокси с авторизацией:
 
 ```yaml
-HTTPS_PROXY: "http://user:password@proxy.example.com"   # например, http://user:pass@proxy.example.com:8080
+# Прокси с авторизацией: логин и пароль указываются прямо в URL прокси
+# перед хостом, в формате user:password@host:port.
+# ЗАМЕНИТЕ http://user:password@proxy.example.com:8080 на реальный URL с логином и паролем
+# в формате user:password@host:port — без них прокси с авторизацией
+# ответит 407 Proxy Authentication Required.
+# (секреты лучше держать в .env, а не в docker-compose.yml, и не коммитить).
+HTTPS_PROXY: "http://user:password@proxy.example.com:8080"
+HTTP_PROXY:  "http://user:password@proxy.example.com:8080"
 ```
 
 ### Как это работает
@@ -275,16 +319,20 @@ curl --proxy http://proxy.example.com:8080 https://api.telegram.org/getMe
 ## 12. Одновременно только один getUpdates
 
 `TelegramPoller` использует long-polling `getUpdates`. Telegram позволяет только
-**один** активный потребитель на токен бота.
+**один** активный потребитель на токен бота. Newsbot защищается от двойного
+запуска **демона** через lock-файл `data/newsbot.lock` (PID активного процесса).
+При попытке второго демона выводится сообщение `Уже запущен (pid N). Выход.`
+
+> **Lock-файл НЕ захватывается** при `--once`, `--digest`, `--check-*`
+> (короткие one-shot команды). Запуск `--once` при работающем демоне безопасен —
+> один цикл обработается, демон продолжит работу.
 
 > ⚠️ **НЕ делайте так:**
 > - Не запускайте `--check-telegram` / `--set-chat-id` при работающем демоне.
-> - Не запускайте `--once` одновременно с активным демоном.
 > - Не запускайте два контейнера с одним и тем же токеном.
 
-Если видите ошибку `Conflict: bot can only be invoked by its owner` или
-429 с `retry_after` — значит, есть другой потребитель getUpdates.
-Остановите всё: `docker compose down`, проверьте `docker ps`.
+Если видите ошибку `Conflict: terminated by other getUpdates request` —
+остановите всё: `docker compose down`, проверьте `docker ps`.
 
 ---
 
@@ -294,11 +342,14 @@ curl --proxy http://proxy.example.com:8080 https://api.telegram.org/getMe
 # Перезапуск демона
 docker compose restart newsbot
 
-# Остановка
+# Остановка (контейнеры удаляются, данные в ./data сохраняются)
 docker compose down
 
-# Остановить и удалить volumes (данные потеряются!)
-docker compose down -v
+# ВНИМАНИЕ: `docker compose down -v` удаляет только именованные volumes.
+# Данные бота лежат в bind-mount ./data на ХОСТЕ и НЕ удаляются:
+# newsbot.db, newsbot.lock и бэкапы остаются в ./data.
+# Чтобы действительно стереть данные — удалите их вручную:
+#   docker compose down && rm -rf data/
 
 # Зайти в контейнер для отладки
 docker compose run --rm --entrypoint sh newsbot

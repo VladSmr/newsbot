@@ -1115,6 +1115,78 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
+    # ── _domain_recent_duplicate ──────────────────────────────────────────────
+
+    def test_domain_recent_duplicate_blocks_same_cluster_key(self):
+        """Тот же cluster_key в окне → item отклоняется."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            item = _mk_item(
+                title="Breaking: ЦБ повысил ключевую ставку до 21%",
+                source="kommersant.ru",
+                url="https://kommersant.ru/999",
+                cluster_key="cb_rate_2024",
+            )
+            st.save(item)
+
+            from newsbot.dedup import _domain_recent_duplicate
+            result = _domain_recent_duplicate(item, st)
+            self.assertTrue(result, "Item с тем же cluster_key в окне должен блокироваться")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_different_cluster_key_passes(self):
+        """Другой cluster_key → item проходит."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            item_old = _mk_item(
+                title="Курс доллара вырос",
+                source="ria.ru",
+                url="https://ria.ru/old",
+                cluster_key="dollar_course",
+            )
+            st.save(item_old)
+
+            item_new = _mk_item(
+                title="Евро укрепился",
+                source="ria.ru",
+                url="https://ria.ru/new",
+                cluster_key="euro_strength",  # другой cluster_key
+            )
+            from newsbot.dedup import _domain_recent_duplicate
+            result = _domain_recent_duplicate(item_new, st)
+            self.assertFalse(result, "Item с другим cluster_key должен пройти")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_db_error_fail_open(self):
+        """DB-исключение в _domain_recent_duplicate → fail-open (item проходит) + warning."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            item = _mk_item(
+                title="Новость",
+                source="example.com",
+                url="https://example.com/1",
+                cluster_key="any",
+            )
+            st.save(item)
+            st.close()
+
+            from newsbot.dedup import _domain_recent_duplicate
+            with patch.object(Storage, "_connect", side_effect=RuntimeError("DB conn failed")):
+                with self.assertLogs("newsbot.dedup", level="WARNING") as cm:
+                    result = _domain_recent_duplicate(item, st)
+            self.assertFalse(result, "Fail-open: при ошибке DB item должен пройти")
+            self.assertTrue(any("DB conn failed" in msg for msg in cm.output),
+                            "Должен быть warning с текстом ошибки")
+        finally:
+            _cleanup_db(path)
+
 
 # =============================================================================
 

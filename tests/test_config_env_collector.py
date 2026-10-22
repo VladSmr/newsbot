@@ -159,7 +159,84 @@ def _make_transport(rss_body: bytes, content_encoding: str = ""):
     return httpx.MockTransport(handler), lambda: call_count
 
 
-# ── collector.py: M3 — SSRF-защита (scheme-валидация) ──────────────────────────
+# ── collector.py: FEED_DEADLINE_SEC и MAX_ITEMS_PER_FEED ──────────────────────
+
+
+class TestCollectorFeedLimits:
+    """Лимиты: wall-clock deadline + MAX_ITEMS_PER_FEED."""
+
+    def test_feed_deadline_defined(self):
+        from newsbot.collector import FEED_DEADLINE_SEC
+        assert FEED_DEADLINE_SEC == 30
+
+    def test_max_items_per_feed_defined(self):
+        from newsbot.collector import MAX_ITEMS_PER_FEED
+        assert MAX_ITEMS_PER_FEED == 50
+
+    def test_slow_feed_respects_deadline(self):
+        """FEED_DEADLINE_SEC превышен → собирается часть items, не весь фид."""
+        import httpx
+        from newsbot.collector import FeedCollector, FEED_DEADLINE_SEC
+
+        entry_count = 200
+        slow_body = b'''<?xml version="1.0"?><rss><channel>'''
+        for i in range(entry_count):
+            slow_body += (
+                f'<item><title>Slow {i}</title>'
+                f'<link>http://ex.com/{i}</link></item>'
+            ).encode()
+        slow_body += b'</channel></rss>'
+
+        def slow_handler(req: httpx.Request) -> httpx.Response:
+            import time
+            time.sleep(0.05)   # каждый entry = 50ms → 200 шт. > 30 с дедлайна
+            return httpx.Response(200, content=slow_body)
+
+        transport = httpx.MockTransport(slow_handler)
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "slow", "url": "http://slow/feed"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is True
+            # Собрано меньше всех 200 entries (прервались по дедлайну)
+            assert 0 < len(result.items) < entry_count, (
+                f"Ожидалось <{entry_count} items, получено {len(result.items)}"
+            )
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_max_items_per_feed_caps(self):
+        """>MAX_ITEMS_PER_FEED entries → собирается ровно MAX_ITEMS_PER_FEED."""
+        import httpx
+        from newsbot.collector import FeedCollector, MAX_ITEMS_PER_FEED
+
+        big_body = b'''<?xml version="1.0"?><rss><channel>'''
+        for i in range(MAX_ITEMS_PER_FEED + 100):
+            big_body += (
+                f'<item><title>Item {i}</title>'
+                f'<link>http://ex.com/{i}</link></item>'
+            ).encode()
+        big_body += b'</channel></rss>'
+
+        transport, _ = _make_transport(big_body)
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "big", "url": "http://big/feed"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is True
+            assert len(result.items) == MAX_ITEMS_PER_FEED, (
+                f"Ожидалось {MAX_ITEMS_PER_FEED} items, получено {len(result.items)}"
+            )
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
 
 
 class TestCollectorUrlValidation:
@@ -463,3 +540,154 @@ class TestCollectorMockTransport:
         finally:
             client.close()
             collector._client = httpx.Client(timeout=15)
+
+
+# -- config.py: m1 - None-секции не роняют .get-цепочки ----------------------
+
+
+class TestConfigNullSections:
+    """YAML-секция без значения (`llm:`) не должна затирать дефолтный dict."""
+
+    def test_null_llm_section_keeps_defaults(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("llm:\ntelegram:\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert isinstance(cfg["llm"], dict)
+        assert isinstance(cfg["telegram"], dict)
+        assert cfg.get("llm", {}).get("model") == "deepseek-flash"
+        assert cfg.get("llm", {}).get("daily_cost_limit") == 0.50
+
+    def test_null_nested_section_keeps_default(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("llm:\n  balance:\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert isinstance(cfg["llm"]["balance"], dict)
+        assert cfg["llm"]["balance"].get("enabled") is True
+
+
+class TestConfigNonDictSections:
+    """
+    Minor: секция, заданная скаляром (`llm: deepseek`), не должна затирать
+    дефолтный dict — иначе cfg.get("llm", {}).get(...) падает AttributeError.
+    """
+
+    def test_scalar_llm_section_falls_back_to_defaults(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("llm: deepseek\n", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert isinstance(cfg["llm"], dict)
+        assert cfg["llm"]["model"] == "deepseek-flash"
+        # Именно эта цепочка падала в pipeline.py.
+        assert cfg.get("llm", {}).get("push_threshold") == 7
+        assert any("llm" in r.getMessage() for r in caplog.records)
+
+    def test_scalar_telegram_section_falls_back_to_defaults(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("telegram: broken\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert isinstance(cfg["telegram"], dict)
+        assert "token" in cfg["telegram"]
+
+    def test_scalar_balance_section_falls_back_to_defaults(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("llm:\n  balance: true\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert isinstance(cfg["llm"]["balance"], dict)
+        assert cfg["llm"]["balance"].get("enabled") is True
+
+
+# -- Minor 5 / Major 2(a): гварды config.py -----------------------------------
+
+
+class TestConfigHardening:
+    """sources: null, не-dict корень, валидация числовых llm-полей."""
+
+    def test_sources_null_does_not_crash(self, tmp_path):
+        """Minor 5: sources: null → len(None) не должен ронять загрузку."""
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("sources:\nllm:\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert isinstance(cfg, dict)
+        assert cfg["llm"]["model"] == "deepseek-flash"
+
+    def test_non_dict_root_falls_back_to_defaults(self, tmp_path):
+        """Minor 5: YAML-корень не словарь → defaults + warning, без падения."""
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("- a\n- b\n", encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert isinstance(cfg, dict)
+        assert cfg["llm"]["push_threshold"] == 7
+
+    def test_invalid_llm_numeric_falls_back_to_default(self, tmp_path, caplog):
+        """Major 2(a): push_threshold: "high" → warning + дефолт (единая точка)."""
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "llm:\n"
+            "  push_threshold: high\n"
+            "  digest_threshold: null\n"
+            "  max_retries: 2.5\n",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["llm"]["push_threshold"] == 7
+        assert cfg["llm"]["digest_threshold"] == 5
+        assert cfg["llm"]["max_retries"] == 3
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "push_threshold" in messages
+        assert "max_retries" in messages
+
+    def test_numeric_string_accepted(self, tmp_path):
+        """Числовая строка "9" — валидна (не считается опечаткой)."""
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text('llm:\n  push_threshold: "9"\n', encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert cfg["llm"]["push_threshold"] == 9
+
+    def test_digest_cluster_duplicates_in_defaults(self, tmp_path):
+        """Minor 5: digest.cluster_duplicates есть в DEFAULT_CONFIG (True)."""
+        from newsbot.config import DEFAULT_CONFIG, load_config
+
+        assert DEFAULT_CONFIG["digest"]["cluster_duplicates"] is True
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("", encoding="utf-8")
+        cfg = load_config(str(cfg_file))
+        assert cfg["digest"]["cluster_duplicates"] is True
+
+
+# --

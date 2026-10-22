@@ -4,6 +4,7 @@ TelegramDelivery — реальная отправка карточек в ча�
 import html
 import logging
 import re
+import threading
 import time
 import urllib.parse
 from typing import List, Optional
@@ -18,6 +19,26 @@ logger = logging.getLogger("newsbot.delivery.telegram")
 # Лимиты Telegram Bot API
 _TG_MESSAGE_MAX = 4096
 _TG_URL_MAX = 1024   # Telegram inline-кнопка URL ≤ 1024
+
+# ── Pacing: защита от 429 Too Many Requests ───────────────────────────────────
+# Пауза между исходящими сообщениями (Telegram rate limit ~30 msg/sec).
+# 0.6 с — достаточно для заполнения burst bucket'а без превышения лимита.
+SEND_PACING_SEC = 0.6
+
+# ── 429: границы ожидания внутри ОДНОГО вызова API ────────────────────────────
+# Суммарный дедлайн ожидания 429 в рамках одного _api_call. Telegram может
+# вернуть retry_after на часы — ждать такое в цикле доставки нельзя
+# (Docker stop_grace_period 45 с → SIGKILL). По исчерпании дедлайна —
+# TelegramDeliveryError, item остаётся pending (at-least-once).
+RETRY_429_TOTAL_DEADLINE_SEC = 600
+# Максимум подряд идущих 429 в одном вызове (защита от бесконечного цикла,
+# если Telegram отдаёт retry_after=0/маленький, но не пускает).
+MAX_CONSECUTIVE_429 = 10
+
+# Обычные (не 429) ретраи: всего попыток и паузы между ними.
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_HTTP_BACKOFF_SEC = 3
+_RETRY_5XX_BACKOFF_SEC = 5
 
 # ── URL guard (общий helper для poller и digest) ──────────────────────────────
 
@@ -126,15 +147,48 @@ class TelegramDelivery:
     Все спецсимволы экранируются через html.escape().
 
     send_batch возвращает список URL успешно отправленных items.
-    При любом неотправленном item бросает TelegramDeliveryError →
-    pipeline помечает delivered ТОЛЬКО вернувшиеся URL.
+    При ChatIdNotBoundError / BotBlockedError — re-raise (items остаются pending).
+    При TelegramDeliveryError батч прерывается: отправленное — delivered,
+    остаток — pending (at-least-once).
     """
 
-    def __init__(self, token: str, chat_id: str):
+    def __init__(
+        self,
+        token: str,
+        chat_id: str,
+        shutdown_event: Optional[threading.Event] = None,
+    ):
         self.token = token
         self.chat_id = chat_id
         self._base_url = f"https://api.telegram.org/bot{self.token}"
         self._http = _LazyClient(timeout=30.0)
+        # Прерываемые ожидания (pacing, 429, ретраи). event.wait() возвращается
+        # сразу при SIGTERM/SIGINT — в отличие от time.sleep().
+        self._shutdown_event = shutdown_event
+
+    # ── ожидания ─────────────────────────────────────────────────────────────
+
+    def _wait(self, seconds: float) -> None:
+        """
+        Пауза длиной seconds, прерываемая shutdown_event (если он задан).
+
+        shutdown_event=None → обычный time.sleep (обратная совместимость).
+        """
+        if seconds <= 0:
+            return
+        if self._shutdown_event is not None:
+            self._shutdown_event.wait(seconds)
+        else:
+            time.sleep(seconds)
+
+    def _is_shutdown(self) -> bool:
+        """True — запрошен graceful shutdown (event задан и установлен).
+
+        getattr: подклассы/моки могут не вызывать __init__ вовсе.
+        """
+        event = getattr(self, "_shutdown_event", None)
+        return event is not None and event.is_set()
+
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -148,9 +202,9 @@ class TelegramDelivery:
 
         Возвращает список URL успешно доставленных items.
         При ChatIdNotBoundError / BotBlockedError — re-raise (items остаются pending).
-        При прочих ошибках (сеть, 5xx, API) — логирует и продолжает;
-        успешно отправленные URL возвращаются, остальные остаются pending
-        и будут обработаны retry в следующем цикле.
+        При TelegramDeliveryError — батч прерывается (break): уже отправленные
+        URL возвращаются как delivered, остаток остаётся pending и будет
+        обработан retry в следующем цикле (at-least-once).
         """
         if not items:
             return []
@@ -163,7 +217,18 @@ class TelegramDelivery:
 
         successful_urls: List[str] = []
 
-        for item in items:
+        for i, item in enumerate(items):
+            # MINOR-фикс: при установленном shutdown_event паузы в _wait
+            # возвращаются мгновенно, и цикл превращался в burst. Останавливаемся
+            # ДО следующего HTTP-вызова: остаток остаётся pending (at-least-once).
+            if self._is_shutdown():
+                logger.warning(
+                    "TelegramDelivery: получен shutdown — прекращаем отправку, "
+                    "остаток (%d item) остаётся pending",
+                    len(items) - i,
+                )
+                break
+
             try:
                 self._send_one(item)
                 successful_urls.append(item.url)
@@ -180,13 +245,19 @@ class TelegramDelivery:
                 )
                 raise          # аналогично
             except TelegramDeliveryError as e:
-                # сетевая/API-ошибка → логируем, продолжаем,
-                # item остаётся pending, успешные — уже в successful_urls
-                logger.error(
-                    "TelegramDelivery: сбой отправки '%s': %s",
-                    item.title[:60], e,
+                # сетевая/API-ошибка (в т.ч. исчерпан дедлайн 429).
+                # Не долбим API остатком батча: он тоже упрётся в тот же лимит.
+                # Отправленное — delivered, остаток — pending (at-least-once).
+                logger.warning(
+                    "TelegramDelivery: сбой отправки '%s': %s — "
+                    "прерываем батч, остаток (%d item) остаётся pending",
+                    item.title[:60], e, len(items) - i,
                 )
-                # не поднимаем дальше — отдаём то, что отправилось
+                break
+
+            # pacing: пауза между сообщениями (кроме последнего), прерываемая
+            if i < len(items) - 1:
+                self._wait(SEND_PACING_SEC)
 
         return successful_urls
 
@@ -498,48 +569,92 @@ class TelegramDelivery:
 
         Обрабатывает:
           - все сетевые ошибки (базовый httpx.HTTPError) → retry до 3 раз
-          - 429 retry_after → ждём указанное время (capped 120 сек)
+          - 429 retry_after → ждём указанное время, но не дольше суммарного
+            дедлайна RETRY_429_TOTAL_DEADLINE_SEC на ОДИН вызов; 429 НЕ
+            расходует обычный attempt; не более MAX_CONSECUTIVE_429 подряд.
+            При исчерпании дедлайна/лимита → TelegramDeliveryError.
           - 403 → BotBlockedError
           - 5xx → retry до 3 раз
           - невалидный JSON → TelegramDeliveryError
           - прочие 4xx → TelegramDeliveryError
 
+        Все ожидания — через self._wait (прерываемо по shutdown_event).
+
         В10-фикс: ловим базовый httpx.HTTPError (а не отдельные подтипы),
         чтобы UnsupportedProtocol и прочие не-catched подтипы не просочились
         с сырым str(e), содержащим URL с токеном.
         """
-        for attempt in range(3):
+        attempt = 0
+        count_429 = 0
+        waited_429 = 0.0
+
+        while attempt < _RETRY_MAX_ATTEMPTS:
+            # MINOR-фикс: shutdown проверяется в начале КАЖДОЙ попытки —
+            # включая повторы после 429/5xx/сетевых ошибок (continue возвращается
+            # сюда же). Без этого паузы обнулялись, а повторы шли подряд.
+            # Остаток батча остаётся pending (at-least-once).
+            if self._is_shutdown():
+                raise TelegramDeliveryError(
+                    "shutdown: отправка прервана, item остаётся pending"
+                )
+
             try:
                 resp = self._http.post(self._base_url + "/" + method, json=payload)
             except httpx.HTTPError as e:
                 # В10: ловим базовый HTTPError — все подтипы (ConnectError,
                 # TimeoutException, UnsupportedProtocol, RemoteProtocolError …).
                 # Сырое исключение НЕ логируем — содержит URL с токеном.
+                attempt += 1
                 logger.warning(
-                    "Telegram API %s: HTTP-ошибка (%s), попытка %d/3",
-                    method, type(e).__name__, attempt + 1,
+                    "Telegram API %s: HTTP-ошибка (%s), попытка %d/%d",
+                    method, type(e).__name__, attempt, _RETRY_MAX_ATTEMPTS,
                 )
-                if attempt < 2:
-                    time.sleep(3)
+                if attempt < _RETRY_MAX_ATTEMPTS:
+                    self._wait(_RETRY_HTTP_BACKOFF_SEC)
                     continue
                 # типизированное исключение без URL
                 raise TelegramDeliveryError(
-                    f"HTTP-ошибка {type(e).__name__} после 3 попыток"
+                    f"HTTP-ошибка {type(e).__name__} после "
+                    f"{_RETRY_MAX_ATTEMPTS} попыток"
                 )
 
             # ── 429 — rate limit ──
             if resp.status_code == _HTTP_TOO_MANY_REQUESTS:
                 try:
-                    retry_after = resp.json().get(
+                    retry_after = int(resp.json().get(
                         "parameters", {}
-                    ).get("retry_after", 60)
+                    ).get("retry_after", 60))
                 except Exception:
                     retry_after = 60
+                # Защита от 0/отрицательных значений — иначе busy-loop.
+                retry_after = max(retry_after, 1)
+
+                count_429 += 1
+                if count_429 > MAX_CONSECUTIVE_429:
+                    raise TelegramDeliveryError(
+                        f"rate limit (429): {MAX_CONSECUTIVE_429} подряд — отказ "
+                        f"от дальнейших попыток"
+                    )
+
+                remaining = RETRY_429_TOTAL_DEADLINE_SEC - waited_429
+                if retry_after > remaining:
+                    # Ждать бессмысленно: даже полный остаток дедлайна не
+                    # покроет retry_after. item остаётся pending (at-least-once).
+                    raise TelegramDeliveryError(
+                        f"rate limit (429): retry_after={retry_after} с превышает "
+                        f"остаток дедлайна {max(remaining, 0):.0f} с "
+                        f"(лимит {RETRY_429_TOTAL_DEADLINE_SEC} с на вызов)"
+                    )
+
                 logger.warning(
-                    "Telegram API %s: rate limit (429). Ждём %d с",
-                    method, retry_after,
+                    "Telegram API %s: rate limit (429). Ждём %d с "
+                    "(429 подряд: %d/%d, израсходовано %.0f/%d с)",
+                    method, retry_after, count_429, MAX_CONSECUTIVE_429,
+                    waited_429, RETRY_429_TOTAL_DEADLINE_SEC,
                 )
-                time.sleep(min(retry_after, 120))
+                # 429 НЕ расходует attempt — ждём и повторяем тот же вызов.
+                self._wait(retry_after)
+                waited_429 += retry_after
                 continue
 
             # ── 403 — бот заблокирован ──
@@ -548,15 +663,17 @@ class TelegramDelivery:
 
             # ── 5xx — транзиентная ошибка сервера (M1) ──
             if resp.status_code in _RETRYABLE_SERVER_ERRORS:
+                attempt += 1
                 logger.warning(
-                    "Telegram API %s: серверная ошибка %d (попытка %d/3)",
-                    method, resp.status_code, attempt + 1,
+                    "Telegram API %s: серверная ошибка %d (попытка %d/%d)",
+                    method, resp.status_code, attempt, _RETRY_MAX_ATTEMPTS,
                 )
-                if attempt < 2:
-                    time.sleep(5)
+                if attempt < _RETRY_MAX_ATTEMPTS:
+                    self._wait(_RETRY_5XX_BACKOFF_SEC)
                     continue
                 raise TelegramDeliveryError(
-                    f"Серверная ошибка HTTP {resp.status_code} после 3 попыток"
+                    f"Серверная ошибка HTTP {resp.status_code} после "
+                    f"{_RETRY_MAX_ATTEMPTS} попыток"
                 )
 
             # ── прочие ошибки (4xx без special handling) ──
@@ -586,4 +703,6 @@ class TelegramDelivery:
             return result.get("result", {})
 
         # сюда не попадаем (цикл либо return, либо raise), но для типизатора:
-        raise TelegramDeliveryError(f"{method} не удался после 3 попыток")
+        raise TelegramDeliveryError(
+            f"{method} не удался после {_RETRY_MAX_ATTEMPTS} попыток"
+        )

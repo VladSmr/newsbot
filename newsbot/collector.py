@@ -8,9 +8,11 @@
   - пустые entry без link пропускаются
 """
 import calendar
+import html as _html
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator, List, Optional, Pattern, Tuple
@@ -19,6 +21,15 @@ import feedparser
 import httpx
 
 logger = logging.getLogger("newsbot.collector")
+
+# ─── Лимиты ──────────────────────────────────────────────────────────────────
+# Wall-clock (точнее — monotonic) deadline на ОДИН фид целиком:
+# HTTP-фаза (подключение + чтение тела) И конвертация entries.
+# Ставится ДО self._client.stream() — иначе медленный сервер, отдающий
+# по байту, держит iter_bytes() неограниченно долго (per-operation
+# httpx-таймаут сбрасывается на каждом чанке).
+FEED_DEADLINE_SEC = 30
+MAX_ITEMS_PER_FEED = 50  # защита от кривого фида
 
 # ─── Префиксы источников для стриппинга ───────────────────────────────────────
 # Стриппаются ТОЛЬКО в начале строки, ТОЛЬКО если после них идёт whitespace
@@ -86,6 +97,7 @@ class NewsItem:
     tags: Optional[str] = None                # JSON-массив тегов из <category>
     published_parsed: Optional[datetime] = None
     cluster_key: Optional[str] = None         # локация|stem_hash|день (для кластеризации)
+    lang: Optional[str] = None                # язык фида (ru/en), проводка из config.yaml → БД → prompt
     # --- результат LLM-фильтра (этап 2) ---
     llm_score: Optional[int] = None          # оценка 0..10
     llm_summary: Optional[str] = None       # выжимка от LLM
@@ -199,17 +211,30 @@ class FeedCollector:
                 logger.warning("[%s] URL недопустим (scheme/host): %s", name, url)
                 continue
 
-            result = self._fetch_feed(name, url)
+            # lang из конфига фида (Task 2: lang проводка)
+            lang = src.get("lang") or None
+
+            result = self._fetch_feed(name, url, lang=lang)
             yield name, result
 
-    def _fetch_feed(self, name: str, url: str) -> FeedResult:
+    def _fetch_feed(self, name: str, url: str, lang: Optional[str] = None) -> FeedResult:
         """
         GET + feedparser.
 
         Возвращает FeedResult(ok=True, items=[...]) при успехе
         (в т.ч. пустой список если фид легитимно пуст).
-        Возвращает FeedResult(ok=False, items=[]) при любой ошибке.
+        Возвращает FeedResult(ok=False, items=[]) при любой ошибке,
+        в том числе при превышении FEED_DEADLINE_SEC на HTTP-фазе.
         """
+        # ── M1: единый monotonic-deadline на ВСЮ обработку фида ──
+        # Выставляется ДО self._client.stream(): read-таймаут httpx
+        # перезапускается на каждом чанке, поэтому медленный сервер
+        # (по байту раз в 10 с) без этой проверки держал бы iter_bytes()
+        # сколь угодно долго и останавливал весь цикл сбора.
+        # monotonic вместо time.time(): системные часы могут скакнуть (NTP).
+        feed_start = time.monotonic()
+        deadline = feed_start + FEED_DEADLINE_SEC
+
         # ── HTTP: лимит по РАСПАКОВАННОМУ телу — защита от gzip-бомбы / гигантского фида ──
         try:
             logger.debug("[%s] GET %s", name, url)
@@ -239,6 +264,23 @@ class FeedCollector:
                         logger.warning("[%s] Feed too large (%d bytes): %s",
                                        name, len(buf), url)
                         return FeedResult(ok=False, items=[])
+                    # M1: проверка deadline ВНУТРИ чтения — обрывает
+                    # медленный сервер (иначе iter_bytes() бесконечен).
+                    if time.monotonic() > deadline:
+                        logger.warning(
+                            "[%s] FEED_DEADLINE_SEC=%d превышен при чтении тела "
+                            "(%d байт получено) — фид пропущен: %s",
+                            name, FEED_DEADLINE_SEC, len(buf), url,
+                        )
+                        return FeedResult(ok=False, items=[])
+                # M1: страховка после stream (медленное закрытие/финализация).
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "[%s] FEED_DEADLINE_SEC=%d превышен после чтения тела "
+                        "(%d байт) — фид пропущен: %s",
+                        name, FEED_DEADLINE_SEC, len(buf), url,
+                    )
+                    return FeedResult(ok=False, items=[])
                 raw = bytes(buf)
         except httpx.TimeoutException:
             logger.warning("[%s] Таймаут (%d с)", name, FETCH_TIMEOUT)
@@ -272,7 +314,29 @@ class FeedCollector:
 
         # ── entries → NewsItem ──
         news_items = []
+        # feed_start/deadline посчитаны выше (monotonic) — бюджет общий
+        # для HTTP-фазы и конвертации entries.
         for entry in parsed.entries:
+            # Wall-clock deadline: проверяем между entries (не убивая httpx-запрос)
+            elapsed = time.monotonic() - feed_start
+            if elapsed > FEED_DEADLINE_SEC:
+                logger.warning(
+                    "[%s] FEED_DEADLINE_SEC=%d превышен (%.1f с), "
+                    "прерываем обработку фида, собрано %d item(s)",
+                    name, FEED_DEADLINE_SEC, elapsed, len(news_items),
+                )
+                break
+
+            # MAX_ITEMS_PER_FEED: защита от кривого фида
+            if len(news_items) >= MAX_ITEMS_PER_FEED:
+                logger.warning(
+                    "[%s] MAX_ITEMS_PER_FEED=%d reached, "
+                    "пропускаем остальные %d entries",
+                    name, MAX_ITEMS_PER_FEED,
+                    max(0, len(parsed.entries) - len(news_items)),
+                )
+                break
+
             link = getattr(entry, "link", "") or ""
             # пропускаем entry без URL (иначе url="" дедупится как один и тот же)
             if not link:
@@ -281,7 +345,20 @@ class FeedCollector:
                 continue
 
             title = getattr(entry, "title", "") or ""
-            summary = _strip_html(getattr(entry, "summary", "") or "")
+            # m3: feedparser отдаёт title с HTML-сущностями (AT&amp;T, &quot;).
+            # Разэкранируем сразу — title идёт в дедуп, cluster_key и в БД,
+            # а digest затем сам html.escape'ит при отправке. Без unescape
+            # пользователь видел двойное экранирование (AT&amp;amp;T).
+            title = _html.unescape(title)
+
+            # summary: основной → fallback на content[0].value (<20 символов)
+            summary_raw = getattr(entry, "summary", "") or ""
+            if len(summary_raw) < 20:
+                content = getattr(entry, "content", []) or []
+                if content and hasattr(content[0], "value"):
+                    summary_raw = content[0].value or ""
+            summary = _strip_html(summary_raw)
+
             published_str = _format_pubdate(entry)
             pub_parsed = _parse_pubdate_utc(entry)
 
@@ -295,14 +372,14 @@ class FeedCollector:
             tags_str = json.dumps(tags_list) if tags_list else None
 
             # cluster_key: локация|stem_hash|день публикации
+            # Minor 6-фикс: единая реализация — build_cluster_key из locations.py
             cluster_key = None
             if title:
+                from .locations import build_cluster_key, extract_location
                 from .stemmer import stem_hash
-                from .locations import extract_location
                 location = extract_location(title)
                 stem = stem_hash(title)
-                pub_day = published_str[:10] if published_str and len(published_str) >= 10 else 'unknown'
-                cluster_key = f"{location}|{stem}|{pub_day}"
+                cluster_key = build_cluster_key(location, stem, published_str, title=title)
 
             news_items.append(NewsItem(
                 source=name,
@@ -313,6 +390,7 @@ class FeedCollector:
                 published_parsed=pub_parsed,
                 tags=tags_str,
                 cluster_key=cluster_key,
+                lang=lang,
             ))
 
         logger.info(
@@ -330,10 +408,31 @@ class FeedCollector:
 # Обрезается В collector (до отправки в LLM), дублируется в storage.
 MAX_SUMMARY = 6000
 
+# Collector Minor: тег = `<` + опциональный `/` + буква. Так «a < b > c»
+# (сравнение/формула из текста) не считается тегом и не вырезается.
+_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+
 
 def _strip_html(text: str, max_len: int = MAX_SUMMARY) -> str:
-    """Удаляем HTML-теги из summary, обрезаем до max_len символов (B6)."""
-    clean = re.sub(r"<[^>]+>", " ", text)
+    """
+    Удаляем HTML-теги из summary, обрезаем до max_len символов (B6).
+
+    m3: порядок преобразований — strip tags → unescape → повторный strip tags
+    → нормализация пробелов. feedparser отдаёт текст с HTML-сущностями
+    (&amp;, &quot;, &lt;) уже как есть; digest затем html.escape'ит при отправке,
+    поэтому без unescape здесь пользователь видел двойное экранирование
+    (AT&amp;amp;T в Telegram).
+
+    Collector Minor: unescape ДО strip-tags ломал текст с формулами —
+    "a &lt; b &gt; c" превращался в "a < b > c" и regex `<[^>]+>` вырезал
+    "< b >". Поэтому: сначала снимаем настоящие теги, затем разэкранируем и
+    снимаем теги ещё раз (сущность могла стать тегом: `&lt;b&gt;` → `<b>`,
+    псевдотег вырезается). Tag-regex требует букву после `<`/`</` —
+    "a < b > c" (пробел после `<`) остаётся текстом.
+    """
+    clean = _TAG_RE.sub(" ", text)
+    clean = _html.unescape(clean)
+    clean = _TAG_RE.sub(" ", clean)
     clean = re.sub(r"\s+", " ", clean).strip()
     return clean[:max_len]
 
@@ -341,10 +440,13 @@ def _strip_html(text: str, max_len: int = MAX_SUMMARY) -> str:
 def _parse_pubdate_utc(entry) -> Optional[datetime]:
     """
     Парсит published_parsed (struct_time) в UTC.
+    Fallback: updated_parsed.
     Используем calendar.timegm вместо time.mktime,
     чтобы не было сдвига на локальный часовой пояс.
     """
     pt = getattr(entry, "published_parsed", None)
+    if not pt:
+        pt = getattr(entry, "updated_parsed", None)
     if not pt:
         return None
     try:
@@ -356,15 +458,25 @@ def _parse_pubdate_utc(entry) -> Optional[datetime]:
 def _format_pubdate(entry) -> str:
     """
     Формируем читаемую строку даты из entry.
-    Приоритет: published_parsed (UTC) → published → updated → '—'
+    Приоритет: published_parsed (UTC) → updated_parsed → published → updated → '—'
 
     ВАЖНО: НЕ вызывает _parse_pubdate_utc — чтобы избежать двойного парсинга.
     Если нужна дата как datetime — вызывайте _parse_pubdate_utc() напрямую.
     """
+    # Приоритет 1: published_parsed
     pt = getattr(entry, "published_parsed", None)
     if pt:
         try:
             dt = datetime.fromtimestamp(calendar.timegm(pt), tz=timezone.utc)
+            return dt.strftime("%d.%m.%Y %H:%M UTC")
+        except Exception:
+            pass
+
+    # Приоритет 2: updated_parsed (feedparser.struct_time → UTC → строка)
+    ut = getattr(entry, "updated_parsed", None)
+    if ut:
+        try:
+            dt = datetime.fromtimestamp(calendar.timegm(ut), tz=timezone.utc)
             return dt.strftime("%d.%m.%Y %H:%M UTC")
         except Exception:
             pass

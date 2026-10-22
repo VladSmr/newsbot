@@ -183,7 +183,7 @@ def test_long_url_no_link_in_footer(tmp_path):
         summary="Short.",
         llm_score=5,
     )
-    groups, _ = build_digest_messages([item], max_items_per_message=1)
+    groups, _, _ = build_digest_messages([item], max_items_per_message=1)
     assert len(groups) == 1
     msg, _ = groups[0]
 
@@ -588,14 +588,14 @@ def test_send_digest_mismatch_logs_warning(tmp_path, caplog):
 
     # 4 items → 2 groups (max=2), но передаём 5 кнопок
     item_buttons = [[{"t": 1}] for _ in range(5)]
-    groups, _ = build_digest_messages(
+    groups, _, _ = build_digest_messages(
         [storage.get_deferred_items()[0],
          storage.get_deferred_items()[1] or _mk_item(title="X0b", url="https://ex.com/x0b", llm_score=5)],
         max_items_per_message=2,
     )
     # Простой случай: buttons длиннее groups
     with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-        count, urls = run_digest(
+        count, urls, _failed = run_digest(
             storage, delivery, max_items=100, max_items_per_message=20,
             item_buttons_per_msg=item_buttons,
             groups=groups,

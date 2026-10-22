@@ -115,15 +115,15 @@ class TestDedupPrompts(unittest.TestCase):
         msg = build_dedup_user_message(items, recent)
 
         # recent секция есть
-        self.assertIn("НЕДАВНИЕ НОВОСТИ", msg)
+        self.assertIn("RECENT NEWS", msg)
         self.assertIn("Вчерашняя новость", msg)
         # основной список
-        self.assertIn("НОВЫЕ НОВОСТИ", msg)
+        self.assertIn("NEW NEWS", msg)
         self.assertIn("80", msg)  # числа сохраняются
         # делимитеры есть
-        self.assertIn("<|данные:1|>", msg)
-        self.assertIn("<|данные:2|>", msg)
-        self.assertIn("<|данные:R1|>", msg)
+        self.assertIn("<|data:1|>", msg)
+        self.assertIn("<|data:2|>", msg)
+        self.assertIn("<|data:R1|>", msg)
         # без injection в данных
         self.assertNotIn("<|\n", msg)
 
@@ -131,8 +131,8 @@ class TestDedupPrompts(unittest.TestCase):
         """Без recent — секция не добавляется."""
         items = [_mk_item(title="Новость", source="Test")]
         msg = build_dedup_user_message(items, [])
-        self.assertNotIn("НЕДАВНИЕ НОВОСТИ", msg)
-        self.assertIn("НОВЫЕ НОВОСТИ", msg)
+        self.assertNotIn("RECENT NEWS", msg)
+        self.assertIn("NEW NEWS", msg)
 
 
 # =============================================================================

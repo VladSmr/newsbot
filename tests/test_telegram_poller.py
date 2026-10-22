@@ -1491,5 +1491,322 @@ def _make_cb(update_id: int, target_id: int = 1, verdict: str = "u",
     }
 
 
-if __name__ == "__main__":
+# ══════════════════════════════════════════════════════════════════════════════
+# 17. Owner-ID фикс: --set-chat-id авторизация / private-only / --bind
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSetChatIdAuthorization(unittest.TestCase):
+    """Тесты для _set_chat_id (candidates-only без bind) и _set_chat_id_explicit."""
+
+    # httpx импортируется внутри функций (import httpx в теле), поэтому патчим
+    # непосредственно httpx.get — именно этот объект перехватывает локальный import.
+    # _write_env импортирован в __main__ как from .env import _write_env → патчим
+    # newsbot.__main__._write_env.
+
+    def _make_httpx_mock(self, fake_updates):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = fake_updates
+        return mock_resp
+
+    def _join_output(self, mock_print):
+        """Склеивает все аргументы всех вызовов print() в одну строку."""
+        parts = []
+        for call in mock_print.call_args_list:
+            if call.args:
+                parts.append(" ".join(str(a) for a in call.args))
+        return "\n".join(parts)
+
+    # ── _set_chat_id: TELEGRAM_OWNER_ID не задан — показывает кандидатов ─────
+
+    def test_no_owner_id_shows_candidates(self):
+        """Без owner_id: собирает private-чаты из getUpdates, печатает кандидатов."""
+        from newsbot.__main__ import _set_chat_id
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": 111222333, "type": "private",
+                             "username": "alice", "first_name": "Alice"}
+                }},
+                {"update_id": 20, "message": {
+                    "chat": {"id": 444555666, "type": "private",
+                             "username": "bob", "first_name": "Bob"}
+                }},
+                # group — игнорируется
+                {"update_id": 30, "message": {
+                    "chat": {"id": -777888999, "type": "group"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env"):
+            with patch("builtins.print") as mock_print:
+                _set_chat_id()
+                output = self._join_output(mock_print)
+
+            # печатает обоих кандидатов
+            self.assertIn("111222333", output)
+            self.assertIn("444555666", output)
+            self.assertIn("alice", output)
+            self.assertIn("bob", output)
+            # group не попал
+            self.assertNotIn("-777888999", output)
+
+    def test_no_owner_id_one_candidate_prints_bind_hint(self):
+        """Один кандидат — подсказка с --bind."""
+        from newsbot.__main__ import _set_chat_id
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": 111222333, "type": "private",
+                             "username": "alice", "first_name": "Alice"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env"):
+            with patch("builtins.print") as mock_print:
+                _set_chat_id()
+                output = self._join_output(mock_print)
+
+            self.assertIn("--bind", output)
+            self.assertIn("111222333", output)
+
+    def test_no_owner_id_no_private_chats(self):
+        """Нет private-чатов — сообщение и выход без ошибки."""
+        from newsbot.__main__ import _set_chat_id
+
+        fake_updates = {"ok": True, "result": [
+            {"update_id": 10, "message": {
+                "chat": {"id": -100, "type": "group"}
+            }},
+        ]}
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env"):
+            with patch("builtins.print") as mock_print:
+                _set_chat_id()
+                output = self._join_output(mock_print)
+
+            self.assertIn("Не найдено ни одного private-чата", output)
+
+    # ── _set_chat_id: TELEGRAM_OWNER_ID задан — привязывает ТОЛЬКО его ───────
+
+    def test_with_owner_id_binds_his_id_only(self):
+        """owner_id задан: находит его chat_id и пишет TELEGRAM_CHAT_ID в .env."""
+        from newsbot.__main__ import _set_chat_id
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": 111222333, "type": "private",
+                             "username": "alice", "first_name": "Alice"}
+                }},
+                {"update_id": 20, "message": {
+                    "chat": {"id": 999888777, "type": "private",
+                             "username": "bob", "first_name": "Bob"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value="111222333"), \
+             patch("newsbot.__main__._write_env") as mock_write, \
+             patch("builtins.print"):
+            _set_chat_id()
+
+            mock_write.assert_called_once()
+            args = mock_write.call_args[0]
+            self.assertEqual(args[0], "TELEGRAM_CHAT_ID")
+            self.assertEqual(args[1], "111222333")
+
+    def test_owner_id_rejects_wrong_id(self):
+        """owner_id задан, но его chat_id нет в обновлениях — НЕ пишет в .env."""
+        from newsbot.__main__ import _set_chat_id
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": 999888777, "type": "private",
+                             "username": "bob", "first_name": "Bob"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value="111222333"), \
+             patch("newsbot.__main__._write_env") as mock_write, \
+             patch("builtins.print"):
+            _set_chat_id()
+
+            mock_write.assert_not_called()
+
+    def test_group_rejected(self):
+        """getUpdates с group-type чатом: не попадает в candidates."""
+        from newsbot.__main__ import _set_chat_id
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": -1001234567890, "type": "supergroup",
+                             "title": "Test Group"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env"):
+            with patch("builtins.print") as mock_print:
+                _set_chat_id()
+                output = self._join_output(mock_print)
+
+            self.assertIn("Не найдено ни одного private-чата", output)
+
+    def test_channel_rejected(self):
+        """getUpdates с channel — игнорируется."""
+        from newsbot.__main__ import _set_chat_id
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": -100200300400, "type": "channel",
+                             "title": "My Channel"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env"):
+            with patch("builtins.print") as mock_print:
+                _set_chat_id()
+                output = self._join_output(mock_print)
+
+            self.assertIn("Не найдено ни одного private-чата", output)
+
+    # ── _set_chat_id_explicit: --bind ─────────────────────────────────────────
+
+    def test_bind_explicit_private_chat(self):
+        """--bind с реальным private chat_id: пишет в .env."""
+        from newsbot.__main__ import _set_chat_id_explicit
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": 111222333, "type": "private",
+                             "username": "alice", "first_name": "Alice"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env") as mock_write, \
+             patch("builtins.print"):
+            _set_chat_id_explicit("111222333")
+
+            mock_write.assert_called_once()
+            args = mock_write.call_args[0]
+            self.assertEqual(args[0], "TELEGRAM_CHAT_ID")
+            self.assertEqual(args[1], "111222333")
+
+    def test_bind_explicit_non_private_rejected(self):
+        """--bind с group/channel id — отклонение."""
+        from newsbot.__main__ import _set_chat_id_explicit
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": -1001234567890, "type": "supergroup",
+                             "title": "Test Group"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env") as mock_write, \
+             patch("builtins.print") as mock_print:
+            _set_chat_id_explicit("-1001234567890")
+
+            mock_write.assert_not_called()
+            output = self._join_output(mock_print)
+            self.assertIn("НЕ private-чат", output)
+
+    def test_bind_explicit_owner_id_mismatch_rejected(self):
+        """--bind с id ≠ TELEGRAM_OWNER_ID — отклонение."""
+        from newsbot.__main__ import _set_chat_id_explicit
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": 111222333, "type": "private",
+                             "username": "alice", "first_name": "Alice"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value="999888777"), \
+             patch("newsbot.__main__._write_env") as mock_write, \
+             patch("builtins.print") as mock_print:
+            _set_chat_id_explicit("111222333")
+
+            mock_write.assert_not_called()
+            output = self._join_output(mock_print)
+            self.assertIn("не совпадает с TELEGRAM_OWNER_ID", output)
+
+    def test_bind_explicit_id_not_in_updates(self):
+        """--bind с id, которого нет в getUpdates — сообщение об ошибке."""
+        from newsbot.__main__ import _set_chat_id_explicit
+
+        fake_updates = {
+            "ok": True,
+            "result": [
+                {"update_id": 10, "message": {
+                    "chat": {"id": 111222333, "type": "private",
+                             "username": "alice", "first_name": "Alice"}
+                }},
+            ],
+        }
+
+        with patch("httpx.get", return_value=self._make_httpx_mock(fake_updates)), \
+             patch("newsbot.__main__.telegram_token", return_value="token"), \
+             patch("newsbot.__main__.telegram_owner_id", return_value=""), \
+             patch("newsbot.__main__._write_env") as mock_write, \
+             patch("builtins.print") as mock_print:
+            _set_chat_id_explicit("999888777")  # нет в updates
+
+            mock_write.assert_not_called()
+            output = self._join_output(mock_print)
+            self.assertIn("не найден среди private-чатов", output)
+
+
+if __name__ == '__main__':
     unittest.main()

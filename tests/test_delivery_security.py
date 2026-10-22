@@ -12,6 +12,8 @@ import io
 import logging
 import re
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from unittest.mock import MagicMock, patch
@@ -24,7 +26,13 @@ from newsbot.env import _parse_env, _strip_inline_comment, _write_env
 from newsbot.log import TokenSanitizer, setup_logging
 from newsbot.llm.filter import LLMFilter
 from newsbot.llm.client import DeepSeekClient, LLMError
-from newsbot.delivery.telegram import TelegramDelivery
+from newsbot.delivery.telegram import (
+    MAX_CONSECUTIVE_429,
+    RETRY_429_TOTAL_DEADLINE_SEC,
+    SEND_PACING_SEC,
+    TelegramDelivery,
+    TelegramDeliveryError,
+)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -227,41 +235,150 @@ class TestSplitTextHugeTitle:
 
 
 # ══════════════════════════════════════════════════════════════════
-# B8: 429 retry_after каппится до 120
+# Задача 1 (волна 3): 429 — не расходует attempt, ограничен дедлайном
+# и числом подряд идущих 429; все ожидания прерываемы shutdown_event
 # ══════════════════════════════════════════════════════════════════
 
-class Test429RetryCap:
-    def test_retry_after_logic_capped(self):
-        """Проверяем cap через патчинг httpx.HTTPStatusError."""
-        import httpx
+class Test429Handling:
+    """
+    TelegramDelivery._api_call при 429:
+      — attempt НЕ расходуется (429 ≠ обычная ошибка);
+      — суммарное ожидание 429 ≤ RETRY_429_TOTAL_DEADLINE_SEC на ОДИН вызов;
+      — не более MAX_CONSECUTIVE_429 подряд;
+      — ожидание через self._wait (event.wait при заданном shutdown_event).
+    """
 
-        client = DeepSeekClient(
-            api_key="fake-key-not-real",
-            base_url="https://localhost:99999",
-            model="fake",
-            max_retries=1,
+    @staticmethod
+    def _resp_429(retry_after: int):
+        r = MagicMock()
+        r.status_code = 429
+        r.json.return_value = {"ok": False, "parameters": {"retry_after": retry_after}}
+        return r
+
+    @staticmethod
+    def _resp_ok():
+        r = MagicMock()
+        r.status_code = 200
+        r.is_success = True
+        r.json.return_value = {"ok": True, "result": {"message_id": 1}}
+        return r
+
+    def test_429_does_not_consume_attempt(self):
+        """
+        Один 429 (retry_after=1) + успех → ровно 2 HTTP-вызова.
+        При старом for attempt in range(3) 429 съедал попытку, и в
+        комбинации с другими ошибками вызов падал раньше времени.
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          side_effect=[self._resp_429(1), self._resp_ok()]) as mock_post, \
+             patch.object(td, "_wait") as mock_wait:
+            result = td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+        assert result == {"message_id": 1}
+        assert mock_post.call_count == 2, (
+            f"HTTP-вызовов: {mock_post.call_count}, ожидалось 2"
         )
-        # создаём httpx.HTTPStatusError с retry-after: 999
-        resp_mock = MagicMock()
-        resp_mock.status_code = 429
-        resp_mock.headers = {"retry-after": "999"}
-        resp_mock.text = ""
+        mock_wait.assert_called_once_with(1)
 
-        exc = httpx.HTTPStatusError(
-            "429", request=MagicMock(), response=resp_mock
-        )
+    def test_four_consecutive_429_bounded(self):
+        """4+ подряд 429: число вызовов и суммарный сон ограничены."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          side_effect=[self._resp_429(3)] * 5 + [self._resp_ok()]), \
+             patch.object(td, "_wait") as mock_wait:
+            result = td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
 
-        with patch.object(client._http, "post", side_effect=exc):
-            with patch("time.sleep") as mock_sleep:
-                with pytest.raises(LLMError) as exc_info:
-                    client.chat_json("sys", "user")
-                # Конкретный тип исключения: LLMError (не generic Exception)
-                assert isinstance(exc_info.value, LLMError)
-                # retry-after=999 должен быть закаплен в 120
-                assert mock_sleep.called, "time.sleep должен быть вызван при 429"
-                for call in mock_sleep.call_args_list:
-                    wait_arg = call[0][0]
-                    assert wait_arg <= 120, f"wait={wait_arg} превышает cap 120!"
+        assert result == {"message_id": 1}
+        total = sum(call[0][0] for call in mock_wait.call_args_list)
+        assert total <= RETRY_429_TOTAL_DEADLINE_SEC
+
+    def test_429_total_deadline_caps_sleep(self):
+        """
+        retry_after=200 при дедлайне 600 → 3 ожидания по 200 с, на 4-м 429
+        остаток дедлайна 0 → TelegramDeliveryError (item остаётся pending).
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          side_effect=[self._resp_429(200)] * 10) as mock_post, \
+             patch.object(td, "_wait") as mock_wait:
+            with pytest.raises(TelegramDeliveryError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+        total = sum(call[0][0] for call in mock_wait.call_args_list)
+        assert total <= RETRY_429_TOTAL_DEADLINE_SEC
+        assert total == RETRY_429_TOTAL_DEADLINE_SEC
+        # 3 ожидания + 4-й ответ 429, на котором вышли по дедлайну
+        assert mock_post.call_count == 4
+
+    def test_429_above_deadline_fails_fast(self):
+        """
+        retry_after (999 с) больше всего дедлайна → НЕ спим впустую,
+        сразу TelegramDeliveryError.
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          side_effect=[self._resp_429(999)]) as mock_post, \
+             patch.object(td, "_wait") as mock_wait:
+            with pytest.raises(TelegramDeliveryError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+        mock_wait.assert_not_called()
+        assert mock_post.call_count == 1
+
+    def test_429_consecutive_limit(self):
+        """
+        Бесконечные 429 с retry_after=1 → не более MAX_CONSECUTIVE_429
+        ожиданий, затем ошибка (защита от бесконечного цикла).
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          side_effect=[self._resp_429(1)] * 50) as mock_post, \
+             patch.object(td, "_wait") as mock_wait:
+            with pytest.raises(TelegramDeliveryError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+        assert mock_wait.call_count == MAX_CONSECUTIVE_429
+        assert mock_post.call_count == MAX_CONSECUTIVE_429 + 1
+
+    def test_wait_is_interruptible_by_shutdown_event(self):
+        """_wait не блокирует поток, если shutdown_event уже установлен."""
+        event = threading.Event()
+        event.set()
+        td = TelegramDelivery(token="tok", chat_id="123", shutdown_event=event)
+
+        start = time.monotonic()
+        td._wait(60)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0, f"_wait не прервался по shutdown_event ({elapsed:.2f}s)"
+
+    def test_pacing_uses_wait_helper(self):
+        """Pacing между сообщениями идёт через _wait (прерываемо), а не time.sleep."""
+        td = TelegramDelivery(token="tok", chat_id="123",
+                              shutdown_event=threading.Event())
+        with patch.object(td, "_api_call"), \
+             patch.object(td, "_wait") as mock_wait:
+            td.send_batch([_make_item(i) for i in range(3)])
+
+        assert mock_wait.call_count == 2
+        for call in mock_wait.call_args_list:
+            assert call[0][0] == SEND_PACING_SEC
+
+    def test_send_batch_breaks_on_delivery_error(self):
+        """
+        TelegramDeliveryError → break: отправленное = delivered,
+        остаток = pending (не долбим API всем батчем).
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        items = [_make_item(i) for i in range(3)]
+        with patch.object(td, "_send_one",
+                          side_effect=[None, TelegramDeliveryError("429"), None]) as sent, \
+             patch.object(td, "_wait"):
+            result = td.send_batch(items)
+
+        assert result == [items[0].url]
+        assert sent.call_count == 2, "после ошибки батч должен прерваться"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -581,3 +698,69 @@ class TestTokenSanitizerMappingArgs:
         message = record.getMessage()
         assert "***REDACTED***" in message
         assert "TOKENSEcretExtra1" not in message
+
+
+# ══════════════════════════════════════════════════════════════════
+# Задача 1: pacing между сообщениями
+# ══════════════════════════════════════════════════════════════════
+
+class TestSendPacing:
+    """SEND_PACING_SEC=0.6: пауза между сообщениями, кроме последнего."""
+
+    def test_send_batch_sleeps_between_messages(self):
+        """
+        send_batch: пауза после каждого сообщения КРОМЕ последнего.
+        time.sleep мокаем, проверяем количество и интервалы.
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+
+        # Мокаем _api_call — все успешные
+        with patch.object(td, "_api_call"):
+            with patch("newsbot.delivery.telegram.time.sleep") as mock_sleep:
+                with patch("newsbot.delivery.telegram.SEND_PACING_SEC", 0.6):
+                    items = [_make_item(i) for i in range(3)]
+                    td.send_batch(items)
+
+                # 3 items → 2 паузы (после item 0 и item 1)
+                assert mock_sleep.call_count == 2, (
+                    f"sleep вызван {mock_sleep.call_count} раз, ожидалось 2"
+                )
+                # Каждая пауза = 0.6 с
+                for call in mock_sleep.call_args_list:
+                    assert call[0][0] == 0.6
+
+    def test_send_batch_single_item_no_sleep(self):
+        """Одно сообщение — пауза НЕ делается."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+
+        with patch.object(td, "_api_call"):
+            with patch("newsbot.delivery.telegram.time.sleep") as mock_sleep:
+                items = [_make_item(1)]
+                td.send_batch(items)
+
+        # 1 item → 0 пауз
+        assert mock_sleep.call_count == 0
+
+    def test_send_batch_empty_no_sleep(self):
+        """Пустой батч — пауза НЕ делается."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+
+        with patch("newsbot.delivery.telegram.time.sleep") as mock_sleep:
+            result = td.send_batch([])
+        assert result == []
+        assert mock_sleep.call_count == 0
+
+
+def _make_item(i: int):
+    """Factory: NewsItem dataclass с уникальным url."""
+    from dataclasses import dataclass, field
+    from datetime import datetime, timezone
+    from newsbot.collector import NewsItem
+    return NewsItem(
+        source="test",
+        url=f"https://example.com/{i}",
+        title=f"Title {i}",
+        summary=f"Summary {i}",
+        published="2025-01-01",
+        fetched_at=datetime.now(timezone.utc),
+    )

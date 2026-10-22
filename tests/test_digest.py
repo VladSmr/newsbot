@@ -11,8 +11,12 @@
   - purge_items: digested удаляется по retention
 
 Возвращаемое значение build_digest_messages:
-  Tuple[List[Tuple[str, List[NewsItem]]], List[NewsItem]]
-  → msg_groups[i][0] = HTML-строка, msg_groups[i][1] = список items
+  Tuple[List[Tuple[str, List[NewsItem]]], List[NewsItem], List[str]]
+  → msg_groups[i][0] = HTML-строка, msg_groups[i][1] = список items,
+    build_failed_urls = urls items, выпавших при рендеринге.
+
+Возвращаемое значение run_digest:
+  Tuple[int, List[str], List[str]] = (sent_count, sent_urls, all_failed_urls)
 
 Запуск: python -m pytest tests/test_digest.py -v
 """
@@ -80,7 +84,7 @@ def _cleanup(path):
 
 def test_build_digest_empty():
     """Пустой список → ([], [])."""
-    groups, items = build_digest_messages([], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([], max_items_per_message=20)
     assert groups == []
     assert items == []
 
@@ -92,7 +96,7 @@ def test_build_digest_html_escape():
         source='<img src=x onerror=alert(1)>',
         summary='Summary with <b>bold</b> &amp; <i>italic</i>',
     )
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     assert len(groups) == 1
     text = groups[0][0]
     assert "<script>" not in text
@@ -102,7 +106,7 @@ def test_build_digest_html_escape():
 def test_build_digest_single_message():
     """Одна новость → одно сообщение с заголовком."""
     item = _mk_item(title="News Title", source="Source1", summary="Short.")
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     assert len(groups) == 1
     assert "📰 Дайджест — 1 из 1 новостей" in groups[0][0]
     assert len(groups[0][1]) == 1
@@ -111,7 +115,7 @@ def test_build_digest_single_message():
 def test_build_digest_max_per_message():
     """При max_per_message=2 трёхэлементный список → 2 сообщения (кумулятивный header)."""
     items = [_mk_item(title=f"Item {i}", url=f"https://ex.com/{i}") for i in range(3)]
-    groups, all_items = build_digest_messages(items, max_items_per_message=2)
+    groups, all_items, _ = build_digest_messages(items, max_items_per_message=2)
     assert len(groups) == 2
     # Кумулятивный: msg1 items 1–2 → "1–2 из 3", msg2 item 3 → "3 из 3"
     assert "1–2 из 3" in groups[0][0]
@@ -123,7 +127,7 @@ def test_build_digest_large_summary_truncated():
     """Очень длинный summary обрезается."""
     long_text = "A" * 1000
     item = _mk_item(summary=long_text)
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     assert len(groups) == 1
     # Не более 4096 символов
     assert len(groups[0][0]) <= _TG_MESSAGE_MAX
@@ -135,7 +139,7 @@ def test_build_digest_uses_llm_summary():
         summary="Raw summary from feed.",
         llm_summary="LLM summary — important part.",
     )
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     text = groups[0][0]
     assert "LLM summary" in text
     assert "Raw summary from feed" not in text
@@ -144,7 +148,7 @@ def test_build_digest_uses_llm_summary():
 def test_build_digest_all_fits_single_message():
     """10 новостей влезают в одно сообщение."""
     items = [_mk_item(title=f"Title {i}", url=f"https://ex.com/{i}") for i in range(10)]
-    groups, all_items = build_digest_messages(items, max_items_per_message=20)
+    groups, all_items, _ = build_digest_messages(items, max_items_per_message=20)
     assert len(groups) == 1
     assert "10 из 10 новостей" in groups[0][0]
     assert len(all_items) == 10
@@ -154,7 +158,7 @@ def test_build_digest_header_has_local_time():
     """Заголовок содержит локальное время."""
     local_now = datetime(2025, 6, 15, 14, 30, tzinfo=timezone.utc)
     item = _mk_item()
-    groups, items = build_digest_messages([item], max_items_per_message=20,
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20,
                                            local_now=local_now)
     assert "15.06.2025" in groups[0][0]
 
@@ -168,7 +172,7 @@ def test_build_digest_message_within_4096():
         )
         for i in range(50)
     ]
-    groups, all_items = build_digest_messages(items, max_items_per_message=20)
+    groups, all_items, _ = build_digest_messages(items, max_items_per_message=20)
     for msg, _ in groups:
         assert len(msg) <= _TG_MESSAGE_MAX
 
@@ -179,7 +183,7 @@ def test_build_digest_no_broken_html_entities():
         title="Title with <special> & 'chars'",
         summary="Body: a & b < c > d \"quotes\" 'apostrophes'",
     )
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     text = groups[0][0]
     assert "&\n" not in text
 
@@ -187,7 +191,7 @@ def test_build_digest_no_broken_html_entities():
 def test_build_digest_url_whitelist_http_https():
     """URL http:// и https:// пропускаются с HTML-ссылкой."""
     item = _mk_item(title="T", url="https://example.com/path?a=1&b=2")
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     text = groups[0][0]
     assert "https://example.com" in text
     assert '<a href="https://example.com' in text
@@ -196,7 +200,7 @@ def test_build_digest_url_whitelist_http_https():
 def test_build_digest_url_whitelist_rejects_javascript():
     """javascript: URL отбрасывается."""
     item = _mk_item(title="JS", url="javascript:alert(1)")
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     text = groups[0][0]
     assert "javascript:" not in text
     assert '<a href="javascript' not in text
@@ -205,7 +209,7 @@ def test_build_digest_url_whitelist_rejects_javascript():
 def test_build_digest_url_whitelist_rejects_tg():
     """tg:// URL отбрасывается."""
     item = _mk_item(title="TG", url="tg://resolve?domain=foo")
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     text = groups[0][0]
     assert "tg://" not in text
 
@@ -213,21 +217,21 @@ def test_build_digest_url_whitelist_rejects_tg():
 def test_build_digest_max_per_message_zero_guard():
     """max_per_message=0 → минимум 1 (guard)."""
     items = [_mk_item(title=f"Item {i}") for i in range(3)]
-    groups, all_items = build_digest_messages(items, max_items_per_message=0)
+    groups, all_items, _ = build_digest_messages(items, max_items_per_message=0)
     assert len(groups) == 3
 
 
 def test_build_digest_max_per_message_negative():
     """max_per_message=-5 → минимум 1."""
     items = [_mk_item(title=f"Item {i}") for i in range(3)]
-    groups, all_items = build_digest_messages(items, max_items_per_message=-5)
+    groups, all_items, _ = build_digest_messages(items, max_items_per_message=-5)
     assert len(groups) == 3
 
 
 def test_build_digest_source_included():
     """Source отображается в entry (Title — Source)."""
     item = _mk_item(title="Breaking News", source="Reuters", summary="Short.")
-    groups, items = build_digest_messages([item], max_items_per_message=20)
+    groups, items, _ = build_digest_messages([item], max_items_per_message=20)
     text = groups[0][0]
     assert "Reuters" in text
 
@@ -235,7 +239,7 @@ def test_build_digest_source_included():
 def test_build_digest_count_in_header_matches_items():
     """Заголовок N из total соответствует фактическому числу items (кумулятивный)."""
     items = [_mk_item(title=f"Item {i}", url=f"https://ex.com/{i}") for i in range(7)]
-    groups, all_items = build_digest_messages(items, max_items_per_message=3)
+    groups, all_items, _ = build_digest_messages(items, max_items_per_message=3)
     # 7 items, max=3 → 3 msgs: 1–3, 4–6, 7
     assert len(groups) == 3
     # Кумулятивный формат: "1–3 из 7" / "4–6 из 7" / "7 из 7"
@@ -247,13 +251,13 @@ def test_build_digest_count_in_header_matches_items():
 def test_build_digest_cumulative_header_two_messages():
     """При разбиении на 2 сообщения: msg1=N из total, msg2=(N+1) из total."""
     items = [_mk_item(title=f"Item {i}", url=f"https://ex.com/{i}") for i in range(1, 11)]
-    groups, _ = build_digest_messages(items, max_items_per_message=20)
+    groups, _, _ = build_digest_messages(items, max_items_per_message=20)
     # 10 items, max=20 → всё влезает в одно сообщение → header "1–10 из 10"
     assert len(groups) == 1
     assert "1–10 из 10" in groups[0][0]
 
     # При лимите 5 items/message: 2 сообщения
-    groups2, _ = build_digest_messages(items, max_items_per_message=5)
+    groups2, _, _ = build_digest_messages(items, max_items_per_message=5)
     assert len(groups2) == 2
     # msg1: items 1–5 → "1–5 из 10"
     assert "1–5 из 10" in groups2[0][0]
@@ -277,7 +281,7 @@ def test_run_digest_marks_digested_on_success():
         delivery = MagicMock()
         delivery.send_text.return_value = True
 
-        count, urls = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 1
         assert urls == ["https://ex.com/d1"]
@@ -304,7 +308,7 @@ def test_run_digest_remains_deferred_on_failure():
         delivery = MagicMock()
         delivery.send_text.return_value = False
 
-        count, urls = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 0
         assert urls == []
@@ -330,7 +334,7 @@ def test_run_digest_remains_deferred_on_exception():
         delivery = MagicMock()
         delivery.send_text.side_effect = RuntimeError("network error")
 
-        count, urls = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 0
 
@@ -348,7 +352,7 @@ def test_run_digest_empty_no_send():
         storage = Storage(db_path)
         delivery = MagicMock()
 
-        count, urls = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 0
         assert urls == []
@@ -377,7 +381,7 @@ def test_run_digest_partial_failure_marks_sent_only():
 
         delivery.send_text.side_effect = fake_send
 
-        count, urls = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=2)
         # msg1 (items 0,1) → ok, msg2 (items 2,3) → fail, msg3 (item 4) → skip
         assert count == 2
@@ -406,7 +410,7 @@ def test_run_digest_returns_included_urls():
         delivery = MagicMock()
         delivery.send_text.side_effect = [True, False]  # msg1 ok, msg2 fail
 
-        count, urls = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=2)
         assert count == 2
         assert set(urls) == {"https://ex.com/item0", "https://ex.com/item1"}
@@ -433,7 +437,7 @@ def test_run_digest_long_items_still_sent():
         delivery = MagicMock()
         delivery.send_text.return_value = True
 
-        count, urls = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=3)
         assert count == 10
         assert len(urls) == 10
@@ -780,7 +784,7 @@ def test_run_digest_with_buttons_calls_send_digest():
         delivery.send_digest.return_value = True
 
         item_buttons = [[{"url": "https://ex.com/btns", "target_id": 7}]]
-        count, urls = run_digest(
+        count, urls, _failed = run_digest(
             storage, delivery, max_items=100, max_items_per_message=20,
             item_buttons_per_msg=item_buttons,
         )
@@ -820,7 +824,7 @@ def test_run_digest_buttons_partial_failure():
             [{"url": f"https://ex.com/b{i}", "target_id": i + 1} for i in range(2)],
             [{"url": f"https://ex.com/b{i}", "target_id": i + 1} for i in range(2, 4)],
         ]
-        count, urls = run_digest(
+        count, urls, _failed = run_digest(
             storage, delivery, max_items=100, max_items_per_message=2,
             item_buttons_per_msg=item_buttons,
         )
@@ -934,7 +938,7 @@ def test_run_digest_warns_on_oversized_text(caplog):
         item_buttons = [[{"url": "https://ex.com/over", "target_id": 1}]]
 
         with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-            count, urls = run_digest(
+            count, urls, _failed = run_digest(
                 storage, delivery, max_items=100, max_items_per_message=1,
                 item_buttons_per_msg=item_buttons,
             )
@@ -994,7 +998,7 @@ def test_run_digest_pathological_url_no_warning(caplog):
         item_buttons = [[{"url": pathological_url, "target_id": 1}]]
 
         with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-            count, urls = run_digest(
+            count, urls, _failed = run_digest(
                 storage, delivery, max_items=100, max_items_per_message=1,
                 item_buttons_per_msg=item_buttons,
             )
@@ -1052,7 +1056,7 @@ def test_run_digest_combined_escape_pathology(caplog):
         item_buttons = [[{"url": path_url, "target_id": 1}]]
 
         with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-            count, urls = run_digest(
+            count, urls, _failed = run_digest(
                 storage, delivery, max_items=100, max_items_per_message=1,
                 item_buttons_per_msg=item_buttons,
             )
@@ -1087,7 +1091,7 @@ def test_build_digest_quotes_title_and_body_escaped_valid(caplog):
         summary='"' * 500,
         llm_score=5,
     )
-    groups, _ = build_digest_messages([item], max_items_per_message=1)
+    groups, _, _ = build_digest_messages([item], max_items_per_message=1)
     assert len(groups) == 1
     msg, _ = groups[0]
     assert len(msg) <= _TG_MESSAGE_MAX, f"Quotes msg: {len(msg)} > 4096"
@@ -1167,7 +1171,7 @@ def test_run_digest_pathological_escape_special_chars():
         summary=dangerous,
         llm_score=5,
     )
-    groups, _ = build_digest_messages([item], max_items_per_message=1)
+    groups, _, _ = build_digest_messages([item], max_items_per_message=1)
     assert len(groups) == 1
     msg, _ = groups[0]
     # Гарантия ≤ 4096
@@ -1208,7 +1212,7 @@ def test_run_digest_continue_on_partial_failure():
             [{"url": f"https://ex.com/i{i}", "target_id": i + 1} for i in range(2, 4)],
             [{"url": f"https://ex.com/i{i}", "target_id": i + 1} for i in range(4, 6)],
         ]
-        count, urls = run_digest(
+        count, urls, _failed = run_digest(
             storage, delivery, max_items=100, max_items_per_message=2,
             item_buttons_per_msg=item_buttons,
         )
@@ -1232,7 +1236,7 @@ def test_run_digest_source_hard_cap():
     """M1: source обрезается до 100 символов RAW — overhead не раздувается."""
     # source с 200 символами — после усечения до 100 body получит больше бюджета
     item = _mk_item(title="Title", source="X" * 200, summary="Short.", llm_score=5)
-    groups, _ = build_digest_messages([item], max_items_per_message=1)
+    groups, _, _ = build_digest_messages([item], max_items_per_message=1)
     msg, _ = groups[0]
     assert len(msg) <= _TG_MESSAGE_MAX
 
@@ -1258,7 +1262,7 @@ def test_run_digest_partial_failure_send_text_continue():
         delivery.send_text.side_effect = fake_send_text
 
         # send_text fallback (item_buttons_per_msg=None)
-        count, urls = run_digest(
+        count, urls, _failed = run_digest(
             storage, delivery, max_items=100, max_items_per_message=2,
         )
         # msg1 (0,1) + msg3 (4,5) отправлены = 4 items

@@ -562,12 +562,16 @@ class TestRunDigestClusterIntegration(unittest.TestCase):
             # Переоткрываем соединение чтобы увидеть закоммиченные данные
             p.storage.close()
             s = Storage(db_path)
-            # Оба items удалены delete_items_before (fetched_at 2025 < digest_started_iso Oct 2026)
+            # lead2: selected -> digested -> УДАЛЁН delete_items_before.
+            # d2: NOT selected (дубль, detect_duplicates исключило) -> остаётся deferred.
             all_urls = set()
             for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
                 all_urls.update(i.url for i in s.get_all_by_state(state))
-            self.assertNotIn("https://ex.com/lead2", all_urls)
-            self.assertNotIn("https://ex.com/d2", all_urls)
+            self.assertNotIn("https://ex.com/lead2", all_urls,
+                "lead2 (selected -> digested) удалён delete_items_before")
+            deferred_urls = {i.url for i in s.get_all_by_state("deferred")}
+            self.assertIn("https://ex.com/d2", deferred_urls,
+                "d2 (NOT selected) остаётся deferred (delete_items_before не трогает deferred)")
             s.close()
 
     def test_no_duplicates_means_all_sent(self):

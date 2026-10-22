@@ -6,41 +6,246 @@
 (без --once / --digest / --check-*).
 """
 import argparse
+import ctypes
 import logging
+import os
 import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from .config import load_config
-from .env import telegram_token, deepseek_api_key, _write_env
-from .log import setup_logging
+from .env import telegram_token, deepseek_api_key, telegram_owner_id, _write_env
+from .log import setup_logging, _minimal_sanitizer_handler
 from .llm import DeepSeekClient, LLMError
 from .pipeline import NewsPipeline, _parse_bool
 from .telegram_io import TelegramPoller
 from .version import __version__
 
-_run = True
+# ── graceful shutdown: threading.Event вместо bool-флага ─────────────────────
+# Event работает с threading.Condition/wait(), bool — нет.
+# signal.signal ставится ТОЛЬКО в main thread.
+_shutdown_event = threading.Event()
 
 _BACKOFF_SECONDS = 30  # пауза при непойманном исключении в цикле
+
+# Бюджет ожидания TelegramPoller при graceful shutdown (сек).
+# stop() + close() вместе НЕ должны превышать этот бюджет: stop() делает
+# первый join (poll_timeout+5), close() получает лишь остаток дедлайна.
+# Должно быть < stop_grace_period (45s в docker-compose.yml), чтобы успеть
+# выполнить pipeline.close() и освободить lock-файл до SIGKILL.
+_POLLER_SHUTDOWN_BUDGET_SEC = 40.0
 
 # глобальная ссылка на поллер — для graceful shutdown
 _poller: Optional["TelegramPoller"] = None
 # M1: event для /digest — поллер устанавливает, основной цикл проверяет
 _digest_requested = threading.Event()
 
+# ── single-instance lock (демон) ────────────────────────────────────────────
+# Lock-файл: <db_dir>/newsbot.lock. Захватывается при демон-старте,
+# освобождается в finally при аккуратном выходе.
+# Для --once/--digest/--check-* блокировка НЕ используется (one-shot, быстрые).
+_LOCK_FILE: Optional["Path"] = None
+
+
+def _acquire_lock(lock_path: "Path", my_pid: int) -> bool:
+    """
+    Пытается захватить эксклюзивный lock.
+
+    Атомарность: PID пишется в temp-файл в той же директории и публикуется
+    через os.link() (атомарный create-if-not-exists) — lock-файл появляется
+    СРАЗУ с содержимым. Поэтому нет TOCTOU-окна «файл есть, но пустой»,
+    в котором второй процесс мог бы счесть живой lock stale и удалить его.
+    На ФС без hardlink — fallback: O_CREAT|O_EXCL + запись PID.
+
+    Returns True если lock получен, False если уже занят (sys.exit 1).
+    """
+
+    def _publish() -> bool:
+        """Публикует lock с PID. False — lock уже существует."""
+        tmp_path = lock_path.with_name(f"{lock_path.name}.{my_pid}.tmp")
+        try:
+            tmp_path.write_text(str(my_pid), encoding="ascii")
+            try:
+                os.link(str(tmp_path), str(lock_path))
+            except FileExistsError:
+                return False
+            except OSError:
+                # ФС без поддержки hardlink → эксклюзивное создание.
+                try:
+                    fd = os.open(
+                        str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+                    )
+                except FileExistsError:
+                    return False
+                try:
+                    os.write(fd, str(my_pid).encode())
+                finally:
+                    os.close(fd)
+            return True
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    if _publish():
+        return True
+
+    # Lock-файл существует → проверяем stale или живой.
+    def _read_pid() -> Optional[int]:
+        try:
+            return int(lock_path.read_text().strip())
+        except (ValueError, OSError):
+            return None
+
+    pid = _read_pid()
+
+    # None = пустой/нечитаемый файл. Даём короткий шанс: возможно, другой
+    # процесс ещё дописывает содержимое. Затем считаем stale.
+    if pid is None:
+        for _ in range(5):
+            time.sleep(0.1)
+            pid = _read_pid()
+            if pid is not None:
+                break
+
+    if pid is not None and _is_process_alive(pid):
+        print(f"[newsbot] Уже запущен (pid {pid}). Выход.", file=sys.stderr)
+        sys.exit(1)
+
+    # Не живой (stale) → удаляем и пробуем снова.
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+    if _publish():
+        return True
+
+    print("[newsbot] Lock занят другим процессом. Выход.", file=sys.stderr)
+    sys.exit(1)
+
+
+def _is_process_alive_windows(pid: int) -> bool:
+    """
+    Windows-проверка живости PID через kernel32.
+
+    os.kill(pid, 0) на Windows НЕ безопасен: это TerminateProcess — проверка
+    живого PID завершила бы проверяемый процесс. Используем OpenProcess
+    с минимальным правом SYNCHRONIZE + WaitForSingleObject(handle, 0):
+
+      — OpenProcess вернул NULL:
+          GetLastError() == ERROR_INVALID_PARAMETER (87) → процесса нет → False;
+          иначе (нет прав)                                  → считаем живым;
+      — WaitForSingleObject == WAIT_OBJECT_0 (0)   → процесс завершён → False;
+      — WaitForSingleObject == WAIT_TIMEOUT (0x102) → процесс жив → True;
+      — прочее (WAIT_FAILED)                        → консервативно True.
+
+    CloseHandle — всегда (finally).
+    """
+    _SYNCHRONIZE = 0x00100000
+    _WAIT_OBJECT_0 = 0x00000000
+    _WAIT_TIMEOUT = 0x00000102
+    _ERROR_INVALID_PARAMETER = 87
+
+    kernel32 = ctypes.windll.kernel32
+
+    # MINOR-фикс: явные argtypes/restype. Без них дефолтный restype=c_int
+    # усекает 64-битный HANDLE на x64 (handle может не влезть в int32).
+    # wintypes.HANDLE — c_void_p, корректная разрядность на x86 и x64.
+    # Импорт локальный: ctypes.wintypes — отдельный подмодуль, доступный
+    # не после любого «import ctypes».
+    from ctypes import wintypes as _wintypes
+    kernel32.OpenProcess.argtypes = [
+        _wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = _wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [_wintypes.HANDLE, _wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = _wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [_wintypes.HANDLE]
+    kernel32.CloseHandle.restype = _wintypes.BOOL
+
+    handle = kernel32.OpenProcess(_SYNCHRONIZE, False, int(pid))
+    if not handle:
+        return kernel32.GetLastError() != _ERROR_INVALID_PARAMETER
+
+    try:
+        rc = kernel32.WaitForSingleObject(handle, 0)
+        if rc == _WAIT_OBJECT_0:
+            return False     # handle сигнален = процесс завершился
+        if rc == _WAIT_TIMEOUT:
+            return True      # процесс жив
+        return True          # WAIT_FAILED / неизвестный код — не убиваем lock
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _is_process_alive_posix(pid: int) -> bool:
+    """
+    POSIX-проверка живости PID: os.kill(pid, 0) — сигнал не отправляется.
+    ProcessLookupError → процесса нет; PermissionError → процесс есть.
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # процесс существует, но принадлежит другому пользователю
+        return True
+    except OSError:
+        return False
+
+
+def _is_process_alive(pid: int) -> bool:
+    """
+    Проверяет, жив ли процесс с данным PID.
+
+    Windows: kernel32.OpenProcess + WaitForSingleObject (НЕ os.kill(pid, 0) —
+    на Windows это TerminateProcess, который убил бы проверяемый процесс).
+    POSIX: os.kill(pid, 0).
+    """
+    if sys.platform == "win32":
+        try:
+            return _is_process_alive_windows(pid)
+        except Exception:
+            # Не смогли проверить — консервативно считаем живым,
+            # чтобы не запустить второй демон поверх первого.
+            return True
+    return _is_process_alive_posix(pid)
+
+
+def _release_lock(lock_path: "Path") -> None:
+    """Удаляет lock-файл. Безопасна при отсутствии файла."""
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
 
 def _signal_handler(signum, frame):
-    global _run
+    """
+    SIGTERM/SIGINT handler — ТОЛЬКО устанавливает события.
+
+    signal.signal вызывается ТОЛЬКО в main thread (здесь — main).
+    Останавливать poller (join) и закрывать pipeline здесь НЕЛЬЗЯ:
+    блокирующий join (poll_timeout+5 ≈ 30 с) в хендлере съедал бы весь
+    stop_grace_period (45 с) и приводил к SIGKILL. Всё завершение —
+    в finally главного цикла.
+    """
     print("\n[newsbot] Получен сигнал остановки, завершаем цикл...")
-    _run = False
+    _shutdown_event.set()
     _digest_requested.set()  # разбудить main thread из wait
-    if _poller is not None:
-        _poller.stop()
 
 
 def main():
+    # Минимальный sanitizer до CLI-ветвления (N4: --check-telegram / --set-chat-id / --check-llm).
+    # TokenSanitizer активен даже когда setup_logging ещё не вызван.
+    _minimal_sanitizer_handler()
+
     parser = argparse.ArgumentParser(
         description="newsbot — персональный новостной агрегатор"
     )
@@ -58,6 +263,13 @@ def main():
         "--set-chat-id",
         action="store_true",
         help="Получить chat_id через getUpdates и сохранить в .env",
+    )
+    parser.add_argument(
+        "--bind",
+        type=str,
+        metavar="OWNER_ID",
+        default=None,
+        help="Привязать конкретный private-чат по chat_id (только с --set-chat-id)",
     )
     parser.add_argument(
         "--check-llm",
@@ -86,7 +298,10 @@ def main():
         return
 
     if args.set_chat_id:
-        _set_chat_id()
+        if args.bind:
+            _set_chat_id_explicit(args.bind)
+        else:
+            _set_chat_id()
         return
 
     if args.check_llm:
@@ -103,7 +318,7 @@ def main():
 
     logger.info("newsbot v%s — запуск", __version__)
 
-    pipeline = NewsPipeline(config)
+    pipeline = NewsPipeline(config, shutdown_event=_shutdown_event)
 
     if args.once:
         logger.info("Режим: --once (один цикл)")
@@ -119,84 +334,108 @@ def main():
 
     # бесконечный цикл
     _digest_requested.clear()  # M1: очищаем stale events от прошлых запусков
-    # ── TelegramPoller: запускается ТОЛЬКО в демон-режиме ──
-    # Не запускается в --once / --digest / --check-* (диагностика getUpdates несовместима).
-    _maybe_start_poller(config, pipeline, logger)
 
-    interval = config["poll_interval_minutes"] * 60
-    logger.info(
-        "Режим: бесконечный цикл, интервал %d мин.",
-        config["poll_interval_minutes"],
-    )
+    # ── single-instance lock (демон) ───────────────────────────────────────
+    # Lock-файл рядом с БД — защита от двойного старта в Docker/на хосте.
+    # Pipeline уже создан, db_path известен.
+    global _LOCK_FILE
+    db_dir = Path(pipeline.storage.db_path).parent
+    _LOCK_FILE = db_dir / "newsbot.lock"
+    _acquire_lock(_LOCK_FILE, os.getpid())
+    logger.info("Single-instance lock acquired: %s", _LOCK_FILE)
 
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
+    # Minor 3-фикс: ВЕСЬ код после захвата lock — внутри try/finally.
+    # Иначе исключение в _maybe_start_poller/signal.signal оставило бы
+    # lock-файл на диске (и следующий старт счёл бы демон живым).
+    try:
+        # ── TelegramPoller: запускается ТОЛЬКО в демон-режиме ──
+        # Не запускается в --once / --digest / --check-* (диагностика getUpdates несовместима).
+        _maybe_start_poller(config, pipeline, logger)
 
-    while _run:
-        try:
-            # M1: обработка /digest из poller — ДО основного цикла
-            if _digest_requested.is_set():
-                _digest_requested.clear()
-                logger.info("/digest: выполняем по запросу от poller...")
-                # Minor #2: проверяем паузу перед force-digest.
-                # Безопасный getattr — _is_paused может быть приватным,
-                # а в отдельных окружениях pipeline может не иметь storage.
-                try:
-                    is_paused = getattr(pipeline, "_is_paused", lambda: False)()
-                except Exception:
-                    is_paused = False
-                if is_paused:
-                    logger.info("/digest: пропущен — bot на паузе (paused=1)")
-                else:
+        interval = config["poll_interval_minutes"] * 60
+        logger.info(
+            "Режим: бесконечный цикл, интервал %d мин.",
+            config["poll_interval_minutes"],
+        )
+
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+
+        while not _shutdown_event.is_set():
+            try:
+                # M1: обработка /digest из poller — ДО основного цикла
+                if _digest_requested.is_set():
+                    _digest_requested.clear()
+                    logger.info("/digest: выполняем по запросу от poller...")
+                    # Minor #2: проверяем паузу перед force-digest.
+                    # Безопасный getattr — _is_paused может быть приватным,
+                    # а в отдельных окружениях pipeline может не иметь storage.
                     try:
-                        count = pipeline.run_digest(force=True)
-                        if count > 0:
-                            logger.info("/digest: отправлено %d новостей", count)
-                        else:
-                            logger.info("/digest: ничего не отправлено")
-                    except Exception as e:
-                        logger.error("/digest: ошибка: %s", e, exc_info=True)
+                        is_paused = getattr(pipeline, "_is_paused", lambda: False)()
+                    except Exception:
+                        is_paused = False
+                    if is_paused:
+                        logger.info("/digest: пропущен — bot на паузе (paused=1)")
+                    else:
+                        try:
+                            count = pipeline.run_digest(force=True)
+                            if count > 0:
+                                logger.info("/digest: отправлено %d новостей", count)
+                            else:
+                                logger.info("/digest: ничего не отправлено")
+                        except Exception as e:
+                            logger.error("/digest: ошибка: %s", e, exc_info=True)
 
-            pipeline.run_cycle_with_delivery()
-        except Exception as e:
-            # непойманное исключение — логируем, ждём, продолжаем
-            logger.error(
-                "Непойманное исключение в цикле (демон жив, backoff %d с): %s",
-                _BACKOFF_SECONDS, e, exc_info=True,
-            )
-            # ждём backoff с проверкой флага
+                pipeline.run_cycle_with_delivery()
+            except Exception as e:
+                # непойманное исключение — логируем, ждём, продолжаем
+                logger.error(
+                    "Непойманное исключение в цикле (демон жив, backoff %d с): %s",
+                    _BACKOFF_SECONDS, e, exc_info=True,
+                )
+                # ждём backoff с проверкой флага (event.wait — прерываемо)
+                slept = 0
+                while slept < _BACKOFF_SECONDS and not _shutdown_event.is_set():
+                    _shutdown_event.wait(1)
+                    slept += 1
+                continue
+
+            # C3: slept инициализируется КАЖДУЮ итерацию (в т.ч. после успешного цикла)
             slept = 0
-            while slept < _BACKOFF_SECONDS and _run:
-                time.sleep(1)
-                slept += 1
-            continue
-
-        # C3: slept инициализируется КАЖДУЮ итерацию (в т.ч. после успешного цикла)
-        slept = 0
-        logger.info("Пауза %d мин. до следующего цикла...",
-                    config["poll_interval_minutes"])
-        # M1: event.wait с таймаутом — реагирует на /digest БЫСТРО
-        # (не ждёт 15 мин, просыпается через 30 с или сразу при set)
-        while True:
-            if not _run:
-                break
-            # проверяем /digest-requested даже во время паузы
-            if _digest_requested.is_set():
-                break
-            # 30 с — батч ожидания, не слишком долго для быстрой реакции
-            if _digest_requested.wait(timeout=30):
-                # проснулись по set — выходим из цикла паузы
-                break
-            # иначе просто проснулись по таймауту — продолжаем паузу
-            slept += 30
-            if slept >= interval:
-                break
-
-    pipeline.close()
-    if _poller is not None:
-        _poller.stop()  # stop → join + finally: Storage.close() в poller thread
-        _poller.close()  # только HTTP-клиент (m2: Storage уже закрыт из poller thread)
-    logger.info("=== newsbot остановлен ===")
+            logger.info("Пауза %d мин. до следующего цикла...",
+                        config["poll_interval_minutes"])
+            # M1: event.wait с таймаутом — реагирует на /digest БЫСТРО
+            # (не ждёт 15 мин, просыпается через 30 с или сразу при set)
+            while not _shutdown_event.is_set():
+                # проверяем /digest-requested даже во время паузы
+                if _digest_requested.is_set():
+                    break
+                # 30 с — батч ожидания, не слишком долго для быстрой реакции
+                if _digest_requested.wait(timeout=30):
+                    # проснулись по set — выходим из цикла паузы
+                    break
+                # иначе просто проснулись по таймауту — продолжаем паузу
+                slept += 30
+                if slept >= interval:
+                    break
+    finally:
+        # ── graceful shutdown: аккуратное завершение ──────────────────────────
+        # MAJOR (main)-фикс: единый дедлайн shutdown-фазы. Раньше stop() ждал
+        # poll_timeout+5 ≈ 30 с, а затем close() делал ПОВТОРНЫЙ полный join
+        # того же потока — суммарно до 60 с при stop_grace_period 45s →
+        # SIGKILL до pipeline.close()/_release_lock. Теперь остаток бюджета
+        # считается от дедлайна и передаётся в close(join_timeout=...).
+        logger.info("Завершение: останавливаем poller...")
+        if _poller is not None:
+            shutdown_deadline = time.monotonic() + _POLLER_SHUTDOWN_BUDGET_SEC
+            _poller.stop()   # stop → join с таймаутом poll_timeout+5 с
+            remaining = max(0.0, shutdown_deadline - time.monotonic())
+            # close(): остаток дедлайна вместо повторного полного join
+            _poller.close(join_timeout=remaining)
+        pipeline.close()
+        if _LOCK_FILE is not None:
+            _release_lock(_LOCK_FILE)
+        logger.info("=== newsbot остановлен ===")
 
 
 # ─────────────────────────────────────────────────────────
@@ -310,12 +549,12 @@ def _check_telegram() -> None:
 
 def _set_chat_id() -> None:
     """
-    Читает getUpdates, берёт последний message.chat.id (по update_id),
-    сохраняет TELEGRAM_CHAT_ID в .env.
+    Читает getUpdates, показывает кандидатов, привязывает private-чат к .env.
 
-    M2-исправление: берёт message с наибольшим update_id,
-    не первый из возвращённых. limit=100 чтобы охватить очередь,
-    allowed_updates=['message'] чтобы не получать callback/edited/etc.
+    Поведение зависит от TELEGRAM_OWNER_ID:
+      — TELEGRAM_OWNER_ID задан: привязывает ТОЛЬКО этот id (и только private).
+      — TELEGRAM_OWNER_ID не задан: печатает кандидатов и подсказку --bind <id>.
+    Всегда требует chat.type == 'private' (группы/каналы игнорируются).
     """
     import httpx
     import json as _json
@@ -325,12 +564,18 @@ def _set_chat_id() -> None:
         print("ОШИБКА: TELEGRAM_BOT_TOKEN не найден в .env")
         return
 
-    print("Ожидание сообщения от владельца...")
-    print("  1) Откройте чат с ботом в Telegram")
-    print("  2) Нажмите /start")
-    print("  3) Отправьте боту любое сообщение (например, 'Привет')")
-    print("  4) Дождитесь завершения скрипта")
-    print()
+    owner_id = telegram_owner_id()
+
+    if owner_id:
+        print(f"TELEGRAM_OWNER_ID задан: {owner_id}")
+        print("Режим: привязка ТОЛЬКО к указанному id.")
+    else:
+        print("Ожидание сообщения от владельца...")
+        print("  1) Откройте чат с ботом в Telegram")
+        print("  2) Нажмите /start")
+        print("  3) Отправьте боту любое сообщение (например, 'Привет')")
+        print("  4) Дождитесь завершения скрипта")
+        print()
 
     try:
         resp = httpx.get(
@@ -360,24 +605,141 @@ def _set_chat_id() -> None:
         print("Нет обновлений. Убедитесь, что отправили сообщение боту.")
         return
 
-    # M2-фикс: берём update с наибольшим update_id (последнее сообщение)
-    latest = max(updates, key=lambda u: u.get("update_id", 0))
-    msg = latest.get("message", {})
-    chat = msg.get("chat", {})
-    chat_id = chat.get("id")
+    # ── Собираем private-чаты (кандидатов) ─────────────────────────
+    private_chats = []
+    for upd in updates:
+        msg = upd.get("message", {})
+        chat = msg.get("chat", {})
+        if chat.get("type") == "private":
+            private_chats.append({
+                "update_id": upd.get("update_id", 0),
+                "chat_id": chat.get("id"),
+                "chat_type": chat.get("type"),
+                "username": chat.get("username", ""),
+                "first_name": chat.get("first_name", ""),
+                "last_name": chat.get("last_name", ""),
+            })
 
-    if not chat_id:
-        print("chat_id не найден в ответе.")
+    if not private_chats:
+        print("Не найдено ни одного private-чата.")
+        print("Команда предназначена только для private-чатов (личные сообщения с ботом).")
         return
 
-    print(f"Найден chat_id: {chat_id}")
-    print(f"  chat_type: {chat.get('type', '?')}")
-    print(f"  first_name: {chat.get('first_name', '?')}")
+    # Сортируем по update_id — берём последний (newest)
+    private_chats.sort(key=lambda c: c["update_id"], reverse=True)
 
-    _write_env("TELEGRAM_CHAT_ID", str(chat_id))
+    # ── TELEGRAM_OWNER_ID задан: привязываем ТОЛЬКО его ────────────
+    if owner_id:
+        matched = next(
+            (c for c in private_chats if str(c["chat_id"]) == str(owner_id)),
+            None,
+        )
+        if matched:
+            _write_env("TELEGRAM_CHAT_ID", str(matched["chat_id"]))
+            print()
+            print(f"✅ TELEGRAM_CHAT_ID={matched['chat_id']} записан в .env")
+            print(f"   chat_type: {matched['chat_type']}")
+            name = matched["first_name"] or matched["username"] or str(matched["chat_id"])
+            print(f"   владелец: {name}")
+            print("Запустите --once для проверки отправки.")
+        else:
+            print()
+            print(f"⚠️  В обновлениях нет chat_id={owner_id}")
+            print("   TELEGRAM_OWNER_ID задан, но сообщение пришло от другого id.")
+            print("   Проверьте, что отправили сообщение СВОЕМУ боту.")
+            print()
+            print("Кандидаты (private-чаты в обновлениях):")
+            for c in private_chats:
+                print(f"  id={c['chat_id']}  username={c['username']!r}  "
+                      f"name={c['first_name']} {c['last_name']}")
+        return
+
+    # ── TELEGRAM_OWNER_ID не задан: печатаем кандидатов ────────────
+    print(f"Найдено private-чатов: {len(private_chats)}")
+    for c in private_chats:
+        name_parts = [p for p in [c["first_name"], c["last_name"]] if p]
+        display_name = " ".join(name_parts) or c["username"] or str(c["chat_id"])
+        print(f"  update_id={c['update_id']}  id={c['chat_id']}")
+        print(f"    type={c['chat_type']}  username={c['username']!r}  name={display_name}")
+
     print()
-    print(f"TELEGRAM_CHAT_ID записан в .env")
-    print("Запустите --once для проверки отправки.")
+    if len(private_chats) == 1:
+        c = private_chats[0]
+        print(f"Один кандидат: id={c['chat_id']}")
+        print("Подтвердить привязку: python -m newsbot --set-chat-id --bind "
+              + str(c["chat_id"]))
+    else:
+        print("Подтвердить привязку: python -m newsbot --set-chat-id --bind <id>")
+    print("(Выберите тот, который соответствует ВАШЕМУ аккаунту.)")
+
+
+def _set_chat_id_explicit(target_id: str) -> None:
+    """
+    Привязывает конкретный private-чат по его id.
+    Вызывается из main() при --set-chat-id --bind <id>.
+    """
+    import httpx
+    import json as _json
+
+    token = telegram_token()
+    if not token:
+        print("ОШИБКА: TELEGRAM_BOT_TOKEN не найден в .env")
+        return
+
+    owner_id = telegram_owner_id()
+
+    try:
+        resp = httpx.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"timeout": 30, "limit": 100,
+                    "allowed_updates": _json.dumps(["message"])},
+            timeout=35.0,
+        )
+        data = resp.json()
+    except httpx.TimeoutException:
+        print("Таймаут. Убедитесь, что боту отправлено сообщение.")
+        return
+    except httpx.ConnectError:
+        print("Нет соединения: ConnectError")
+        return
+    except Exception as e:
+        print(f"Ошибка: {type(e).__name__}")
+        return
+
+    if not data.get("ok"):
+        print(f"getUpdates вернул ok=false: {data.get('description')}")
+        return
+
+    updates = data.get("result", [])
+    if not updates:
+        print("Нет обновлений. Убедитесь, что отправили сообщение боту.")
+        return
+
+    # Ищем private-чат с указанным id
+    for upd in updates:
+        msg = upd.get("message", {})
+        chat = msg.get("chat", {})
+        if str(chat.get("id")) == target_id:
+            if chat.get("type") != "private":
+                print(f"id={target_id} — НЕ private-чат (type={chat.get('type')}).")
+                print("Привязка отклонена: только private-чаты.")
+                return
+            # ── если TELEGRAM_OWNER_ID задан — сверяем ───────────────
+            if owner_id and str(chat.get("id")) != str(owner_id):
+                print(f"id={target_id} не совпадает с TELEGRAM_OWNER_ID={owner_id}.")
+                print("Привязка отклонена.")
+                return
+            _write_env("TELEGRAM_CHAT_ID", str(chat["id"]))
+            print()
+            print(f"✅ TELEGRAM_CHAT_ID={chat['id']} записан в .env")
+            print(f"   chat_type: {chat.get('type')}")
+            name = chat.get("first_name") or chat.get("username") or str(chat["id"])
+            print(f"   владелец: {name}")
+            print("Запустите --once для проверки отправки.")
+            return
+
+    print(f"id={target_id} не найден среди private-чатов в обновлениях.")
+    print("Убедитесь, что отправили сообщение боту С ЭТОГО аккаунта.")
 
 
 def _run_digest_once() -> None:
@@ -394,7 +756,7 @@ def _run_digest_once() -> None:
     logger = logging.getLogger("newsbot")
 
     logger.info("=== Дайджест по запросу (--digest) ===")
-    pipeline = NewsPipeline(config)
+    pipeline = NewsPipeline(config, shutdown_event=_shutdown_event)
     try:
         # Minor #2: проверяем паузу — ручной CLI --digest уважает паузу
         # (консистентно с /digest в чате и daemon-run_cycle).
@@ -458,7 +820,7 @@ def _check_llm() -> None:
         print(f"    currency      : {balance.currency!r}")
         print(f"    total_balance : {balance.total_balance}")
     except Exception as e:
-        print(f"    [FAIL] Ошибка при проверке баланса: {e}")
+        print(f"    [FAIL] Ошибка при проверке баланса: {type(e).__name__}")
 
     print()
 
@@ -494,7 +856,8 @@ def _check_llm() -> None:
         else:
             print(f"    [FAIL] LLMError: {e}")
     except Exception as e:
-        print(f"    [FAIL] Неожиданная ошибка: {e}")
+        # N4: печатаем только тип, не str(e) — может содержать URL с ключом
+        print(f"    [FAIL] {type(e).__name__}")
 
 
 if __name__ == "__main__":

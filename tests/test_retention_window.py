@@ -138,9 +138,9 @@ class TestRetentionWindow(unittest.TestCase):
         """Дефолт database.retention_days == 1."""
         self.assertEqual(config_module.DEFAULT_CONFIG["database"]["retention_days"], 1)
 
-    def test_config_deferred_retention_days_1(self):
-        """Дефолт database.deferred_retention_days == 1."""
-        self.assertEqual(config_module.DEFAULT_CONFIG["database"]["deferred_retention_days"], 1)
+    def test_config_deferred_retention_days_3(self):
+        """Дефолт database.deferred_retention_days == 3 (v1.1.5)."""
+        self.assertEqual(config_module.DEFAULT_CONFIG["database"]["deferred_retention_days"], 3)
 
 
 if __name__ == "__main__":

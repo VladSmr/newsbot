@@ -4,15 +4,16 @@ LLM-фильтр новостей.
 import logging
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from ..collector import NewsItem
-from .client import DeepSeekClient, LLMError, BalanceInfo
+from .client import DeepSeekClient, LLMError, LLMTruncationError, BalanceInfo
 from .prompts import (
     SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT,
     build_feedback_block, build_batch_user_message, sanitize_item_field,
     DEDUP_SYSTEM_PROMPT, build_dedup_user_message,
-    MAX_PROMPT_TITLE_CHARS, MAX_PROMPT_SUMMARY_CHARS,
+    MAX_PROMPT_TITLE_CHARS, MAX_PROMPT_SUMMARY_CHARS, LANG_MARKER,
 )
 
 logger = logging.getLogger("newsbot.llm.filter")
@@ -43,6 +44,11 @@ class FilterResult:
         Флаг срочности. True — событие мирового/национального масштаба
         (война, мобилизация, катастрофа с массовыми жертвами, ядерный инцидент).
         По умолчанию False (безопасный дефолт).
+    cost_blocked : bool
+        True — LLM не вызывался из-за превышения дневного лимита расходов.
+        Это НЕ ошибка LLM: items должны остаться new/pending и быть
+        обработаны в следующем цикле/на следующий день (лимит обнулится),
+        а не уходить в deferred/fallback/failed.
     """
 
     ok: bool
@@ -50,6 +56,7 @@ class FilterResult:
     summary: str = ""
     reason: str = ""
     urgent: bool = False
+    cost_blocked: bool = False
 
 
 # ----------------------------------------------------------------------
@@ -142,17 +149,23 @@ class LLMFilter:
         system_prompt.
     client : DeepSeekClient, optional
         Клиент. Если None — создаётся из config_llm.
+    storage : Storage, optional
+        Хранилище. Если None — cost-guard отключён.
     """
 
     def __init__(
         self,
         config_llm: Dict[str, Any],
         client: Optional[DeepSeekClient] = None,
+        storage=None,
     ):
         self.enabled = self._parse_bool(config_llm.get("enabled", True))
         self.model = config_llm.get("model", "")
-        self.push_threshold = int(config_llm.get("push_threshold", 7))
-        self.digest_threshold = int(config_llm.get("digest_threshold", 5))
+        # Major #2-фикс: числовые поля парсятся защищённо — одно неверное
+        # значение (например push_threshold: "high") не должно отключать
+        # фильтр целиком. Невалидное значение → warning + дефолт по полю.
+        self.push_threshold = self._parse_int_field(config_llm, "push_threshold", 7)
+        self.digest_threshold = self._parse_int_field(config_llm, "digest_threshold", 5)
 
         # M1-фикс: при отсутствии ключа push_urgent_only — явный warning.
         # Дефолт True (urgent-only). Без warning'а legacy-конфиг без ключа
@@ -166,17 +179,167 @@ class LLMFilter:
         self.push_urgent_only = self._parse_bool(config_llm.get("push_urgent_only", True))
         self.system_prompt = config_llm.get("system_prompt") or SYSTEM_PROMPT
 
+        # ── Task 3: cost guard config ────────────────────────────────
+        self._pricing: Dict[str, Dict[str, float]] = {}
+        pricing_conf = config_llm.get("pricing", {})
+        if not isinstance(pricing_conf, dict):
+            # Major 1-фикс: битая секция pricing не должна молча игнорироваться.
+            logger.warning(
+                "llm.pricing должен быть словарём, получено %s — cost-guard "
+                "не сможет считать расходы",
+                type(pricing_conf).__name__,
+            )
+        else:
+            for model_name, prices in pricing_conf.items():
+                if not isinstance(prices, dict):
+                    logger.warning(
+                        "llm.pricing[%r] должен быть словарём {input, output}, "
+                        "получено %s — запись пропущена",
+                        model_name, type(prices).__name__,
+                    )
+                    continue
+                try:
+                    self._pricing[model_name] = {
+                        "input": float(prices.get("input", 0) or 0),
+                        "output": float(prices.get("output", 0) or 0),
+                    }
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "llm.pricing[%r] содержит нечисловые цены (%r/%r) — "
+                        "запись пропущена",
+                        model_name, prices.get("input"), prices.get("output"),
+                    )
+        self._daily_cost_limit = self._parse_float_field(
+            config_llm, "daily_cost_limit", 0.0
+        )
+        # Контракт: отрицательный лимит = guard выключен.
+        if self._daily_cost_limit < 0:
+            logger.warning(
+                "llm.daily_cost_limit=%r отрицательный — cost-guard выключен (0)",
+                self._daily_cost_limit,
+            )
+            self._daily_cost_limit = 0.0
+
+        # Storage для daily cost tracking
+        self._storage = storage
+
+        # Признак «последний _check_daily_cost выдал WARNING о лимите ВПЕРВЫЕ
+        # за день» — используется _log_cost_blocked_pending, чтобы и
+        # pending-напоминание писалось WARNING только один раз за день
+        # (общий флаг llm_cost_limit_warning_done_YYYYMMDD на оба сообщения).
+        self._cost_warning_fresh = False
+
         if client is not None:
             self._client = client
         else:
+            prices = self._pricing.get(self.model, {})
             self._client = DeepSeekClient(
                 api_key=config_llm.get("api_key", ""),
                 base_url=config_llm.get("base_url", "https://api.deepseek.com"),
-                model=config_llm.get("model", ""),
-                timeout=float(config_llm.get("timeout_sec", 60)),
-                max_retries=int(config_llm.get("max_retries", 3)),
-                temperature=float(config_llm.get("temperature", 0.0)),
-                max_tokens=int(config_llm.get("max_tokens", 4096)),
+                model=self.model,
+                timeout=self._parse_float_field(config_llm, "timeout_sec", 60.0),
+                max_retries=self._parse_non_negative_int_field(
+                    config_llm, "max_retries", 3
+                ),
+                temperature=self._parse_float_field(config_llm, "temperature", 0.0),
+                max_tokens=self._parse_int_field(config_llm, "max_tokens", 4096),
+                input_price=prices.get("input", 0),
+                output_price=prices.get("output", 0),
+            )
+
+        # Major 1-фикс: cost-guard активен, но цены модели неизвестны →
+        # дневной расход всегда 0.0 и лимит никогда не сработает.
+        # Поведение не меняем — только явный warning ОДИН раз при старте.
+        self._warn_if_cost_guard_blind()
+
+    # ── защищённый парсинг числовых полей конфига (Major 2-фикс) ──────
+
+    @staticmethod
+    def _parse_int_field(
+        config: Dict[str, Any], key: str, default: int
+    ) -> int:
+        """
+        int-поле конфига: невалидное значение → warning + default.
+        Никогда не бросает исключение (фильтр не должен отключаться
+        из-за одной опечатки в конфиге).
+        """
+        raw = config.get(key, default)
+        if isinstance(raw, bool):
+            logger.warning(
+                "llm.%s=%r — ожидалось целое число, используется дефолт %r",
+                key, raw, default,
+            )
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "llm.%s=%r — ожидалось целое число, используется дефолт %r",
+                key, raw, default,
+            )
+            return default
+
+    @classmethod
+    def _parse_non_negative_int_field(
+        cls, config: Dict[str, Any], key: str, default: int
+    ) -> int:
+        """Как _parse_int_field, но отрицательное значение → 0."""
+        value = cls._parse_int_field(config, key, default)
+        if value < 0:
+            logger.warning(
+                "llm.%s=%r отрицательное — используется 0", key, value
+            )
+            return 0
+        return value
+
+    @staticmethod
+    def _parse_float_field(
+        config: Dict[str, Any], key: str, default: float
+    ) -> float:
+        """
+        float-поле конфига: невалидное значение → warning + default.
+        Никогда не бросает исключение.
+        """
+        raw = config.get(key, default)
+        if isinstance(raw, bool):
+            logger.warning(
+                "llm.%s=%r — ожидалось число, используется дефолт %r",
+                key, raw, default,
+            )
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "llm.%s=%r — ожидалось число, используется дефолт %r",
+                key, raw, default,
+            )
+            return default
+
+    def _warn_if_cost_guard_blind(self) -> None:
+        """
+        Major 1-фикс: если дневной лимит задан, а цены модели неизвестны
+        (нет в pricing и в клиенте нули) — лимит никогда не сработает.
+        Логируем warning ОДИН раз при старте; поведение guard не меняем.
+        """
+        if self._daily_cost_limit <= 0:
+            return
+
+        prices = self._pricing.get(self.model) or {}
+        input_price = prices.get("input", 0) or 0
+        output_price = prices.get("output", 0) or 0
+
+        if not input_price and not output_price:
+            stats = getattr(self._client, "usage_stats", None)
+            input_price = float(getattr(stats, "_input_price", 0) or 0)
+            output_price = float(getattr(stats, "_output_price", 0) or 0)
+
+        if not input_price and not output_price:
+            logger.warning(
+                "cost-guard активен (daily_cost_limit=%.2f USD), но цены модели "
+                "%r не заданы в llm.pricing — дневной лимит работать не будет "
+                "(расход всегда 0.0)",
+                self._daily_cost_limit, self.model,
             )
 
     @staticmethod
@@ -220,20 +383,25 @@ class LLMFilter:
 
         user_message = self._build_user_message(item, feedback_context=feedback_context)
 
+        usage_before = self._usage_totals()
         try:
             raw = self._client.chat_json(
                 system=self.system_prompt,
                 user=user_message,
             )
-            return self._parse_response(raw)
-
         except LLMError as e:
+            # usage мог быть списан API (например finish_reason=length):
+            # аккумулируем ДО выхода, чтобы дневной лимит учитывал эти токены.
+            self._record_usage(usage_before)
             logger.warning(
                 "LLM-ошибка при оценке '%s': %s — fallback: шлём непрофильтрованным",
                 item.title[:60],
                 e,
             )
             return FilterResult(ok=False)
+
+        self._record_usage(usage_before)
+        return self._parse_response(raw)
 
     def evaluate_batch(
         self,
@@ -282,28 +450,22 @@ class LLMFilter:
                 for item in items
             ]
 
+        # Проверка cost guard перед вызовом (в т.ч. для batch_size=1)
+        if not self._check_daily_cost():
+            # Явный сигнал: LLM не вызывался из-за дневного лимита.
+            # pipeline оставляет такие items в new/pending (не deferred/failed).
+            self._log_cost_blocked_pending()
+            return [
+                FilterResult(ok=False, cost_blocked=True)
+                for _ in items
+            ]
+
         if len(items) == 1:
             result = self.evaluate(items[0], feedback_context=feedback_context)
             return [result]
 
-        # собираем user-сообщение: few-shot один раз на батч + нумерация items
-        user_message = build_batch_user_message(items, feedback_context=feedback_context)
-
-        try:
-            raw = self._client.chat_json(
-                system=BATCH_SYSTEM_PROMPT,
-                user=user_message,
-            )
-            return self._parse_batch_response(raw, len(items))
-
-        except LLMError as e:
-            logger.warning(
-                "LLM-ошибка при батч-оценке %d items: %s — "
-                "fallback для всех: шлём непрофильтрованными",
-                len(items),
-                e,
-            )
-            return [FilterResult(ok=False) for _ in items]
+        # Рекурсивный evaluate с length-split
+        return self._evaluate_batch_recursive(items, feedback_context, depth=0)
 
     def _parse_batch_response(self, raw: Dict[str, Any], expected_count: int) -> List[FilterResult]:
         """
@@ -496,16 +658,22 @@ class LLMFilter:
         title = sanitize_item_field(item.title)
         if len(title) > MAX_PROMPT_TITLE_CHARS:
             title = title[:MAX_PROMPT_TITLE_CHARS - 3] + "..."
-        parts.append(f"# Заголовок\n{title}")
+        parts.append(f"# Title\n{title}")
 
         if item.summary:
             summary = sanitize_item_field(item.summary)
             if len(summary) > MAX_PROMPT_SUMMARY_CHARS:
                 summary = summary[:MAX_PROMPT_SUMMARY_CHARS - 3] + "..."
-            parts.append(f"# Содержание\n{summary}")
+            parts.append(f"# Content\n{summary}")
 
         if item.source:
-            parts.append(f"# Источник: {sanitize_item_field(item.source)}")
+            parts.append(f"# Source: {sanitize_item_field(item.source)}")
+
+        # Language marker (injection-safe)
+        lang = getattr(item, "lang", None)
+        if lang:
+            safe_lang = sanitize_item_field(str(lang))
+            parts.append(LANG_MARKER.format(lang=safe_lang))
 
         return "\n\n".join(parts)
 
@@ -521,6 +689,276 @@ class LLMFilter:
         return self._client
 
     # ── internal ────────────────────────────────────────────────────────────
+
+    # ── Task 3: daily cost guard ────────────────────────────────────────────
+
+    def _check_daily_cost(self) -> bool:
+        """
+        Проверяет дневной лимит расходов.
+
+        Returns:
+            True — можно вызывать LLM; False — лимит превышен.
+        При превышении — логирует WARNING ОДИН раз за день
+        (через флаг в meta 'llm_cost_limit_warning_done_YYYYMMDD').
+        """
+        if self._daily_cost_limit <= 0 or not self._storage:
+            return True
+
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        limit_key = f"llm_daily_cost_{today}"
+        warning_flag_key = f"llm_cost_limit_warning_done_{today}"
+
+        try:
+            current_cost = float(self._storage.get_meta(limit_key) or "0")
+        except (ValueError, TypeError):
+            current_cost = 0.0
+
+        # Решение о блокировке — ВСЕГДА по факту current_cost (не по флагу).
+        # Флаг warning'а используется ТОЛЬКО для подавления повторного WARNING:
+        # если оператор поднял daily_cost_limit в тот же UTC-день, блокировка
+        # снимается сразу, без ожидания полуночи.
+        if current_cost < self._daily_cost_limit:
+            self._cost_warning_fresh = False
+            return True
+
+        if self._storage.get_meta(warning_flag_key) != "1":
+            logger.warning(
+                "LLM daily cost limit reached: $%.2f >= $%.2f — "
+                "skipping LLM call (items will be retried later)",
+                current_cost, self._daily_cost_limit,
+            )
+            # Ставим флаг что warning уже дан (повторно не спамим)
+            self._storage.set_meta(warning_flag_key, "1")
+            self._cost_warning_fresh = True
+        else:
+            # Повторное превышение в тот же день (в т.ч. после того как оператор
+            # поднял лимит, а расход снова его достиг). DEBUG терял информацию —
+            # пишем INFO с фактическими значениями, но без WARNING-шума.
+            logger.info(
+                "LLM daily cost limit reached again: $%.2f >= $%.2f — skip "
+                "(warning уже был сегодня)",
+                current_cost, self._daily_cost_limit,
+            )
+            self._cost_warning_fresh = False
+        return False
+
+    def _log_cost_blocked_pending(self) -> None:
+        """
+        Диагностика при срабатывании cost-guard: сколько items накопилось pending.
+
+        При хроническом превышении лимита pending растёт неограниченно —
+        оператор должен это видеть в логах. Только чтение storage
+        (``count_by_state``), никаких изменений в storage/pipeline.
+
+        Диагностика НЕ должна ломать цикл: любые ошибки глушим в DEBUG.
+        """
+        if not self._storage:
+            return
+        try:
+            pending = self._storage.count_by_state("pending")
+        except Exception as e:  # noqa: BLE001 — диагностика не критична
+            logger.debug("LLM cost-guard: не удалось получить pending count: %s", e)
+            return
+        if pending:
+            # Minor (лог-шум): при исчерпанном лимите cost-blocked батчей до
+            # ~16 за цикл — WARNING даём только первый раз за день (тот же
+            # флаг llm_cost_limit_warning_done_YYYYMMDD, что и для самого
+            # лимита), повторы — DEBUG.
+            if self._cost_warning_fresh:
+                logger.warning(
+                    "LLM cost-guard: в pending накоплено %d items — они будут "
+                    "обработаны после сброса/повышения дневного лимита", pending,
+                )
+            else:
+                logger.debug(
+                    "LLM cost-guard: в pending накоплено %d items "
+                    "(напоминание уже было сегодня)", pending,
+                )
+
+    def _usage_totals(self) -> tuple:
+        """
+        Возвращает (prompt_tokens, completion_tokens) из usage_stats клиента.
+
+        Используется для вычисления дельты usage одного вызова:
+        клиент аккумулирует usage ДО raise (в т.ч. finish_reason=length),
+        поэтому дельта учитывает и «сгоревшие» токены.
+        """
+        stats = getattr(self._client, "usage_stats", None)
+        if stats is None:
+            return (0, 0)
+        try:
+            return (
+                int(getattr(stats, "prompt_tokens", 0) or 0),
+                int(getattr(stats, "completion_tokens", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            return (0, 0)
+
+    def _record_usage(self, before: tuple) -> None:
+        """Аккумулирует дневной расход по дельте usage с момента ``before``."""
+        if not self._storage:
+            return
+        after = self._usage_totals()
+        # usage_stats может быть сброшен между циклами → отрицательная дельта:
+        # в этом случае считаем, что накоплено всё текущее значение.
+        prompt_delta = after[0] - before[0]
+        completion_delta = after[1] - before[1]
+        if prompt_delta < 0:
+            prompt_delta = after[0]
+        if completion_delta < 0:
+            completion_delta = after[1]
+        if prompt_delta == 0 and completion_delta == 0:
+            return
+        self._accumulate_daily_cost(prompt_delta, completion_delta)
+
+    def _accumulate_daily_cost(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        """
+        Аккумулирует стоимость вызова в дневной счётчик.
+        Цена берётся из _pricing по модели.
+        """
+        if not self._storage:
+            return
+
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        cost_key = f"llm_daily_cost_{today}"
+
+        prices = self._pricing.get(self.model, {})
+        input_price = prices.get("input", 0)   # USD per 1M tokens
+        output_price = prices.get("output", 0)  # USD per 1M tokens
+
+        # Fallback: если модель не описана в pricing, берём цены,
+        # переданные в клиент при создании (input_price/output_price).
+        if not input_price and not output_price:
+            stats = getattr(self._client, "usage_stats", None)
+            input_price = float(getattr(stats, "_input_price", 0) or 0)
+            output_price = float(getattr(stats, "_output_price", 0) or 0)
+
+        cost = (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
+
+        try:
+            current = float(self._storage.get_meta(cost_key) or "0")
+        except (ValueError, TypeError):
+            current = 0.0
+
+        self._storage.set_meta(cost_key, str(current + cost))
+
+    # ── Task 4: length-split recursive batch ───────────────────────────────
+
+    # Максимальная глубина рекурсии для length-split
+    _MAX_SPLIT_DEPTH = 5
+
+    def _evaluate_batch_recursive(
+        self,
+        items: List["NewsItem"],
+        feedback_context: Optional[tuple],
+        depth: int = 0,
+    ) -> List[FilterResult]:
+        """
+        Рекурсивный evaluate батча с split-ом при length-truncation.
+
+        При finish_reason=length батч разбивается пополам и каждая
+        половина ретраится рекурсивно. Результаты сливаются.
+        Usage обоих половины учитывается (аккумулируется до raise).
+
+        При depth >= _MAX_SPLIT_DEPTH или len(items)==1 и length →
+        возвращает [FilterResult(ok=False) for _ in items] (per-item fallback).
+
+        Parameters
+        ----------
+        items : List[NewsItem]
+        feedback_context : tuple optional
+        depth : int — текущая глубина рекурсии
+
+        Returns
+        -------
+        List[FilterResult]
+        """
+        if not items:
+            return []
+
+        # Terminal: per-item fallback для одиночного item
+        if len(items) == 1:
+            result = self.evaluate(items[0], feedback_context=feedback_context)
+            return [result]
+
+        # Проверка cost guard
+        if not self._check_daily_cost():
+            self._log_cost_blocked_pending()
+            return [FilterResult(ok=False, cost_blocked=True) for _ in items]
+
+        # Собираем user-сообщение
+        user_message = build_batch_user_message(items, feedback_context=feedback_context)
+
+        usage_before = self._usage_totals()
+        try:
+            raw = self._client.chat_json(
+                system=BATCH_SYSTEM_PROMPT,
+                user=user_message,
+            )
+        except LLMError as e:
+            # usage списан даже при усечении/ошибке ответа — учитываем
+            # в дневном лимите до возможного split/retry.
+            self._record_usage(usage_before)
+
+            # Minor 3-фикс: основная детекция length-truncation — по ТИПУ
+            # исключения (LLMTruncationError), а не по тексту ошибки.
+            # Строковый fallback оставлен как запасной (например, если
+            # пришёл внешний клиент, бросающий обычный LLMError).
+            is_length = isinstance(e, LLMTruncationError)
+            if not is_length:
+                err_text = str(e).lower()
+                is_length = (
+                    "finish_reason=length" in err_text
+                    or ("length" in err_text and "truncat" in err_text)
+                )
+
+            if not is_length:
+                # Не length → общий fallback для всех items
+                logger.warning(
+                    "LLM-ошибка при батч-оценке %d items (non-length): %s — "
+                    "fallback для всех: шлём непрофильтрованными",
+                    len(items), e,
+                )
+                return [FilterResult(ok=False) for _ in items]
+
+            # ── length-truncation: рекурсивный split ──────────────────
+            if depth >= self._MAX_SPLIT_DEPTH:
+                logger.warning(
+                    "Length-truncation at depth=%d, %d items — "
+                    "per-item fallback (max depth reached)",
+                    depth, len(items),
+                )
+                return [FilterResult(ok=False) for _ in items]
+
+            mid = len(items) // 2
+            first_half = items[:mid]
+            second_half = items[mid:]
+
+            logger.info(
+                "Length-truncation: splitting %d items into "
+                "%d + %d (depth %d)",
+                len(items), len(first_half), len(second_half), depth + 1,
+            )
+
+            # Рекурсивно обрабатываем половины
+            # NOTE: feedback_context передаётся в обе половины (once per original batch)
+            first_results = self._evaluate_batch_recursive(
+                first_half, feedback_context, depth + 1,
+            )
+            second_results = self._evaluate_batch_recursive(
+                second_half, feedback_context, depth + 1,
+            )
+
+            return first_results + second_results
+
+        self._record_usage(usage_before)
+        return self._parse_batch_response(raw, len(items))
+
+    # ── _build_user_message ─────────────────────────────────────────────────
 
     def _parse_response(self, raw: Dict[str, Any]) -> FilterResult:
         """
@@ -619,6 +1057,7 @@ class LLMFilter:
         Примеры: RU-пара (дроны/БПЛА), EN-пара (Pakistan school).
 
         Полный сбой (``LLMError``) → пустое множество (безопасно, ничего не пропущено).
+        Исчерпанный дневной лимит расходов → пустое множество (LLM не вызывается).
         Битые/несуществующие индексы в ответе → игнорируются.
         Если кандидатов < 2 → вызов не делается, возвращается пустое множество.
 
@@ -640,20 +1079,54 @@ class LLMFilter:
         if len(items) < 2:
             return set()
 
+        # MAJOR-фикс: cost-guard ДО любого LLM-вызова. Без него при исчерпанном
+        # дневном лимите скоринг блокируется, а дедуп продолжал тратить деньги
+        # каждый цикл (вызывается из pipeline до скоринга и в cluster-deferred).
+        # Fail-open: пустое множество = «дублей не найдено», ничего не теряется.
+        if not self._check_daily_cost():
+            logger.info(
+                "LLM-дедуп: дневной лимит расходов исчерпан — пропускаем "
+                "(безопасно: дублей не найдено)"
+            )
+            self._log_cost_blocked_pending()
+            return set()
+
         all_dup_indices: Set[int] = set()
 
         # Чанкование: не более _DEDUP_CHUNK_SIZE кандидатов на вызов
         for chunk_start in range(0, len(items), self._DEDUP_CHUNK_SIZE):
             chunk = items[chunk_start: chunk_start + self._DEDUP_CHUNK_SIZE]
 
+            # Guard на каждой итерации: лимит мог исчерпаться ПОСЛЕ предыдущего
+            # чанка (usage предыдущего вызова уже записан). Fail-open: прерываем
+            # цикл, сохраняя уже найденные дубли предыдущих чанков.
+            if not self._check_daily_cost():
+                logger.info(
+                    "LLM-дедуп: дневной лимит исчерпан на чанке [%d:%d] из %d "
+                    "items — прерываем, сохраняем уже найденные дубли (%d шт.)",
+                    chunk_start,
+                    chunk_start + len(chunk),
+                    len(items),
+                    len(all_dup_indices),
+                )
+                # Minor-фикс: если лимит исчерпался уже ПОСЛЕ предыдущего чанка,
+                # _check_daily_cost выше поставил _cost_warning_fresh=True, но
+                # pending-напоминание без этого вызова не попадёт в лог: следующий
+                # _check_daily_cost уйдёт в else-ветку, сбросит _fresh, а meta-флаг
+                # уже "1" → WARNING за день не появится ни разу (только DEBUG).
+                self._log_cost_blocked_pending()
+                break
+
             user_message = build_dedup_user_message(chunk, recent)
 
+            usage_before = self._usage_totals()
             try:
                 raw = self._client.chat_json(
                     system=DEDUP_SYSTEM_PROMPT,
                     user=user_message,
                 )
             except LLMError as e:
+                self._record_usage(usage_before)
                 logger.warning(
                     "LLM-ошибка при дедупликации чанка [%d:%d] из %d items: %s "
                     "→ прерываем, сохраняем уже найденные дубли (%d шт.)",
@@ -666,6 +1139,8 @@ class LLMFilter:
                 # m1-фикс: НЕ сбрасываем all_dup_indices — сохраняем находки
                 # предыдущих чанков. Токены уже списаны, информация не потеряна.
                 break
+
+            self._record_usage(usage_before)
 
             # Парсим ответ: {"duplicates": [1, 3, ...]}
             dup_indices = self._parse_dedup_response(
@@ -741,6 +1216,12 @@ class LLMFilter:
                 continue
             if isinstance(val, int):
                 idx = val
+            elif isinstance(val, float):
+                # Minor 4-фикс: модели часто возвращают 1.0/2.0 — принимаем
+                # только конечные целочисленные значения (как в
+                # _parse_batch_response для id).
+                if math.isfinite(val) and float(int(val)) == val:
+                    idx = int(val)
             elif isinstance(val, str):
                 # строковые "1", "2" — парсим
                 try:
@@ -749,7 +1230,7 @@ class LLMFilter:
                     continue
 
             if idx is None:
-                continue  # float, None, dict и прочее — пропускаем
+                continue  # None, NaN/inf, dict и прочее — пропускаем
 
             # проверяем границы чанка
             if not (1 <= idx <= chunk_len):

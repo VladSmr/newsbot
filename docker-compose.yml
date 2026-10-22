@@ -1,6 +1,10 @@
 services:
   newsbot:
     build: .
+    # ── stop grace period ────────────────────────────────────────────
+    # 45s > бюджета ожидания поллера (40s, _POLLER_SHUTDOWN_BUDGET_SEC)
+    # + запас на pipeline.close()/_release_lock до SIGKILL.
+    stop_grace_period: 45s
     # ── secrets ──────────────────────────────────────────────────────
     env_file: .env
     # ── logging: ограничение роста логов (M3-фикс) ───────────────────
@@ -12,7 +16,27 @@ services:
         max-file: "3"
     # ── restart policy ────────────────────────────────────────────────
     restart: unless-stopped
-    # ── volumes: БД, конфиг, .env (для --set-chat-id) ────────────────
+    # ── resource limits (защита от утечек) ───────────────────────────
+    mem_limit: 256m
+    # ── security hardening ────────────────────────────────────────────
+    security_opt:
+      - no-new-privileges:true
+    # Приложению не нужны привилегированные capabilities: только исходящие
+    # HTTP(S), SQLite-файл в ./data и запись в .env. Сбрасываем ВСЕ caps.
+    cap_drop:
+      - ALL
+    # ── init: корректная обработка SIGTERM (Tini как PID 1) ───────────
+    init: true
+    # ── healthcheck: проверка БД без вызовов LLM/Telegram ───────────
+    # mode=ro: НЕ создаём пустую БД при её отсутствии — иначе контейнер
+    # с нерабочей/отсутствующей БД рапортовал бы healthy.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3; sqlite3.connect('file:/app/data/newsbot.db?mode=ro', uri=True).execute('select 1')"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # ── volumes: БД, конфиг, .env (для --set-chat-id) ───────────────
     volumes:
       # .env — секреты + chat_id. монтируется rw: --set-chat-id
       # персистентен на хосте. env_file делает переменные доступными
@@ -31,7 +55,8 @@ services:
       # Все HTTP-клиенты бота (collector, telegram_io, delivery, llm) создаются
       # с trust_env=True — они автоматически читают HTTPS_PROXY / HTTP_PROXY.
       # БЕЗОПАСНОСТЬ: если прокси требует авторизации — передавайте credentials
-      # ВНУТРИ URL:  HTTPS_PROXY=http://user:pass@proxy.example.com:8080
+      # ВНУТРИ URL прокси: логин и пароль — часть адреса прокси
+      # (стандартная форма http-прокси с basic-auth), см. DEPLOY.md §11.
       # На VPS с WireGuard / VPN-прокси — обычно без авторизации.
       #
       # HTTP_PROXY: "http://proxy.example.com:8080"

@@ -352,15 +352,20 @@ class TestDigestWindowSuccess(unittest.TestCase):
             for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
                 all_window_urls.update(i.url for i in p.storage.get_all_by_state(state))
 
-            # 3 old items — удалены (были в окне, за max_items, не отправлены)
+            # 3 old items — deferred, НЕ selected (низкий score), остались после окна.
             for i in range(3):
-                self.assertNotIn(f"https://ex.com/old{i}", all_window_urls)
+                self.assertIn(f"https://ex.com/old{i}", all_window_urls)
 
-            # 2 fresh items — ОТПРАВЛЕНЫ и тоже УДАЛЕНЫ из БД
-            # (окно вычищается целиком после успеха: delete_items_before удаляет всё,
-            #  включая отправленные digested-items)
+            # 2 fresh items — ОТПРАВЛЕНЫ → digested, остаются в БД
+            # (delete_items_before с границей window_start_iso=2020-01-01,
+            # digested-items с fetched_at 2026-01 НЕ удаляются — они из текущего окна)
             for i in range(2):
-                self.assertNotIn(f"https://ex.com/fresh{i}", all_window_urls)
+                self.assertIn(f"https://ex.com/fresh{i}", all_window_urls)
+                state = list(p.storage.get_all_by_state("digested"))
+                self.assertTrue(
+                    any(f"https://ex.com/fresh{i}" == item.url for item in state),
+                    f"fresh{i} должен быть state=digested"
+                )
 
             # Item, пришедший во время отправки (fetched_at в будущем) — ОСТАЛСЯ
             self.assertIn("https://ex.com/during", all_window_urls)
@@ -523,13 +528,20 @@ class TestDigestSecondRun(unittest.TestCase):
             old_boundary = p.storage.get_meta("digest_window_started_at")
             self.assertIsNotNone(old_boundary)
 
-            # stale_item удалён (за границей); fresh_item — digested, но удалён из БД
+            # stale_item удалён (за границей); fresh_item — digested, остаётся в БД
             all_after_d1 = set()
             for state in ["deferred", "digested", "new", "pending", "skipped", "failed"]:
                 all_after_d1.update(i.url for i in p.storage.get_all_by_state(state))
-            self.assertNotIn("https://ex.com/stale", all_after_d1)
-            # fresh_item отправлен и удалён (окно очищено после успеха)
-            self.assertNotIn("https://ex.com/fresh", all_after_d1)
+            # stale_item - deferred за границей, delete_items_before не трогает deferred
+            deferred_after_d1 = {i.url for i in p.storage.get_all_by_state("deferred")}
+            self.assertIn("https://ex.com/stale", deferred_after_d1,
+                "stale deferred за границей НЕ удаляется delete_items_before")
+            # fresh_item - digested, НЕ удаляется (граница = window_start_iso 2025,
+            # не NOW; digested с fetched_at 2026-01 > window_start_iso)
+            self.assertIn("https://ex.com/fresh", all_after_d1)
+            fresh_states = [i.url for i in p.storage.get_all_by_state("digested")]
+            self.assertIn("https://ex.com/fresh", fresh_states,
+                "fresh_item должен остаться state=digested в текущем окне")
 
             # Патчим datetime.now: первый вызов (D1) → 2026-01-01T00:00:00 UTC,
             # второй вызов (D2) → на 2 дня позже (сдвигаем реальное время).
@@ -573,14 +585,17 @@ class TestDigestSecondRun(unittest.TestCase):
             self.assertEqual(count2, 0)
 
             # new_item остаётся deferred (не был отправлен, не удалён).
-            # stale_item — удалён в D1 (за границей).
-            # fresh_item — удалён в D1 (окно D1 очищено).
+            # stale_item — остался deferred (за границей, delete_items_before не трогает deferred).
+            # fresh_item — остался digested (fetched_at=2026-01 > window_start_iso=2025-12-31,
+            # delete_items_before с логической границей, не NOW).
             deferred_after_d2 = {i.url for i in p.storage.get_all_by_state("deferred")}
             all_after_d2 = set()
             for state in ["deferred", "digested", "new", "pending", "skipped", "failed"]:
                 all_after_d2.update(i.url for i in p.storage.get_all_by_state(state))
-            self.assertNotIn("https://ex.com/stale", all_after_d2)
-            self.assertNotIn("https://ex.com/fresh", all_after_d2)
+            self.assertIn("https://ex.com/stale", deferred_after_d2,
+                "stale deferred за границей сохраняется после D1 (only purge_items removes)")
+            self.assertIn("https://ex.com/fresh", all_after_d2,
+                "fresh_item digested, НЕ удалён: window_start_iso фиксирована, NOW ≠ граница")
             self.assertIn("https://ex.com/new", deferred_after_d2)  # остался deferred
 
             # Граница сдвинута на digest_started_iso (new_item.fetched_at старше,
@@ -806,11 +821,15 @@ class TestDigestWindowUnprocessedAndCleanup(unittest.TestCase):
 
             self.assertEqual(count, 1)  # только deferred-item
 
-            # deferred-item отправлен и удалён
+            # deferred-item отправлен → digested, остаётся в БД
+            # (window_start_iso=2020-01-01, digested fetched_at=2026-01 > границы)
             all_urls = set()
             for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
                 all_urls.update(i.url for i in p.storage.get_all_by_state(state))
-            self.assertNotIn("https://ex.com/def", all_urls)
+            self.assertIn("https://ex.com/def", all_urls)
+            def_states = [i.url for i in p.storage.get_all_by_state("digested")]
+            self.assertIn("https://ex.com/def", def_states,
+                "DeferredItem должен остаться state=digested в текущем окне")
 
             # new-item сохранён
             self.assertIn("https://ex.com/new", all_urls)
@@ -1124,6 +1143,140 @@ class TestDigestWindowIntegrity(unittest.TestCase):
             p.close()
 
 
+
+
+class TestDigestMaxAgeHours(unittest.TestCase):
+    """
+    Minor 5-фикс: digest.max_age_hours проводка через run_digest.
+    Item старше max_age_hours → НЕ в дайджесте.
+    """
+
+    def test_old_item_filtered_by_max_age_hours(self):
+        """
+        2 deferred items:
+          - old_item: fetched_at 25 часов назад (за пределами max_age=24)
+          - fresh_item: fetched_at 1 час назад (внутри max_age=24)
+        max_age_hours=24 → только fresh_item попадает в digest.
+        """
+        import datetime as _dt
+
+        now_ts = _dt.datetime(2026, 10, 22, 12, 0, 0, tzinfo=timezone.utc)
+        old_fetched = (now_ts - _dt.timedelta(hours=25)).isoformat()
+        fresh_fetched = (now_ts - _dt.timedelta(hours=1)).isoformat()
+        window_start = (now_ts - _dt.timedelta(hours=30)).isoformat()
+
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", window_start)
+            s.close()
+
+            # old_item: fetched_at 25 часов назад
+            _insert_deferred_item(
+                db_path,
+                title="OldItem",
+                url="https://ex.com/old",
+                published="2026-10-22 12:00",
+                fetched_at=old_fetched,
+                score=8,
+            )
+            # fresh_item: fetched_at 1 час назад
+            _insert_deferred_item(
+                db_path,
+                title="FreshItem",
+                url="https://ex.com/fresh",
+                published="2026-10-22 12:00",
+                fetched_at=fresh_fetched,
+                score=6,
+            )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 10,
+                    "max_items_per_message": 20,
+                    "max_age_hours": 24,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            # Minor 5-фикс: патчим datetime в ОБОИХ модулях (pipeline + storage),
+            # т.к. max_age_iso вычисляется в storage.get_deferred_items().
+            fake_cls = MagicMock()
+            fake_cls.now.return_value = now_ts
+            fake_cls.side_effect = lambda *a, **kw: _dt.datetime(*a, **kw)
+            fake_cls.timedelta = _dt.timedelta
+            fake_cls.replace = _dt.datetime.replace
+            fake_cls.fromisoformat = _dt.datetime.fromisoformat
+            with patch('newsbot.pipeline.datetime', fake_cls), \
+                 patch('newsbot.storage.datetime', fake_cls):
+                count = p.run_digest(force=True)
+
+            # Только fresh_item попал (old_item отфильтрован max_age)
+            self.assertEqual(count, 1,
+                f"Expected 1 (only fresh), got {count}")
+            text = delivery.send_text.call_args[0][0]
+            self.assertIn("FreshItem", text,
+                "FreshItem должен быть в digest")
+            self.assertNotIn("OldItem", text,
+                "OldItem (25ч) не должен быть в digest при max_age=24ч")
+
+            p.storage.close()
+            p.close()
+
+    def test_no_max_age_keeps_all_items(self):
+        """
+        Без max_age_hours: даже очень старый item (fetched_at 100 часов назад)
+        попадает в digest (ограничен только оконной границей).
+        """
+        import datetime as _dt
+
+        now_ts = _dt.datetime(2026, 10, 22, 12, 0, 0, tzinfo=timezone.utc)
+        old_fetched = (now_ts - _dt.timedelta(hours=100)).isoformat()
+        window_start = (now_ts - _dt.timedelta(hours=200)).isoformat()
+
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", window_start)
+            s.close()
+
+            _insert_deferred_item(
+                db_path,
+                title="OldItem",
+                url="https://ex.com/old",
+                published="2026-10-22 12:00",
+                fetched_at=old_fetched,
+                score=8,
+            )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 10,
+                    "max_items_per_message": 20,
+                    # max_age_hours НЕ задан
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            fake_cls = MagicMock()
+            fake_cls.now.return_value = now_ts
+            fake_cls.side_effect = lambda *a, **kw: _dt.datetime(*a, **kw)
+            fake_cls.timedelta = _dt.timedelta
+            fake_cls.replace = _dt.datetime.replace
+            fake_cls.fromisoformat = _dt.datetime.fromisoformat
+            with patch('newsbot.pipeline.datetime', fake_cls), \
+                 patch('newsbot.storage.datetime', fake_cls):
+                count = p.run_digest(force=True)
+
+            self.assertEqual(count, 1,
+                "Без max_age_hours старый item должен попасть в digest")
+
+            p.storage.close()
+            p.close()
 
 
 class TestCategoryGuaranteeEvictable(unittest.TestCase):

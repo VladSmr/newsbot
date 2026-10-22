@@ -3,8 +3,9 @@
 
 Покрывает:
   1. get_deferred_items(since_iso): фильтрация по границе окна.
-  2. delete_items_before: удаляет items всех состояний старше cutoff,
-     возвращает корректный rowcount; второй вызов — 0.
+  2. delete_items_before: удаляет items в терминальных состояниях
+     (delivered/skipped/digested/failed) старше cutoff; 'new'/'pending'/
+     'deferred' сохраняются. Второй вызов — 0.
 
 Запуск: python -m pytest tests/test_storage_window.py -v
 """
@@ -116,7 +117,7 @@ class TestStorageWindow(unittest.TestCase):
         return datetime.now(timezone.utc).isoformat()
 
     def test_delete_items_before_removes_only_terminal_states(self):
-        """Удаляются ТОЛЬКО терминальные states (delivered/skipped/deferred/
+        """Удаляются ТОЛЬКО терминальные states (delivered/skipped/
         digested/failed); 'new' и 'pending' остаются даже если старше cutoff."""
         self._insert("deferred", hours_ago=48, title="DefOld")
         self._insert("delivered", hours_ago=48, title="DelOld")
@@ -133,8 +134,8 @@ class TestStorageWindow(unittest.TestCase):
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         deleted = self.storage.delete_items_before(cutoff)
 
-        self.assertEqual(deleted, 5,
-            "Должно быть удалено 5 терминальных items старше cutoff")
+        self.assertEqual(deleted, 4,
+            "Должно быть удалено 4 терминальных items старше cutoff")
 
         # Проверяем: новые и pending (независимо от возраста) — остались
         conn = sqlite3.connect(self.db_path)
@@ -149,8 +150,8 @@ class TestStorageWindow(unittest.TestCase):
         self.assertIn("PendOld", remaining_titles,
             "pending-item старше cutoff НЕ должен быть удалён")
         self.assertIn("NewFresh", remaining_titles)
-        self.assertNotIn("DefOld", remaining_titles,
-            "deferred старше cutoff должен быть удалён")
+        self.assertIn("DefOld", remaining_titles,
+            "deferred старше cutoff НЕ удаляется (только purge_items)")
         self.assertNotIn("DelOld", remaining_titles,
             "delivered старше cutoff должен быть удалён")
 
@@ -163,7 +164,7 @@ class TestStorageWindow(unittest.TestCase):
 
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         deleted = self.storage.delete_items_before(cutoff)
-        self.assertEqual(deleted, 5, "Должно быть удалено ровно 5 старых items")
+        self.assertEqual(deleted, 5, "Должно быть удалено ровно 5 старых delivered items")
 
     def test_delete_items_before_idempotent_second_call_zero(self):
         """Повторный вызов delete_items_before удаляет 0 (items уже удалены)."""
@@ -172,7 +173,8 @@ class TestStorageWindow(unittest.TestCase):
 
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         first = self.storage.delete_items_before(cutoff)
-        self.assertEqual(first, 2)
+        self.assertEqual(first, 1,
+            "Удаляется только delivered, deferred защищён от delete_items_before")
 
         second = self.storage.delete_items_before(cutoff)
         self.assertEqual(second, 0, "Повторный вызов должен удалить 0 items")
