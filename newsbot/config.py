@@ -69,7 +69,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_minutes": 15,
     "database": {"path": "data/newsbot.db", "retention_days": 1, "retry_threshold_sec": 60,
                    "deferred_retention_days": 3, "recovery_new_limit": 500,
-                   "max_retries": 8},
+                   "stuck_pending_limit": 500, "max_retries": 8},
     "logging": {
         "level": "INFO",
         "format": "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -117,10 +117,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_tokens": 4096,
         "llm_dedup": True,
         "push_urgent_only": True,
-        # Pricing: USD per 1M tokens (verify current DeepSeek prices)
+        # Pricing: USD per 1M tokens (DeepSeek-V4.1-Flash, verified from official price page, effective 10.09.2026)
+        # NOTE: структура flat {input, output} — peak/off-peak не поддерживается cost-guard'ом filter.py.
+        # deepseek-v4-pro: цена не верифицирована (прайс-картинка покрывает только Flash).
         "pricing": {
-            "deepseek-flash": {"input": 0.27, "output": 1.10},   # placeholder
-            "deepseek-v4-pro": {"input": 0.50, "output": 2.00}, # placeholder
+            "deepseek-flash": {"input": 0.15, "output": 0.60},
+            "deepseek-v4-pro": {"input": 0.50, "output": 2.00},  # placeholder: не верифицировано
         },
         "daily_cost_limit": 0.50,  # USD per day; 0 = disabled
     },
@@ -247,6 +249,9 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
     # P1-фикс: валидация telegram.poll_timeout (тип/диапазон/кламп) —
     # после guard'ов секций, чтобы работал уже нормализованный dict.
     _validate_telegram_poll_timeout(cfg)
+
+    # Major #1-фикс: валидация database.stuck_pending_limit (целое > 0).
+    _validate_stuck_pending_limit(cfg)
 
     # ── Telegram: .env поверх config.yaml ──
     # .env читается только для telegram.* — остальное из config.yaml
@@ -469,6 +474,39 @@ def _validate_poll_interval(cfg: Dict[str, Any]) -> None:
         converted = _MAX_POLL_INTERVAL_MINUTES
 
     cfg["poll_interval_minutes"] = converted
+
+
+def _validate_stuck_pending_limit(cfg: Dict[str, Any]) -> None:
+    """
+    Валидация ``database.stuck_pending_limit``: целое > 0.
+    Используется в storage.get_stuck_pending() для защиты RAM при большом backlog.
+    """
+    db_cfg = cfg.get("database")
+    if not isinstance(db_cfg, dict) or "stuck_pending_limit" not in db_cfg:
+        return
+
+    default = DEFAULT_CONFIG["database"]["stuck_pending_limit"]
+    raw = db_cfg["stuck_pending_limit"]
+
+    converted = None
+    if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+        try:
+            f = float(raw)
+            if math.isfinite(f) and f == int(f) and int(f) > 0:
+                converted = int(f)
+        except (TypeError, ValueError, OverflowError):
+            converted = None
+
+    if converted is None:
+        logger.warning(
+            "database.stuck_pending_limit=%r — ожидалось целое > 0, "
+            "используется дефолт %r",
+            raw, default,
+        )
+        db_cfg["stuck_pending_limit"] = default
+        return
+
+    db_cfg["stuck_pending_limit"] = converted
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:

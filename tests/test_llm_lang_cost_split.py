@@ -107,15 +107,15 @@ class TestLangStorage:
         conn.commit()
         s.close()
 
-        # Открытие v13-кодом: миграция должна добавить items.lang.
+        # Открытие v14-кодом: миграция должна добавить items.lang и url_norm.
         s2 = Storage(db_path=db_path)
         try:
             cols2 = {r[1] for r in s2._connect().execute(
                 "PRAGMA table_info(items)"
             ).fetchall()}
-            assert "lang" in cols2, "миграция v13 не добавила items.lang"
+            assert "lang" in cols2, "миграция v14 не добавила items.lang"
             version = s2._connect().execute("PRAGMA user_version").fetchone()[0]
-            assert int(version) == Storage.SCHEMA_VERSION == 13
+            assert int(version) == Storage.SCHEMA_VERSION == 14
 
             items = s2.get_all_by_state("new")
             assert len(items) == 1
@@ -581,7 +581,7 @@ class TestTelegramShutdown:
         with patch.object(td._http, "post") as mock_post:
             delivered = td.send_batch(items)
 
-        assert delivered == []       # всё остаётся pending
+        assert delivered == ([], [])       # всё остаётся pending
         assert mock_post.call_count == 0
 
     def test_send_batch_stops_after_current_item(self):
@@ -599,7 +599,7 @@ class TestTelegramShutdown:
              patch.object(td, "_wait"):
             delivered = td.send_batch(items)
 
-        assert delivered == ["https://e.com/0"]  # текущий доставлен
+        assert delivered == (["https://e.com/0"], [])  # текущий доставлен
         assert sent.call_count == 1              # остаток — pending
 
     def test_api_call_raises_on_shutdown_without_http(self):

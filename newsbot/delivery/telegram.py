@@ -7,12 +7,17 @@ import re
 import threading
 import time
 import urllib.parse
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import httpx
 
 from ..storage import NewsItem
 from . import format_time_utc
+
+# Minor #5-фикс: strip control-chars из исходящего текста (RSS может содержать
+# \x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029, которые Telegram API отклоняет
+# как 400 "can't parse entities"). \n, \t, \r сохраняются (имеют смысл в тексте).
+_OUTGOING_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029]")
 
 logger = logging.getLogger("newsbot.delivery.telegram")
 
@@ -100,6 +105,18 @@ def is_valid_http_url(url: str) -> str:
 
     return url
 
+
+def _strip_control_chars(text: str) -> str:
+    """
+    Minor #5-фикс: удаляет control-chars из исходящего текста.
+
+    RSS-фиды могут содержать нуль-символы, vertical tab, form feed и прочие
+    непечатаемые символы (\\x00-\\x08, \\x0b, \\x0c, \\x0e-\\x1f, \\x7f,
+    \\x85, U+2028/2029). Telegram Bot API отклоняет их как 400
+    «can't parse entities». \\n, \\t, \\r сохраняются (имеют значение в тексте).
+    """
+    return _OUTGOING_CONTROL_RE.sub("", text)
+
 # HTTP-статусы
 _HTTP_FORBIDDEN = 403
 _HTTP_TOO_MANY_REQUESTS = 429
@@ -121,6 +138,16 @@ class ChatIdNotBoundError(TelegramDeliveryError):
 
 class BotBlockedError(TelegramDeliveryError):
     """Бот заблокирован пользователем (HTTP 403)."""
+    pass
+
+
+class PermanentDeliveryError(TelegramDeliveryError):
+    """Постоянная ошибка доставки (HTTP 400/413/422): bad request / too long / can't parse.
+
+    В отличие от транзиентных ошибок (429/5xx/сеть), эти НЕ исправятся при повторе —
+    item бессмысленно повторять. Помечается failed напрямую (set_state('failed')),
+    но батч продолжается (уже доставленные не откатываются).
+    """
     pass
 
 
@@ -161,7 +188,7 @@ class TelegramDelivery:
     Использует httpx для HTTP. parse_mode — HTML.
     Все спецсимволы экранируются через html.escape().
 
-    send_batch возвращает список URL успешно отправленных items.
+    send_batch возвращает кортеж (delivered_urls, failed_urls).
     При ChatIdNotBoundError / BotBlockedError — re-raise (items остаются pending).
     При TelegramDeliveryError батч прерывается: отправленное — delivered,
     остаток — pending (at-least-once).
@@ -207,22 +234,25 @@ class TelegramDelivery:
 
     # ── public API ───────────────────────────────────────────────────────────
 
-    def send(self, items: List[NewsItem]) -> List[str]:
-        """Сингл-отправка одной новости. Возвращает [url] при успехе, [] при ошибке."""
+    def send(self, items: List[NewsItem]) -> Tuple[List[str], List[str]]:
+        """Сингл-отправка одной новости. Возвращает (successful_urls, permanent_failed_urls)."""
         return self.send_batch(items)
 
-    def send_batch(self, items: List[NewsItem]) -> List[str]:
+    def send_batch(self, items: List[NewsItem]) -> Tuple[List[str], List[str]]:
         """
         Отправляет батч items.
 
-        Возвращает список URL успешно доставленных items.
-        При ChatIdNotBoundError / BotBlockedError — re-raise (items остаются pending).
-        При TelegramDeliveryError — батч прерывается (break): уже отправленные
-        URL возвращаются как delivered, остаток остаётся pending и будет
-        обработан retry в следующем цикле (at-least-once).
+        Returns:
+            Tuple of (successful_urls, permanent_failed_urls).
+            successful_urls — URL items, успешно доставленных (state → 'delivered').
+            permanent_failed_urls — URL items с PermanentDeliveryError
+            (state → 'failed', без расхода retry_count).
+            При ChatIdNotBoundError / BotBlockedError — re-raise (items остаются pending).
+            При TelegramDeliveryError — батч прерывается: уже отправленные
+            возвращаются как successful_urls, остаток — pending (at-least-once).
         """
         if not items:
-            return []
+            return ([], [])
 
         if not self.chat_id:
             raise ChatIdNotBoundError(
@@ -231,6 +261,7 @@ class TelegramDelivery:
             )
 
         successful_urls: List[str] = []
+        permanent_failed_urls: List[str] = []
 
         for i, item in enumerate(items):
             # MINOR-фикс: при установленном shutdown_event паузы в _wait
@@ -259,12 +290,26 @@ class TelegramDelivery:
                     "Оставшиеся items — pending."
                 )
                 raise          # аналогично
+            except PermanentDeliveryError as e:
+                # FIX-1: 400/413/422 — permanent: item никогда не доставится.
+                # permanent_failed_urls → pipeline делает set_state('failed'),
+                # НЕ попадает в retry_count. Батч продолжается (уже отправленные
+                # не откатываются). pacing применяется к следующему item.
+                logger.warning(
+                    "TelegramDelivery: permanent сбой '%s': %s — "
+                    "item → failed (permanent)",
+                    item.title[:60], e,
+                )
+                permanent_failed_urls.append(item.url)
+                # FIX-5-3: pacing применяется и после permanent-failed (continue),
+                # чтобы следующий send не пошёл без задержки.
+                # (pacing в конце тела цикла, без continue.)
             except TelegramDeliveryError as e:
                 # сетевая/API-ошибка (в т.ч. исчерпан дедлайн 429).
                 # Не долбим API остатком батча: он тоже упрётся в тот же лимит.
                 # Отправленное — delivered, остаток — pending (at-least-once).
                 logger.warning(
-                    "TelegramDelivery: сбой отправки '%s': %s — "
+                    "TelegramDelivery: transient сбой '%s': %s — "
                     "прерываем батч, остаток (%d item) остаётся pending",
                     item.title[:60], e, len(items) - i,
                 )
@@ -274,7 +319,7 @@ class TelegramDelivery:
             if i < len(items) - 1:
                 self._wait(SEND_PACING_SEC)
 
-        return successful_urls
+        return (successful_urls, permanent_failed_urls)
 
     def close(self) -> None:
         """Закрывает HTTP-клиент. Может быть вызван повторно без последствий."""
@@ -386,11 +431,11 @@ class TelegramDelivery:
         _MAX_RAW_TITLE = 250  # до escape, чтобы избежать обрыва сущностей
         _MAX_RAW_FOOTER_SOURCE = 100
 
-        raw_title = (item.title or "—")
+        raw_title = _strip_control_chars(item.title or "—")
         if len(raw_title) > _MAX_RAW_TITLE:
             raw_title = raw_title[:_MAX_RAW_TITLE]
 
-        raw_source = item.source or "—"
+        raw_source = _strip_control_chars(item.source or "—")
         if len(raw_source) > _MAX_RAW_FOOTER_SOURCE:
             raw_source = raw_source[:_MAX_RAW_FOOTER_SOURCE]
 
@@ -399,7 +444,10 @@ class TelegramDelivery:
         source_esc = html.escape(raw_source)
 
         # приоритет: llm_summary (выжимка LLM) → raw summary
-        raw_body = item.llm_summary if item.llm_summary else item.summary
+        # Minor #5-фикс: strip control-chars (не \n/\t/\r — нужны для split по \n\n)
+        raw_body = _strip_control_chars(
+            item.llm_summary if item.llm_summary else item.summary
+        )
         escaped_summary = html.escape(raw_body or "")
 
         ts = format_time_utc(getattr(item, "published_parsed", None), item.fetched_at)
@@ -557,8 +605,15 @@ class TelegramDelivery:
             # Страховка от расхождения: резервируем с запасом на 2 знака.
             packed = _pack(_utf16_units(f" ({len(packed)}/{len(packed)})") + 2)
 
-        if packed:
-            result = [(part, i == len(packed) - 1) for i, part in enumerate(packed)]
+        if not packed:
+            # Minor #6-фикс: body после split оказался whitespace-only.
+            # packed пуст → result пуст → final пуст → item доставлен без текста.
+            # Fallback: title + footer (без body). Бросать ошибку нельзя
+            # (URL уже в successful_urls → item был бы marked delivered повторно).
+            logger.warning("_split_text: body whitespace-only, fallback title+footer")
+            packed = [""]
+
+        result = [(part, i == len(packed) - 1) for i, part in enumerate(packed)]
 
         # проставить суффиксы и построить финальные payload'ы
         total = len(result)
@@ -785,8 +840,15 @@ class TelegramDelivery:
                     desc = body.get("description", "unknown")
                 except Exception:
                     desc = resp.text[:100] if resp.text else "unknown"
+                # Major #4-фикс: 400/413/422 — permanent (не исправятся при retry).
+                # 429 обрабатывается выше (retry-after). 403 → BotBlockedError.
+                status = resp.status_code
+                if status in (400, 413, 422):
+                    raise PermanentDeliveryError(
+                        f"HTTP {status}: {desc}"
+                    )
                 raise TelegramDeliveryError(
-                    f"HTTP {resp.status_code}: {desc}"
+                    f"HTTP {status}: {desc}"
                 )
 
             # ── успешный ответ — парсим JSON безопасно (M1) ──

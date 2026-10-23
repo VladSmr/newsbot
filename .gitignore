@@ -1,6 +1,8 @@
 # Sensitive data
 .env
+.env.*
 *.env
+!.env.example
 
 # Python cache
 __pycache__/
@@ -16,6 +18,8 @@ venv/
 
 # Database files (per-user state)
 data/*.db
+data/*.db.backup-*
+data/*.db-*
 # SQLite WAL (Write-Ahead Logging)
 data/*.db-wal
 data/*.db-shm

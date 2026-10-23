@@ -49,14 +49,15 @@ def _tmp_db():
 
 
 def _cleanup(path):
-    try:
-        os.unlink(path)
-    except (FileNotFoundError, PermissionError):
-        time.sleep(0.2)
+    for suffix in ("", "-wal", "-shm"):
         try:
-            os.unlink(path)
+            os.unlink(path + suffix)
         except (FileNotFoundError, PermissionError):
-            pass
+            time.sleep(0.2)
+            try:
+                os.unlink(path + suffix)
+            except (FileNotFoundError, PermissionError):
+                pass
 
 
 # =============================================================================
@@ -543,7 +544,7 @@ def test_scored_stuck_delivered_when_llm_budget_exhausted(tmp_path):
     pipeline.llm_filter = mock_llm
 
     delivery = MagicMock()
-    delivery.send_batch.return_value = ["https://ex.com/scored1"]
+    delivery.send_batch.return_value = (["https://ex.com/scored1"], [])
     pipeline.delivery = delivery
 
     # batch_size=10, бюджет=1, 2 items → обработан только scored (retry)
@@ -555,11 +556,11 @@ def test_scored_stuck_delivered_when_llm_budget_exhausted(tmp_path):
     assert "https://ex.com/fresh1" not in failed, (
         "Fresh item срезанный бюджетом НЕ должен быть в failed_urls"
     )
-    # Fresh остался pending
-    rows = pipeline.storage.get_all_by_state("pending")
-    pending_urls = [r.url for r in rows]
-    assert "https://ex.com/fresh1" in pending_urls, (
-        "Fresh item должен остаться pending (бюджет исчерпан)"
+    # Fresh срезанный бюджетом → state='new' (Major #3, retry в след.цикле)
+    rows = pipeline.storage.get_all_by_state("new")
+    new_urls = [r.url for r in rows]
+    assert "https://ex.com/fresh1" in new_urls, (
+        "Fresh item должен быть в state='new' (срезан бюджетом, retry в след.цикле)"
     )
     # LLM-вызов по scored НЕ должен был состояться (retry_batch — synthesize)
     assert not mock_llm.evaluate_batch.called, (

@@ -142,6 +142,10 @@ class TestRetentionWindow(unittest.TestCase):
         """Дефолт database.deferred_retention_days == 3 (v1.1.5)."""
         self.assertEqual(config_module.DEFAULT_CONFIG["database"]["deferred_retention_days"], 3)
 
+    def test_storage_default_retention_days_1(self):
+        """Дефолт Storage.DEFAULT_RETENTION_DAYS == 1 (источник истины — код, не README)."""
+        self.assertEqual(Storage.DEFAULT_RETENTION_DAYS, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

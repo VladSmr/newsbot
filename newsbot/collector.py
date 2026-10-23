@@ -20,6 +20,8 @@ from typing import Iterator, List, Optional, Pattern, Tuple
 import feedparser
 import httpx
 
+from .urlnorm import normalize_url
+
 logger = logging.getLogger("newsbot.collector")
 
 # ─── Лимиты ──────────────────────────────────────────────────────────────────
@@ -428,11 +430,16 @@ class FeedCollector:
                              getattr(entry, "title", "")[:50])
                 continue
 
+            # URL normalization (tracking-параметры, lowercase, sort, fragment).
+            # Применяется ДО создания NewsItem — нормализованный URL сохраняется
+            # в БД и используется при дедупликации (is_duplicate + UNIQUE index).
+            link_normalized = normalize_url(link)
+
             # P2-фикс: ошибка конвертации ОДНОГО entry (кривой _strip_html,
             # не-str term в tags, битый title в extract_location) не должна
             # вылетать из генератора collect() и убивать остальные фиды цикла.
             try:
-                news_item = _entry_to_news_item(entry, name, link, lang)
+                news_item = _entry_to_news_item(entry, name, link_normalized, lang)
             except Exception as e:
                 logger.warning(
                     "[%s] пропущен entry (ошибка конвертации): %s", name, e,
@@ -507,15 +514,24 @@ def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Opt
             tags_list.append(term)
     tags_str = json.dumps(tags_list) if tags_list else None
 
-    # cluster_key: локация|stem_hash|день публикации
-    # Minor 6-фикс: единая реализация — build_cluster_key из locations.py
+    # cluster_key: локация|stem_hash|день публикации.
+    # Задача: локация теперь извлекается LLM при скоринге, а НЕ из словаря.
+    # При ингесте ставится stub с пустой локацией → 'other' (cap не применится).
+    # После скоринга pipeline._process_batch пересобирает cluster_key с
+    # реальной LLM-локцией через _rebuild_cluster_key.
     cluster_key = None
     if title:
-        from .locations import build_cluster_key, extract_location
         from .stemmer import stem_hash
-        location = extract_location(title)
         stem = stem_hash(title)
-        cluster_key = build_cluster_key(location, stem, published_str, title=title)
+        import hashlib
+        loc = ""  # локация пока неизвестна → пустая → 'other'
+        loc_norm = loc.strip().lower() or "other"
+        pub_day = published_str[:10] if (published_str and len(published_str) >= 10) else "unknown"
+        if stem:
+            cluster_key = f"{loc_norm}|{stem}|{pub_day}"
+        else:
+            title_hash = hashlib.md5(b"").hexdigest()[:12]
+            cluster_key = f"{loc_norm}|nostem:{title_hash}|{pub_day}"
 
     return NewsItem(
         source=name,

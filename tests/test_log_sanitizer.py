@@ -189,11 +189,17 @@ class TestSanitizerEndToEnd:
         отформатированный вывод.
         """
         from newsbot.log import setup_logging
+        import logging
 
         # Перехватываем stderr
         old_stderr = sys.stderr
         captured = io.StringIO()
         sys.stderr = captured
+
+        # Сохраняем root-логгер (setup_logging вешает handler на root)
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
 
         try:
             # Чистая конфигурация логгера
@@ -212,8 +218,10 @@ class TestSanitizerEndToEnd:
                 "Multi: bot111:Tok11111111111111111  222333:Tok22222222222222222  " + _DS_KEY
             )
 
-            logger.handlers.clear()  # очищаем после теста
         finally:
+            # Восстанавливаем root-логгер (иначе handler останется до конца сессии)
+            root.handlers = saved_handlers
+            root.level = saved_level
             sys.stderr = old_stderr
 
         output = captured.getvalue()
@@ -230,6 +238,7 @@ class TestSanitizerEndToEnd:
         T4: токен в traceback (exc_info) не попадает в лог.
         """
         from newsbot.log import setup_logging
+        import logging
 
         _secret = "SecretKeyABCDEFGHIJKLMN"
         _token = "bot555666:" + _secret
@@ -237,6 +246,11 @@ class TestSanitizerEndToEnd:
         old_stderr = sys.stderr
         captured = io.StringIO()
         sys.stderr = captured
+
+        # Сохраняем root-логгер
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
 
         try:
             setup_logging({"level": "DEBUG", "format": "%(message)s"})
@@ -247,9 +261,78 @@ class TestSanitizerEndToEnd:
             except Exception:
                 logger.error("API failed", exc_info=sys.exc_info())
 
-            logger.handlers.clear()
         finally:
+            # Восстанавливаем root-логгер
+            root.handlers = saved_handlers
+            root.level = saved_level
             sys.stderr = old_stderr
 
         output = captured.getvalue()
         assert _secret not in output
+
+    def test_file_handler_emoji_utf8_and_secret_masking(self, tmp_path):
+        """
+        NIT-фикс: RotatingFileHandler с encoding='utf-8' записывает emoji/CJK
+        без Logging error; секрет в файловом хендлере замаскирован.
+
+        Проверяет оба фикса log.py:
+          1. encoding='utf-8' в RotatingFileHandler — на Windows cp1251 ломается
+             на emoji/CJK (--- Logging error ---).
+          2. Повторный setup_logging закрывает старые file-хендлеры
+             (flush+close перед handlers.clear()), иначе утечка дескрипторов.
+        """
+        import sqlite3
+        from newsbot.log import setup_logging
+        import logging
+
+        log_file = tmp_path / "emoji_test.log"
+
+        _secret = "SecretKEYABCDEFGHIJKLMNOP"
+        _token = "bot444555:" + _secret
+
+        # Сохраняем состояние root-логгера
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        saved_level = root.level
+
+        # --- Первая инициализация (файл создаётся) ---
+        try:
+            setup_logging({
+                "level": "DEBUG",
+                "format": "%(message)s",
+                "file": str(log_file),
+            })
+            logger = logging.getLogger("emoji_test")
+
+            # Записываем строку с emoji, CJK и секретом
+            logger.info("Test: 🌏CJK 测试 🔥 token=" + _token)
+
+            # --- Повторный setup_logging (flush+close старых хендлеров) ---
+            setup_logging({
+                "level": "DEBUG",
+                "format": "%(message)s",
+                "file": str(log_file),
+            })
+            logger.info("Second init: 🎉 " + _token + " works")
+        finally:
+            # Восстанавливаем root-логгер
+            for h in root.handlers[:]:
+                root.removeHandler(h)
+            root.handlers.clear()
+            root.handlers = saved_handlers
+            root.level = saved_level
+
+        # Читаем файл как utf-8
+        content = log_file.read_text(encoding="utf-8")
+
+        # 1. Emoji и CJK записаны без ошибок
+        assert "🌏" in content, f"emoji not found in log: {content!r}"
+        assert "测试" in content, f"CJK not found in log: {content!r}"
+
+        # 2. Секрет замаскирован
+        assert _secret not in content, (
+            f"Secret '{_secret}' found unmasked in log file: {content!r}"
+        )
+        assert "***REDACTED***" in content, (
+            f"Mask not found in log file: {content!r}"
+        )

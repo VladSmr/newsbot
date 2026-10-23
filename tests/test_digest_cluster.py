@@ -93,13 +93,11 @@ def _mk_pipeline_unit(llm_filter=None, digest_cfg=None, off_peak_only=False):
         "digest": digest_cfg or {"cluster_duplicates": True},
         "llm": {"enabled": True, "api_key": "fake", "off_peak_only": off_peak_only},
     }
-    _tmpdir = tempfile.mkdtemp()
-    with patch.object(NewsPipeline, "_resolve_db_path", return_value=os.path.join(_tmpdir, "test.db")):
-        with patch.object(NewsPipeline, "_build_delivery", return_value=MagicMock()):
-            with patch.object(NewsPipeline, "_build_llm_filter", return_value=llm_filter):
-                p = NewsPipeline(cfg)
-                p.llm_filter = llm_filter
-                return p
+    with patch.object(NewsPipeline, "_build_delivery", return_value=MagicMock()):
+        with patch.object(NewsPipeline, "_build_llm_filter", return_value=llm_filter):
+            p = NewsPipeline(cfg)
+            p.llm_filter = llm_filter
+            return p
 
 
 def _mk_pipeline_integration(db_path, digest_cfg=None, llm_filter=None):
@@ -117,6 +115,8 @@ def _mk_pipeline_integration(db_path, digest_cfg=None, llm_filter=None):
     with patch.object(NewsPipeline, "_build_delivery", return_value=MagicMock()):
         with patch.object(NewsPipeline, "_build_llm_filter", return_value=llm_filter):
             p = NewsPipeline(cfg)
+            # Закрываем первое соединение перед подменой
+            p.storage.close()
             p.storage = Storage(db_path)
             if llm_filter is not None:
                 p.llm_filter = llm_filter
@@ -246,7 +246,6 @@ class TestClusterUnit(unittest.TestCase):
         mock_filter = MagicMock()
         mock_filter.detect_duplicates.return_value = {1}
 
-        _tmpdir = tempfile.mkdtemp()
         cfg = {
             "sources": [],
             "database": {"path": "data/nb.db"},
@@ -254,11 +253,10 @@ class TestClusterUnit(unittest.TestCase):
             "digest": {},  # нет ключа cluster_duplicates
             "llm": {"enabled": True, "api_key": "fake"},
         }
-        with patch.object(NewsPipeline, "_resolve_db_path", return_value=os.path.join(_tmpdir, "test.db")):
-            with patch.object(NewsPipeline, "_build_delivery", return_value=MagicMock()):
-                with patch.object(NewsPipeline, "_build_llm_filter", return_value=mock_filter):
-                    p = NewsPipeline(cfg)
-                    p.llm_filter = mock_filter
+        with patch.object(NewsPipeline, "_build_delivery", return_value=MagicMock()):
+            with patch.object(NewsPipeline, "_build_llm_filter", return_value=mock_filter):
+                p = NewsPipeline(cfg)
+                p.llm_filter = mock_filter
 
         result = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/g0"),

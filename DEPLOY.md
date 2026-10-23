@@ -354,8 +354,8 @@ docker compose down
 # Зайти в контейнер для отладки
 docker compose run --rm --entrypoint sh newsbot
 
-# Проверить конфиг без запуска
-docker compose run --rm --entrypoint python newsbot -c "from newsbot.config import load_config; print(load_config())"
+# Проверить конфиг без запуска (секреты маскируются)
+docker compose run --rm --entrypoint python newsbot -c "from newsbot.config import load_config; cfg=load_config(); tg=cfg.get('telegram',{}); llm=cfg.get('llm',{}); print({'telegram':{**tg,'token':'***' if tg.get('token') else ''},'llm':{**llm,'api_key':'***' if llm.get('api_key') else ''},**{k:v for k,v in cfg.items() if k not in('telegram','llm')}})"
 
 # Проверить, какие переменные окружения видит контейнер
 docker compose run --rm --entrypoint env newsbot | grep -E "TELEGRAM|DEEPSEEK|HTTP_PROXY"
@@ -364,6 +364,7 @@ docker compose run --rm --entrypoint env newsbot | grep -E "TELEGRAM|DEEPSEEK|HT
 ## 14. Команды бота (в чате Telegram)
 
 ```
+/start    — начать (привязка chat_id)
 /stop     — приостановить обработку и доставку
            (сбор RSS продолжается, новости накопятся)
 /continue — возобновить после /stop

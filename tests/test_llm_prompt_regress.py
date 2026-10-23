@@ -111,8 +111,9 @@ class TestLeadingHashEscape:
 
         for prompt in (SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT):
             assert "LANGUAGE RULE (STRICT)" in prompt
-            assert "# Language: en" in prompt
-            assert "MUST get English summaries" in prompt
+            # v1.4.0: summary ВСЕГДА на английском, независимо от языка статьи
+            assert "ALWAYS in English" in prompt
+        # "# Language: en" — только в user-сообщениях (build_batch_user_message), не в системном промпте
 
 
 # ─────────────────────────────────────────────────────────────────

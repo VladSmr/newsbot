@@ -26,69 +26,31 @@ def make_item(url="https://e.com/1", title="Test", summary="Summary"):
 # Fake-клиент, подменяющий POST (по мотиву test_llm_filter_mocks.py)
 # ─────────────────────────────────────────────────────────────────
 
-class FakeChatCompletionBatch:
-    """Мок-ответ для батча: возвращает настроенный JSON."""
-    response_data: str = ""
-    call_count: int = 0
-    _last_body: dict = {}
+# Module-level saved reference for safe restore in all test helpers
+_saved_httpx_client_cls: type = None
+# The real httpx.Client class — set ONCE at import, never touched by _make_batch_filter
+_real_httpx_Client_class: type = None
 
-    @classmethod
-    def install_json(cls, json_str: str):
-        cls.response_data = json_str
-        cls.call_count = 0
-        import newsbot.llm.client as cm
-        orig = cm.httpx.Client
 
-        class _Fake:
-            is_closed = False
+def _init_real_httpx_class():
+    """Called once at import: capture the real httpx.Client class."""
+    global _real_httpx_Client_class
+    if _real_httpx_Client_class is None:
+        import httpx as _httpx_module
+        import newsbot.llm.client as _cm
+        _real_httpx_Client_class = _cm.httpx.Client
 
-            def __init__(s, **kw): pass
 
-            def post(s, url, **kwargs):
-                cls.call_count += 1
-                cls._last_body = kwargs.get("json", {})
-                import httpx as _hx
-                return _FakeResponse(
-                    {"choices": [{"message": {"content": cls.response_data}}]},
-                    200,
-                )
+_init_real_httpx_class()
 
-            def get(s, url, **kwargs):
-                import httpx as _hx
-                return _FakeResponse({"balance_infos": []}, 200)
 
-            def close(s): pass
-
-        cm.httpx.Client = _Fake
-
-    @classmethod
-    def uninstall(cls):
-        import newsbot.llm.client as cm
-        import httpx
-        cm.httpx.Client = httpx.Client
-
-    @classmethod
-    def make_error_response(cls, exc: Exception):
-        """Мок-вызов, поднимающий исключение (имитирует LLMError)."""
-        import newsbot.llm.client as cm
-
-        class _FakeErr:
-            is_closed = False
-
-            def __init__(s, **kw): pass
-
-            def post(s, url, **kwargs):
-                cls.call_count += 1
-                cls._last_body = kwargs.get("json", {})
-                raise exc
-
-            def get(s, url, **kwargs):
-                import httpx as _hx
-                return _FakeResponse({"balance_infos": []}, 200)
-
-            def close(s): pass
-
-        cm.httpx.Client = _FakeErr
+def _unmock_batch():
+    """Восстанавливает оригинальный httpx.Client после теста."""
+    import newsbot.llm.client as cm
+    global _saved_httpx_client_cls
+    if _saved_httpx_client_cls is not None:
+        cm.httpx.Client = _saved_httpx_client_cls
+        _saved_httpx_client_cls = None
 
 
 class _FakeHTTPResponse:
@@ -108,8 +70,10 @@ def _make_batch_filter(response_body: dict, *, push_urgent_only=False) -> LLMFil
     Создаёт LLMFilter с мок-клиентом, который возвращает response_body.
     Мок подменяет httpx.Client.post так, чтобы POST вернул нужный JSON.
     """
-    import httpx
     import newsbot.llm.client as cm
+
+    global _saved_httpx_client_cls
+    _saved_httpx_client_cls = cm.httpx.Client
 
     class _FakeHTTPClient:
         is_closed = False
@@ -138,8 +102,9 @@ def _make_batch_filter(response_body: dict, *, push_urgent_only=False) -> LLMFil
             "push_urgent_only": push_urgent_only,
         })
     finally:
-        # restore: НЕ восстанавливаем, чтобы мок остался для evaluate_batch
-        cm.httpx.Client = httpx.Client
+        # Восстанавливаем сохранённый класс.
+        cm.httpx.Client = _saved_httpx_client_cls
+        _saved_httpx_client_cls = None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -311,8 +276,10 @@ class TestBatchPerItemFallback:
 
     def test_full_llm_error_all_false(self):
         """Полный LLMError → все items ok=False."""
-        import httpx
         import newsbot.llm.client as cm
+
+        global _saved_httpx_client_cls
+        _saved_httpx_client_cls = cm.httpx.Client
 
         class _ErrorClient:
             is_closed = False
@@ -336,7 +303,7 @@ class TestBatchPerItemFallback:
             assert len(results) == 3
             assert all(not r.ok for r in results)
         finally:
-            cm.httpx.Client = httpx.Client
+            _unmock_batch()
 
     def test_non_dict_response_all_false(self):
         """LLM вернул не-объект → все ok=False."""
@@ -381,15 +348,9 @@ class TestBatchPerItemFallback:
 # ─────────────────────────────────────────────────────────────────
 
 class TestBatchPromptContent:
-    def setup_method(self):
-        FakeChatCompletionBatch.uninstall()
-
-    def teardown_method(self):
-        FakeChatCompletionBatch.uninstall()
-
     def test_user_message_contains_data_markers(self):
         """User-сообщение содержит <|data:N|> и <|end data:N|>."""
-        from newsbot.llm.prompts import build_batch_user_message, build_feedback_block
+        from newsbot.llm.prompts import build_batch_user_message
 
         items = [make_item(f"https://x.com/{i}", f"Title{i}", f"Sum{i}") for i in range(1, 4)]
         msg = build_batch_user_message(items)
@@ -519,42 +480,6 @@ class TestBatchSanitization:
         assert "\n" not in title_part
         assert "\r" not in title_part
         assert "\x00" not in title_part
-    def setup_method(self):
-        FakeChatCompletionBatch.uninstall()
-
-    def teardown_method(self):
-        FakeChatCompletionBatch.uninstall()
-
-    def test_user_message_contains_data_markers(self):
-        """User-сообщение содержит <|data:N|> и <|end data:N|>."""
-        from newsbot.llm.prompts import build_batch_user_message, build_feedback_block
-
-        items = [make_item(f"https://x.com/{i}", f"Title{i}", f"Sum{i}") for i in range(1, 4)]
-        msg = build_batch_user_message(items)
-
-        # маркировка ДАННЫХ
-        assert "DATA" in msg
-        assert "<|data:1|>" in msg
-        assert "<|data:2|>" in msg
-        assert "<|data:3|>" in msg
-        assert "<|end data:1|>" in msg
-        assert "<|end data:2|>" in msg
-        assert "<|end data:3|>" in msg
-
-        # titles на месте
-        assert "Title1" in msg
-        assert "Title2" in msg
-
-    def test_feedback_context_in_batch_message(self):
-        """feedback_context подставляется в батчевое сообщение."""
-        from newsbot.llm.prompts import build_batch_user_message
-
-        items = [make_item("https://x.com/1", "T", "S")]
-        ctx = ([{"title": "Bad", "source": "Src"}], [])  # dislikes
-        msg = build_batch_user_message(items, feedback_context=ctx)
-
-        assert "DATA" in msg
-        assert "Bad" in msg
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -935,7 +860,7 @@ class TestPipelineBatchIntegration:
 
 class _MockDelivery:
     def send_batch(self, items):
-        return [i.url for i in items]
+        return ([i.url for i in items], [])
     def send_text(self, text): return True
     def close(self): pass
 
@@ -1032,7 +957,7 @@ class TestBudgetInItems:
 
                 def send_batch(self, items):
                     self.send_batch_called = True
-                    return [i.url for i in items]
+                    return ([i.url for i in items], [])
 
                 def send_text(self, text):
                     return True
@@ -1300,7 +1225,7 @@ class TestTruncationAndJSONDecodeRetry:
                 assert "length" in str(e).lower() or "усечён" in str(e).lower(), \
                     f"Unexpected LLMError message: {e}"
         finally:
-            cm.httpx.Client = httpx.Client
+            cm.httpx.Client = _real_httpx_Client_class
 
     def test_json_decode_error_retries_once(self):
         """JSONDecodeError → ровно 1 повторная попытка (не break сразу)."""
@@ -1347,7 +1272,7 @@ class TestTruncationAndJSONDecodeRetry:
             assert result["score"] == 8, f"Expected score=8, got {result}"
             assert call_count[0] == 2, f"Expected 2 calls (1 retry), got {call_count[0]}"
         finally:
-            cm.httpx.Client = httpx.Client
+            cm.httpx.Client = _real_httpx_Client_class
 
     def test_json_decode_error_gives_up_after_one_retry(self):
         """JSONDecodeError: 2-й JSONDecodeError → LLMError (а не бесконечный цикл)."""
@@ -1388,7 +1313,7 @@ class TestTruncationAndJSONDecodeRetry:
                 # Ровно 2 попытки: первая + 1 retry
                 assert call_count[0] == 2, f"Expected 2 calls, got {call_count[0]}"
         finally:
-            cm.httpx.Client = httpx.Client
+            cm.httpx.Client = _real_httpx_Client_class
 
 
 # ─────────────────────────────────────────────────────────────────

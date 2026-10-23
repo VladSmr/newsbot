@@ -120,7 +120,7 @@ Purge: seen_titles (TTL) + items (delivered/skipped/failed/digested, retention_d
 | `pending`   | Обработка начата (set_state перед send_batch)| Да — через `get_stuck_pending` |
 | `delivered` | Успешно доставлен (пуш)                      | Нет                           |
 | `skipped`   | LLM отфильтровал (score < digest_threshold)  | Нет                           |
-| `deferred`  | Score 5–6, отложен на дайджест               | Нет; исключён из purge         |
+| `deferred`  | Score 5–6, отложен на дайджест               | Нет; чистится по deferred_retention_days (3 дня) |
 | `failed`    | Терминальный; retry_count исчерпан           | Нет (purge по retention_days)   |
 | `digested`  | Терминальный; отправлен в дайджесте          | Нет (purge по retention_days)   |
 
@@ -130,8 +130,9 @@ Purge: seen_titles (TTL) + items (delivered/skipped/failed/digested, retention_d
 - Recovery на старте цикла: зависшие `pending` с `retry_count >= max_retries` получают `failed`.
 - При падении delivery: items остаются `pending`, retry в следующем цикле.
 
-**Purge:** `delivered`, `skipped`, `failed`, `digested`, `new` старше `retention_days`.
-`deferred` удаляются по отдельному окну `deferred_retention_days` (14 дней по умолчанию)
+**Purge:** `delivered`, `skipped`, `failed`, `digested` старше `retention_days` (1 день);
+`new` удаляется при возрасте ≥ max(`retention_days`, 7) — минимум 7 дней;
+`deferred` удаляются по отдельному окну `deferred_retention_days` (3 дня по умолчанию)
 — старые неотправленные отложенные новости больше не копятся вечно.
 
 ## CLI-команды
@@ -142,7 +143,9 @@ python -m newsbot --once                 # один цикл и выход
 python -m newsbot --digest               # дайджест отложенных новостей и выход
 python -m newsbot --check-telegram       # getMe → username бота
 python -m newsbot --set-chat-id          # получить chat_id через getUpdates
+python -m newsbot --set-chat-id --bind OWNER_ID  # привязать конкретный chat_id
 python -m newsbot --check-llm            # баланс + тестовый chat_json
+python -m newsbot --version              # показать версию приложения
 ```
 
 **TelegramPoller** запускается только в демон-режиме (`python -m newsbot`).
@@ -325,8 +328,11 @@ digest:
 ```
 
 Собирает все non-urgent релевантные новости (score 5–6), отбирает ≤30
-топовых по score, отправляет 2×/день. Семантические перефразы НЕ
-дедуплицируются (нужен отдельный этап embeddings/LLM).
+топовых по score, отправляет 2×/день. Перед отправкой запускается
+финальная LLM-кластеризация (`digest.cluster_duplicates=true`, дефолт) —
+семантические дубли (одно событие, разные формулировки) отсеиваются
+в пользу наиболее приоритетного лидера. Управляется параметром
+`digest.cluster_duplicates` в config.yaml.
 
 **Гарантии:**
 - ≤ 4096 символов на сообщение (HTML-экранирование, безопасное усечение body по word boundary)
@@ -350,7 +356,7 @@ RSS-сбор → `state='new'` (продолжается) → LLM-фильтр, 
 
 ## Дедупликация
 
-**Два уровня (оба конфигурируемые):**
+**Три уровня (уровни 1–2 конфигурируемые, уровень 3 всегда включён):**
 
 **Уровень 1 — глобальный точный:** `title_hash` БЕЗ `source` в пределах `window_days`.
 Активируется: `dedup.cross_source=true` (дефолт True). Окно: `dedup.window_days`
@@ -375,9 +381,17 @@ RSS-сбор → `state='new'` (продолжается) → LLM-фильтр, 
 поведение сохранено).
 
 **Всегда:**
-- **URL** — точный, permanent, все записи (без TTL).
+— **URL** — точный, живёт в пределах жизни записи в `items` (URL-дедуп в таблице
+  — `INSERT OR IGNORE`, UNIQUE INDEX `idx_items_url_norm` по нормализованному URL). Purge: терминальные — 1 день,
+  `deferred` — 3 дня, `new` — минимум 7 дней. Отдельного permanent-хранилища URL нет
+  (заголовки — отдельная история: `seen_titles` TTL 30 дней).
 - **Заголовок** — нормализованный (strip, collapse spaces, lowercase, remove punctuation,
   срез префиксов `Reuters:`, `Bloomberg:`, `Источник:` и т.п.) + `source`, TTL 30 дней.
+  Заголовки короче 3 символов НЕ пишутся в `seen_titles` (MIN_TITLE_LEN=3).
+- **cluster_key** — доменный 2-часовой дедуп: ключ = `{location}|{stem_hash}|{pub_day}`
+  (fallback: `nostem:{md5(title)}`); `tags` (json-список `<category>` из фида) в ключ
+  НЕ входит. Если в пределах 2 часов уже была новость с тем же `cluster_key`, она
+  помечается `skipped`. Всегда включён, не конфигурируется.
 
 **Уровень 3 — LLM-дедуп (семантическая группировка «одно событие»):**
 `llm.llm_dedup: true` (дефолт True). Отдельный лёгкий вызов (только заголовки) **ДО**
@@ -395,10 +409,11 @@ LLM-скоринга. Критерий: «одно и то же событие, 
 |-------------------------------|-------------------------------------|-----------------------|
 | `poll_interval_minutes`       | Пауза между циклами                 | 15                    |
 | `database.path`               | Путь к SQLite (от каталога newsbot)  | `data/newsbot.db`     |
-| `database.retention_days`     | Хранить delivered/skipped/failed/digested | 90          |
+| `database.retention_days`     | Хранить delivered/skipped/failed/digested и new старше 7 дней | 1          |
 | `database.retry_threshold_sec` | pending считается зависшим через    | 60                    |
 | `database.max_retries`        | Лимит retry попыток → state=failed   | 8                     |
-| `database.deferred_retention_days` | Удалять старые deferred-items (не попали в digest) | 14               |
+| `database.deferred_retention_days` | Удалять старые deferred-items (не попали в digest) | 3               |
+| `database.stuck_pending_limit` | Макс. 'pending'-items, загружаемых из retry-очереди за цикл (защита RAM) | 500 |
 | `database.recovery_new_limit` | Макс. 'new'-items, загружаемых в RAM за цикл (K1-recovery) | 500          |
 | `llm.max_per_cycle`           | Макс. LLM-оценок (items) на цикл    | 150                   |
 | `llm.batch_size`             | ≤N новостей одним LLM-вызовом (1=поштучно) | 10              |
@@ -413,7 +428,14 @@ LLM-скоринга. Критерий: «одно и то же событие, 
 | `llm.model`                   | Модель DeepSeek                      | `deepseek-flash` (pro — альтернатива) |
 | `digest.enabled`              | Автоматический дайджест              | true                  |
 | `digest.times`                | HH:MM в локальной tz                 | `["08:00","20:00"]`   |
+| `digest.cluster_duplicates`   | LLM-кластеризация deferred перед отправкой | true           |
+| `digest.max_age_hours`        | Выбирать deferred-items не старше N часов | 24               |
+| `digest.bootstrap_window_hours`| Окно начального наполнения дайджеста | 24                   |
+| `digest.max_per_location`     | Макс. новостей на локацию/день в дайджесте | 2                |
 | `feedback.enabled`            | Приём обратной связи                 | true                  |
+| `feedback.digest_enabled`     | 👍/👎 кнопки в дайджесте             | false                 |
+| `llm.daily_cost_limit`        | Дневной лимит расходов на LLM (USD; 0=выкл) | 0.50          |
+| `llm.pricing`                 | Цены моделей (input/output за 1M токенов) | deepseek-flash: 0.15/0.60 |
 | `feedback.max_examples`       | Примеров в few-shot                 | 10                    |
 | `dedup.cross_source`          | Глобальный точный дедуп по title_hash (без source) | true          |
 | `dedup.fuzzy`                 | Нечёткое сравнение (только при cross_source=true)  | true          |
@@ -425,16 +447,21 @@ LLM-скоринга. Критерий: «одно и то же событие, 
 ```
 TELEGRAM_BOT_TOKEN=<токен от @BotFather>
 TELEGRAM_CHAT_ID=<привязанный chat_id>
+TELEGRAM_OWNER_ID=<ваш числовой id (опционально)>
 DEEPSEEK_API_KEY=<ключ от platform.deepseek.com>
 ```
 
-## Схема БД (v11, идемпотентные миграции v1→v11)
+## Схема БД (v13, идемпотентные миграции v1→v13)
 
 ```sql
 -- items: state-машина
 items: id, source, url, title, summary, published, fetched_at,
        state, state_at, llm_score, llm_summary, llm_reason,
-       llm_urgent INTEGER (v10/v11, 0/1), filtered_at, retry_count
+       llm_urgent INTEGER (v10/v11, 0/1), filtered_at, retry_count,
+       tags TEXT,        -- v4: список тегов (например "attack","russia","drone")
+       cluster_key TEXT,-- v12: ключ группировки для 2-часового доменного дедупа
+                        -- формат: {location}|{stem_hash}|{pub_day}
+       lang TEXT        -- v13: язык новости (ru/en)
 
 -- seen_titles: title-dedup, TTL 30 дней (v9: + title_normalized для fuzzy)
 seen_titles: id, title_hash, source, fetched_at, expires_at, title_normalized

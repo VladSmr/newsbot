@@ -141,7 +141,7 @@ class TestVersionReexport:
 
             # Реплицируем логику setup.py: читает version.py и извлекает значение
             m_setup_version = re.search(
-                r'_version\s*=\s*re\.search\([^)]+\.read_text[^)]+\)[^;]*\.group\(1\)',
+                r'_version\s*=\s*re\.search\([^)]+\.read_text[^)]+\)[^;\n]*\.group\(1\)',
                 setup_py_text,
                 re.DOTALL,
             )

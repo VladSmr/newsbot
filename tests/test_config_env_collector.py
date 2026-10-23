@@ -173,41 +173,68 @@ class TestCollectorFeedLimits:
         from newsbot.collector import MAX_ITEMS_PER_FEED
         assert MAX_ITEMS_PER_FEED == 50
 
-    def test_slow_feed_respects_deadline(self):
-        """FEED_DEADLINE_SEC превышен → собирается часть items, не весь фид."""
+    def test_slow_feed_respects_deadline(self, caplog):
+        """
+        FEED_DEADLINE_SEC превышен → собирается часть items, не весь фид.
+
+        MockTransport отвечает мгновенно. collector.py проверяет
+        FEED_DEADLINE_SEC в entries-loop (line 406: elapsed > FEED_DEADLINE_SEC).
+        deadline срабатывает только если истекло >30 с. Имитируем это патчем
+        collector.time.monotonic: возвращаем 1.0 для HTTP-фазы (elapsed≈0<30),
+        FEED_DEADLINE_SEC+1 для entries-loop (elapsed=31>30 → deadline превышен).
+        """
+        import logging
         import httpx
+        from unittest import mock
+        import newsbot.collector as col
         from newsbot.collector import FeedCollector, FEED_DEADLINE_SEC
 
-        entry_count = 200
-        slow_body = b'''<?xml version="1.0"?><rss><channel>'''
-        for i in range(entry_count):
-            slow_body += (
-                f'<item><title>Slow {i}</title>'
-                f'<link>http://ex.com/{i}</link></item>'
-            ).encode()
-        slow_body += b'</channel></rss>'
+        _calls = [0]
 
-        def slow_handler(req: httpx.Request) -> httpx.Response:
-            import time
-            time.sleep(0.05)   # каждый entry = 50ms → 200 шт. > 30 с дедлайна
-            return httpx.Response(200, content=slow_body)
+        def fake_monotonic():
+            """
+            Deterministic fake: returns the current call index as fake time.
+            collector.py sets deadline = feed_start + FEED_DEADLINE_SEC (= 30).
+            The entry-loop check (line 406) fires when elapsed > 30.
+            We return the raw call counter n, so after n calls elapsed = n.
+            With 31 items, the entry loop alone makes 31 checks (n=0..30),
+            which is enough for the deadline to fire during entry ~30.
+            """
+            n = _calls[0]
+            _calls[0] = n + 1
+            return float(n)
 
-        transport = httpx.MockTransport(slow_handler)
-        client = httpx.Client(transport=transport)
-        collector = FeedCollector([{"name": "slow", "url": "http://slow/feed"}])
-        collector._client.close()
-        collector._client = client
+        # Build a feed with 31 items so the entry loop makes enough
+        # monotonic() calls to exceed the 30-second deadline.
+        body = b'<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel>'
+        for i in range(31):
+            body += (f'<item><title>Slow {i}</title>'
+                     f'<link>http://ex.com/{i}</link></item>').encode()
+        body += b'</channel></rss>'
+        transport = httpx.MockTransport(lambda req: httpx.Response(200, content=body))
 
-        try:
-            _, result = next(collector.collect())
+        # collector.py имеет 'import time'; коллектор вызывает time.monotonic.
+        # Патчим модульный атрибут напрямую (через тот же module object).
+        with mock.patch.object(col.time, 'monotonic', fake_monotonic):
+            collector = FeedCollector([{"name": "slow", "url": "http://slow/feed"}])
+            collector._client.close()
+            collector._client = httpx.Client(transport=transport)
+
+            with caplog.at_level(logging.WARNING, logger="newsbot.collector"):
+                _, result = next(collector.collect())
+
             assert result.ok is True
-            # Собрано меньше всех 200 entries (прервались по дедлайну)
-            assert 0 < len(result.items) < entry_count, (
-                f"Ожидалось <{entry_count} items, получено {len(result.items)}"
+            # After 31 monotonic() calls (from 31-item entry loop + HTTP phase),
+            # deadline fires: elapsed > FEED_DEADLINE_SEC=30 → fewer than 31 items
+            assert len(result.items) < 31, (
+                f"Expected fewer than 31 items (deadline exceeded), got {len(result.items)}"
             )
-        finally:
-            client.close()
-            collector._client = httpx.Client(timeout=15)
+            # WARNING о превышении дедлайна
+            assert any("FEED_DEADLINE_SEC" in r.getMessage() for r in caplog.records), \
+                f"Ожидался WARNING о FEED_DEADLINE_SEC, получено: {[r.getMessage() for r in caplog.records]}"
+
+            collector._client.close()
+        # restore happens automatically via mock.patch
 
     def test_max_items_per_feed_caps(self):
         """>MAX_ITEMS_PER_FEED entries → собирается ровно MAX_ITEMS_PER_FEED."""

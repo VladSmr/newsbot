@@ -61,3 +61,38 @@ def _block_real_network(monkeypatch):
                       _blocked_handle_request, raising=False)
     yield
     # restore не нужен (monkeypatch сам восстанавливает)
+
+
+# ─────────────────────────────────────────────────────────────────
+# httpx.Client isolation: защита от протёкших моков между тестами.
+# test_llm_filter_mocks.py подменяет newsbot.llm.client.httpx.Client
+# через _mock_httpx_client(). Если тест протёк (не вызвал _unmock_httpx),
+# следующий тест увидит мок вместо «оригинала» и _mock_httpx_client
+# захватит мок → все последующие тесты получат None-восстановление.
+#
+# Решение: autouse-снапшот уровня module-import, а не global-переменной.
+# ─────────────────────────────────────────────────────────────────
+
+
+_httpx_client_original_ref: type = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_httpx_client(monkeypatch):
+    """
+    Snapshot newsbot.llm.client.httpx.Client ДО теста, восстановить ПОСЛЕ.
+    Если предыдущий тест протёк и подменил Client на мок —
+    следующий тест всё равно увидит реальный httpx.Client.
+    """
+    import newsbot.llm.client as cm
+
+    global _httpx_client_original_ref
+    if _httpx_client_original_ref is None:
+        _httpx_client_original_ref = cm.httpx.Client
+
+    yield
+
+    # Восстановление: сбрасываем модульный Client обратно к оригиналу.
+    # Это защищает СЛЕДУЮЩИЙ тест от протекшего мока.
+    # (monkeypatch работает на module-атрибуте, restoring не нужен)
+    cm.httpx.Client = _httpx_client_original_ref

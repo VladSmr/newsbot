@@ -12,7 +12,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from unittest import mock
 
 try:
@@ -29,7 +29,7 @@ from newsbot.collector import NewsItem
 from newsbot.llm.filter import FilterResult, LLMFilter, route
 from newsbot.llm.client import BalanceInfo, UsageStats
 from newsbot.storage import Storage
-from newsbot.pipeline import NewsPipeline
+from newsbot.pipeline import NewsPipeline, build_cluster_key
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -83,19 +83,19 @@ class FakeLLMFilter:
 
 
 class MockDelivery:
-    """Мок доставки: принимает всё, возвращает все URL."""
+    """Мок доставки: принимает всё, возвращает (successful_urls, [])."""
     def __init__(self, fail_on_urls: List[str] = None):
         self.sent: List[str] = []
         self.fail_on_urls = set(fail_on_urls or [])
 
-    def send_batch(self, items: List[NewsItem]) -> List[str]:
+    def send_batch(self, items: List[NewsItem]) -> tuple:
         result = []
         for item in items:
             if item.url in self.fail_on_urls:
                 continue
             result.append(item.url)
             self.sent.append(item.url)
-        return result
+        return (result, [])
 
     def send_text(self, text: str) -> bool:
         return True
@@ -321,6 +321,7 @@ class TestPipelineLLMRouting:
                 "max_retries": 3,
                 "push_threshold": 7,
                 "digest_threshold": 5,
+                "push_urgent_only": False,
                 "system_prompt": "ты фильтр",
             },
         }
@@ -344,6 +345,17 @@ class TestPipelineLLMRouting:
         # Items должны быть СНАЧАЛА сохранены в БД (как в реальном pipeline),
         # иначе set_state (UPDATE) не найдёт строк.
         for item in items:
+            # Присваиваем cluster_key, чтобы избежать коллизий при score propagation.
+            # Без cluster_key rebuild_cluster_key("") генерирует один nostem-hash для
+            # всех items без старого ключа → все три попадают в один кластер и все
+            # получают max(score)=8 → все push вместо push+dig+skip.
+            if not getattr(item, "cluster_key", None):
+                item.cluster_key = build_cluster_key(
+                    location="",
+                    stem=None,
+                    published=item.published,
+                    title=item.title,
+                )
             p.storage.save(item)
 
         # вызываем _process_batch
@@ -1081,9 +1093,9 @@ class TestCandidatesRetryAccounting:
                             for _ in items]
 
             class PartialDelivery:
-                """Доставляет только первые 2 из 3."""
+                """Доставляет только первые 2 из 3 (new tuple contract)."""
                 def send_batch(self, items):
-                    return [items[0].url, items[1].url]
+                    return ([items[0].url, items[1].url], [])
 
                 def send_text(self, text): return True
                 def close(self): pass
@@ -1117,17 +1129,24 @@ class TestCandidatesRetryAccounting:
             cleanup()
 
     def test_candidates_remainder_triggers_increment_in_run_cycle(self):
-        """Интеграционный: run_cycle_with_delivery вызывает increment_retry_count для remainder."""
+        """
+        Major #3 (p.3): budget-excess items возвращаются в state='new'.
+        Budget-независимый TG-сбой → failed_urls → retry_count → 'failed'.
+        Budget-cut items НЕ попадают в failed_urls (не дошли до delivery).
+
+        Проверяем НОВОЕ корректное поведение (p.3):
+        — Budget-cut → 'new' (retry в след.цикле, retry_count сохраняется)
+        — TG-сбой (send_batch < to_deliver) → в failed_urls → retry_count
+        """
         import unittest.mock as mock
-        from newsbot.pipeline import NewsPipeline
-        from newsbot.storage import Storage
+        import sqlite3
 
         path, cleanup = fresh_db()
         try:
             s = Storage(path)
             cfg = {
                 "sources": [],
-                "database": {"path": path, "max_retries": 8},
+                "database": {"path": path, "max_retries": 3},
                 "telegram": {"token": "", "chat_id": ""},
                 "llm": {
                     "enabled": True, "provider": "deepseek", "model": "deepseek-flash",
@@ -1149,34 +1168,22 @@ class TestCandidatesRetryAccounting:
                             for _ in items]
 
             class PartialDelivery:
-                """Доставляет только первые 2 из 3."""
+                """Доставляет только первые 2 из 3 (new tuple contract)."""
                 def send_batch(self, items):
-                    return [items[0].url, items[1].url]
+                    return ([items[0].url, items[1].url], [])
 
                 def send_text(self, text): return True
                 def close(self): pass
 
+            # Создаём items в Storage
             items = [make_item(url=f"https://cand2.com/{i}", title=f"C{i}", summary="S")
                      for i in range(3)]
             for item in items:
                 s.save(item)
 
-            # Мокаем increment_retry_count в run_cycle_with_delivery
-            inc_calls = []
-
-            orig_increment = s.increment_retry_count
-
-            def tracking_increment(urls):
-                inc_calls.extend(urls)
-                return orig_increment(urls)
-
-            s.increment_retry_count = tracking_increment
-
-            # Мокаем recover_stuck_pending и get_stuck_pending
             with mock.patch.object(s, "get_all_by_state", return_value=[]), \
                  mock.patch.object(s, "get_stuck_pending", return_value=[]), \
                  mock.patch.object(s, "recover_stuck_pending", return_value=0), \
-                 mock.patch.object(s, "set_state"), \
                  mock.patch.object(s, "update_llm_results_batch"), \
                  mock.patch.object(s, "get_or_create_feedback_target_from_item", return_value=1), \
                  mock.patch.object(s, "get_meta", return_value=None), \
@@ -1191,22 +1198,41 @@ class TestCandidatesRetryAccounting:
                 p.llm_filter = MockFilter()
                 p._max_per_cycle = 150
                 p._llm_calls_left = 150
+                p._max_retries = 3
                 p._feedback_context = None
                 p._is_paused = lambda: False
 
-                # run_cycle_with_delivery не вызываем полностью (слишком сложно замокать).
-                # Вместо этого вызываем _process_batch и проверяем что
-                # run_cycle_with_delivery вызвал бы increment для remainder.
-                remainder = p._process_batch(items, budget_override=150)
+                # budget=2 → items[0,1] обработаны, items[2] срезан бюджетом
+                # set_state НЕ мокаем — хотим реальные state-переходы в БД
+                remainder = p._process_batch(items, budget_override=2)
 
-                # После _process_batch вызываем логику run_cycle_with_delivery:
-                if remainder:
-                    s.increment_retry_count(remainder)
-                    # Проверяем что increment был вызван для remainder
-                    assert len(inc_calls) > 0, \
-                        "increment_retry_count должен быть вызван для remainder"
-                    assert "https://cand2.com/2" in inc_calls, \
-                        f"cand2.com/2 должен быть в increment: {inc_calls}"
+                # p.3: items[2] срезан бюджетом → НЕ в failed_urls
+                # (он не дошёл до delivery, не было TG-сбоя)
+                assert "https://cand2.com/2" not in remainder, (
+                    "Budget-cut item[2] НЕ должен быть в failed_urls (p.3 fix)"
+                )
+
+                # items[2] → state='new' (budget cut, retry в след.цикле)
+                conn = sqlite3.connect(path)
+                state = dict(conn.execute(
+                    "SELECT url, state FROM items"
+                ).fetchall())
+                rc = dict(conn.execute(
+                    "SELECT url, retry_count FROM items"
+                ).fetchall())
+                conn.close()
+
+                # Delivered items — delivered
+                assert state.get("https://cand2.com/0") == "delivered", \
+                    f"item0 должен быть delivered, got {state.get('https://cand2.com/0')}"
+                assert state.get("https://cand2.com/1") == "delivered", \
+                    f"item1 должен быть delivered, got {state.get('https://cand2.com/1')}"
+                # Budget-cut item → 'new' (p.3 fix: возвращается, не зависает pending)
+                assert state.get("https://cand2.com/2") == "new", \
+                    f"item2 должен быть в state='new' (budget cut), got {state.get('https://cand2.com/2')}"
+                # retry_count сохранён (не сброшен при возврате в 'new')
+                assert rc.get("https://cand2.com/2") == 0, \
+                    f"item2 retry_count должен быть 0, got {rc.get('https://cand2.com/2')}"
 
             s.close()
         finally:
@@ -1456,10 +1482,10 @@ class _MockDeliveryWithSendText:
         self.sent_texts: List[str] = []
         self.send_batch_urls: List[str] = []
 
-    def send_batch(self, items: List[NewsItem]) -> List[str]:
+    def send_batch(self, items: List[NewsItem]) -> Tuple[List[str], List[str]]:
         urls = [i.url for i in items]
         self.send_batch_urls.extend(urls)
-        return urls
+        return (urls, [])
 
     def send_text(self, text: str) -> bool:
         self.sent_texts.append(text)
@@ -2135,7 +2161,8 @@ class TestOffPeakGate:
     def test_offpeak_gate_pending_counter_in_log(self, tmp_path, caplog):
         """
         off_peak_only=True + пик: в логе фигурирует реальное число
-        pending-items (new + retry), а не заниженное.
+        waiting-items (new + pending), а не заниженное.
+        total_waiting = count_by_state("new") + pending_count.
         """
         from newsbot.pipeline import NewsPipeline
         from unittest import mock
@@ -2169,10 +2196,10 @@ class TestOffPeakGate:
             with mock.patch("newsbot.pipeline.is_llm_allowed_now", return_value=False):
                 p.run_cycle_with_delivery()
 
-        # лог содержит реальное число ожидающих items (1 recovered + 0 stuck = 1)
+        # лог содержит реальное число waiting items: 1 new + 1 pending = 2
         assert any(
-            "1 items ждут off-peak" in r.message for r in caplog.records
-        ), f"Ожидался счётчик 1 в логе. Записи: {[r.message for r in caplog.records]}"
+            "2 items ждут off-peak" in r.message for r in caplog.records
+        ), f"Ожидался счётчик 2 в логе. Записи: {[r.message for r in caplog.records]}"
 
         s.close()
 

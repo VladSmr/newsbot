@@ -6,6 +6,7 @@
     python -m pytest tests -q -p no:randomly 2>&1 | tail -20
 """
 import pytest
+import httpx
 
 from newsbot.llm.filter import route
 from newsbot.llm.prompts import (
@@ -272,3 +273,277 @@ def test_cap_constants_defined():
     """MAX_PROMPT_TITLE_CHARS и MAX_PROMPT_SUMMARY_CHARS определены."""
     assert MAX_PROMPT_TITLE_CHARS == 200
     assert MAX_PROMPT_SUMMARY_CHARS == 800
+
+
+# ─────────────────────────────────────────────────────────────────
+# Minor-фикс #1: get_balance — is_available при битом/пустом балансе
+# ─────────────────────────────────────────────────────────────────
+
+class TestGetBalanceAvailability:
+    """get_balance: невалидный/отсутствующий total_balance → is_available=False."""
+
+    def test_missing_total_balance_is_unavailable(self):
+        """total_balance=None → is_available=False."""
+        from newsbot.llm.client import DeepSeekClient
+        from unittest.mock import patch, MagicMock
+
+        raw_response = {
+            "balance_infos": [
+                {"currency": "CNY"}  # нет total_balance
+            ]
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = raw_response
+
+        client = DeepSeekClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="test",
+            max_retries=1,
+        )
+
+        with patch.object(client, "_get", return_value=mock_response):
+            result = client.get_balance()
+
+        assert result.is_available is False, \
+            "При отсутствующем total_balance is_available должен быть False"
+
+    def test_invalid_total_balance_is_unavailable(self):
+        """total_balance = нечисловая строка → is_available=False."""
+        from newsbot.llm.client import DeepSeekClient
+        from unittest.mock import patch, MagicMock
+
+        raw_response = {
+            "balance_infos": [
+                {"currency": "CNY", "total_balance": "not-a-number"}
+            ]
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = raw_response
+
+        client = DeepSeekClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="test",
+            max_retries=1,
+        )
+
+        with patch.object(client, "_get", return_value=mock_response):
+            result = client.get_balance()
+
+        assert result.is_available is False, \
+            "При невалидном total_balance is_available должен быть False"
+
+    def test_valid_balance_is_available(self):
+        """Валидный total_balance → is_available=True."""
+        from newsbot.llm.client import DeepSeekClient
+        from unittest.mock import patch, MagicMock
+
+        raw_response = {
+            "balance_infos": [
+                {"currency": "CNY", "total_balance": 10.5}
+            ]
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = raw_response
+
+        client = DeepSeekClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="test",
+            max_retries=1,
+        )
+
+        with patch.object(client, "_get", return_value=mock_response):
+            result = client.get_balance()
+
+        assert result.is_available is True
+        assert result.total_balance == 10.5
+        assert result.currency == "CNY"
+
+    def test_api_is_available_flag_honored(self):
+        """Флаг is_available из ответа API учитывается."""
+        from newsbot.llm.client import DeepSeekClient
+        from unittest.mock import patch, MagicMock
+
+        raw_response = {
+            "is_available": False,  # API говорит — недоступно
+            "balance_infos": [
+                {"currency": "CNY", "total_balance": 5.0}
+            ]
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = raw_response
+
+        client = DeepSeekClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="test",
+            max_retries=1,
+        )
+
+        with patch.object(client, "_get", return_value=mock_response):
+            result = client.get_balance()
+
+        # API явно сказал False — принимаем
+        assert result.is_available is False, \
+            "Флаг is_available из API должен учитываться"
+
+    def test_api_is_available_true_honored(self):
+        """Флаг is_available=True из API — принимается."""
+        from newsbot.llm.client import DeepSeekClient
+        from unittest.mock import patch, MagicMock
+
+        raw_response = {
+            "is_available": True,
+            "balance_infos": [
+                {"currency": "CNY", "total_balance": 5.0}
+            ]
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = raw_response
+
+        client = DeepSeekClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="test",
+            max_retries=1,
+        )
+
+        with patch.object(client, "_get", return_value=mock_response):
+            result = client.get_balance()
+
+        assert result.is_available is True
+
+    def test_nan_total_balance_is_unavailable(self):
+        """total_balance=NaN → is_available=False (math.isfinite check)."""
+        from newsbot.llm.client import DeepSeekClient
+        from unittest.mock import patch, MagicMock
+
+        raw_response = {
+            "balance_infos": [
+                {"currency": "CNY", "total_balance": float("nan")}
+            ]
+        }
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = raw_response
+
+        client = DeepSeekClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="test",
+            max_retries=1,
+        )
+
+        with patch.object(client, "_get", return_value=mock_response):
+            result = client.get_balance()
+
+        assert result.is_available is False, \
+            "total_balance=NaN should result in is_available=False"
+
+    def test_inf_total_balance_is_unavailable(self):
+        """total_balance=inf → is_available=False (math.isfinite check)."""
+        from newsbot.llm.client import DeepSeekClient
+        from unittest.mock import patch, MagicMock
+
+        for value in (float("inf"), float("-inf")):
+            raw_response = {
+                "balance_infos": [
+                    {"currency": "CNY", "total_balance": value}
+                ]
+            }
+
+            mock_response = MagicMock()
+            mock_response.json.return_value = raw_response
+
+            client = DeepSeekClient(
+                api_key="test-key",
+                base_url="https://api.deepseek.com",
+                model="test",
+                max_retries=1,
+            )
+
+            with patch.object(client, "_get", return_value=mock_response):
+                result = client.get_balance()
+
+            assert result.is_available is False, (
+                f"total_balance={value} should result in is_available=False"
+            )
+
+
+# ─────────────────────────────────────────────────────────────────
+# Minor-фикс #2: 429 на последней попытке — нет sleep
+# ─────────────────────────────────────────────────────────────────
+
+class Test429LastAttemptNoSleep:
+    """429 на последней попытке: sleep НЕ вызывается (break вместо continue)."""
+
+    def test_last_attempt_429_no_sleep(self):
+        """При 429 на последней попытке time.sleep не вызывается.
+
+        429-sleep вызывается ДО continue, поэтому фиксируем параметр sleep,
+        чтобы отличить 429-wait от backoff (429-wait растёт как 2**attempt,
+        backoff = 2**(attempt-1)). Убеждаемся что на последней попытке
+        429-sleep отсутствует.
+        """
+        from newsbot.llm.client import DeepSeekClient, LLMError
+        from unittest.mock import patch, MagicMock
+        import time
+
+        client = DeepSeekClient(
+            api_key="test-key",
+            base_url="https://api.deepseek.com",
+            model="test",
+            max_retries=2,
+        )
+
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {}
+        mock_response.text = "rate limited"
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "429", request=MagicMock(), response=mock_response
+        )
+
+        call_count = 0
+
+        def fake_post(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return mock_response
+
+        # Record sleep calls in order: deterministically track which call index
+        # corresponds to which retry attempt.
+        sleep_calls: list = []
+
+        def fake_sleep(duration):
+            """
+            Deterministic sleep recorder.
+
+            Real client.py: range(1, max_retries+1) with max_retries=2 → attempts [1, 2].
+            No retry-after header → wait = 2**attempt.
+              - attempt 1: wait=2, sleep(2) if 1 < 2 → YES (429-wait)
+              - attempt 2: wait=4, 2 < 2? NO → break, NO sleep (last attempt)
+            Expected: 2 POST calls, 1 sleep call with duration=2.
+            """
+            sleep_calls.append(duration)
+
+        with patch.object(client._http, "post", side_effect=fake_post):
+            with patch.object(time, "sleep", fake_sleep):
+                with pytest.raises(LLMError):
+                    client.chat_json(system="sys", user="user")
+
+        # 2 POST attempts (range(1, 3))
+        assert call_count == 2, f"Expected 2 calls, got {call_count}"
+
+        # Only 1 sleep: 429-wait after attempt 1. No sleep after attempt 2 (last).
+        assert sleep_calls == [2], (
+            f"Expected exactly [2] sleep call (429-wait after attempt 1), "
+            f"got {sleep_calls}"
+        )

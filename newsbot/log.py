@@ -5,6 +5,8 @@ import logging
 import re
 import sys
 from collections.abc import Mapping
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from newsbot.version import __version__
 
@@ -131,7 +133,8 @@ def _minimal_sanitizer_handler() -> None:
 def setup_logging(cfg: dict) -> None:
     """
     Конфигурирует корневой логгер и обработчики.
-    cfg = {"level": "INFO", "format": "..."}
+    cfg = {"level": "INFO", "format": "...", "file": "data/logs/newsbot.log"}
+    Добавляет RotatingFileHandler (если указан file) и StreamHandler (stderr).
     """
     level_str = cfg.get("level", "INFO").upper()
     level = getattr(logging, level_str, logging.INFO)
@@ -139,10 +142,24 @@ def setup_logging(cfg: dict) -> None:
         "format",
         "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s",
     )
+    file_path = cfg.get("file")
 
     # корневой handler — stderr
     root = logging.getLogger()
     root.setLevel(level)
+
+    # NIT-фикс: закрываем старые хендлеры перед очисткой.
+    # Без этого RotatingFileHandler держит открытый file descriptor →
+    # на повторном setup_logging (re-init) файл не переоткрывается, а
+    # старый handler пишет в закрытый файл (--- Logging error --- на Windows).
+    # flush() сбрасывает буфер на диск; close() освобождает дескриптор.
+    # removeHandler вызывается ДО close для корректного завершения ротейшна.
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+        if hasattr(h, 'flush'):
+            h.flush()
+        if hasattr(h, 'close'):
+            h.close()
     root.handlers.clear()
 
     # T4-фикс: Formatter санирует exc_text — LogRecord.exc_text вычисляется
@@ -154,6 +171,23 @@ def setup_logging(cfg: dict) -> None:
             text = super().format(record)
             return _sanitize(text)
 
+    # ── file handler (ротируемый) ──────────────────────────────────
+    if file_path:
+        log_file = Path(file_path)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            str(log_file),
+            maxBytes=5 * 1024 * 1024,  # 5 МБ
+            backupCount=3,
+            encoding="utf-8",  # NIT-фикс: на Windows без этого emoji/CJK → Logging error (cp1251)
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(SanitizingFormatter(fmt))
+        file_handler.addFilter(VersionFilter())
+        file_handler.addFilter(TokenSanitizer())
+        root.addHandler(file_handler)
+
+    # ── stderr handler ──────────────────────────────────────────────
     handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(level)
     handler.setFormatter(SanitizingFormatter(fmt))

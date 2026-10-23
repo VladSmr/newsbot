@@ -640,7 +640,7 @@ class TestConsoleDeliveryIgnoresFeedback:
         cd = ConsoleDelivery()
         # не должно бросить исключение
         result = cd.send_batch([item])
-        assert result == ["https://x.com"]
+        assert result == (["https://x.com"], [])
 
     def test_console_delivery_no_error_without_fbtid(self):
         """ConsoleDelivery.send_batch работает и без feedback_target_id."""
@@ -657,7 +657,7 @@ class TestConsoleDeliveryIgnoresFeedback:
 
         cd = ConsoleDelivery()
         result = cd.send_batch([item])
-        assert result == ["https://x.com"]
+        assert result == (["https://x.com"], [])
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -415,7 +415,10 @@ class DeepSeekClient:
                         self.max_retries,
                         wait,
                     )
-                    time.sleep(wait)
+                    # Minor-фикс: на ПОСЛЕДНЕЙ попытке не спим —
+                    # sleep впустую тратит до 120 с перед выходом из цикла.
+                    if attempt < self.max_retries:
+                        time.sleep(wait)
                     last_exc = e
                     continue
                 elif 500 <= status < 600:
@@ -534,19 +537,46 @@ class DeepSeekClient:
 
             currency = str(entry.get("currency", ""))
             raw_balance = entry.get("total_balance")
+
+            # Minor-фикс: при отсутствующем или невалидном total_balance
+            # возвращаем is_available=False — чтобы pipeline не слал ложный
+            # алерт «баланс 0.0» (логика та же, что и для пустого balance_infos
+            # выше по коду — пустой balance ≠ ошибка, но и не валидный баланс).
             if raw_balance is None:
-                total_balance = 0.0
+                logger.warning("total_balance отсутствует в ответе баланса")
+                return BalanceInfo(is_available=False, currency="", total_balance=0.0)
+
+            try:
+                total_balance = float(raw_balance)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Некорректное значение total_balance: %r", raw_balance
+                )
+                return BalanceInfo(is_available=False, currency="", total_balance=0.0)
+
+            # FIX-5-5: NaN/inf из ответа баланса (float("NaN") / float("inf"))
+            # проходят без исключения, но is_available=True, total_balance=nan.
+            # math.isfinite отсекает оба случая.
+            if not math.isfinite(total_balance):
+                logger.warning(
+                    "total_balance невалиден (NaN/inf): %r", raw_balance
+                )
+                return BalanceInfo(is_available=False, currency="", total_balance=0.0)
+
+            # Учитываем is_available из ответа API (если есть).
+            # DeepSeek API иногда возвращает поле is_available — оно точно
+            # отражает доступность средств (в отличие от пустого balance_infos
+            # или нулевого total_balance, которые могут быть битым ответом).
+            api_available = raw.get("is_available")
+            if isinstance(api_available, bool):
+                is_available = api_available
             else:
-                try:
-                    total_balance = float(raw_balance)
-                except (TypeError, ValueError):
-                    logger.warning(
-                        "Некорректное значение total_balance: %r", raw_balance
-                    )
-                    total_balance = 0.0
+                # Если поля нет или оно не bool — принимаем как валидный ответ,
+                # is_available=True (средства доступны по балансу).
+                is_available = True
 
             return BalanceInfo(
-                is_available=True,
+                is_available=is_available,
                 currency=currency,
                 total_balance=total_balance,
             )

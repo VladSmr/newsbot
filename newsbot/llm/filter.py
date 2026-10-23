@@ -12,7 +12,8 @@ from .client import DeepSeekClient, LLMError, LLMTruncationError, BalanceInfo
 from .prompts import (
     SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT,
     build_feedback_block, build_batch_user_message, sanitize_item_field,
-    DEDUP_SYSTEM_PROMPT, build_dedup_user_message,
+    DEDUP_SYSTEM_PROMPT, build_dedup_user_message, build_dedup_context_message,
+    BuildDedupContext,
     MAX_PROMPT_TITLE_CHARS, MAX_PROMPT_SUMMARY_CHARS, LANG_MARKER,
 )
 
@@ -57,6 +58,7 @@ class FilterResult:
     reason: str = ""
     urgent: bool = False
     cost_blocked: bool = False
+    location: str = ""  # LLM-extracted location, English, canonical
 
 
 # ----------------------------------------------------------------------
@@ -647,12 +649,16 @@ class LLMFilter:
                     urgent = False
                 # остальное → False
 
+            # ── location (Задача: LLM вместо словаря) ──────────────────
+            location = str(item_raw.get("location") or "").strip()
+
             results[index] = FilterResult(
                 ok=True,
                 score=score,
                 summary=summary,
                 reason=reason,
                 urgent=urgent,
+                location=location,
             )
 
         return results
@@ -1067,12 +1073,18 @@ class LLMFilter:
                 urgent = False
             # всё остальное (включая пустую строку, None и т.п.) → False
 
+        # ── location (Задача: LLM вместо словаря) ──────────────────────
+        # LLM возвращает каноничное название места на английском.
+        # Пустая строка / отсутствие → '' (глобальная/непонятная тема).
+        location = str(raw.get("location") or "").strip()
+
         return FilterResult(
             ok=True,
             score=score,
             summary=summary,
             reason=reason,
             urgent=urgent,
+            location=location,
         )
 
     # ── detect_duplicates ─────────────────────────────────────────────────────────
@@ -1097,6 +1109,10 @@ class LLMFilter:
         Битые/несуществующие индексы в ответе → игнорируются.
         Если кандидатов < 2 → вызов не делается, возвращается пустое множество.
 
+        Cross-chunk dedup: результаты предыдущих чанков (kept leaders + duplicates)
+        передаются следующему чанку как CONTEXT. Это позволяет обнаруживать
+        кросс-чанковые дубли (например, RU-версия в чанке 1, EN-версия в чанке 2).
+
         Parameters
         ----------
         items : List[NewsItem]
@@ -1109,7 +1125,8 @@ class LLMFilter:
         -------
         Set[int]
             0-based индексы items, которые являются дубликатами
-            БОЛЕЕ РАННЕЙ новости (из основного списка или из recent).
+            БОЛЕЕ РАННЕЙ новости (из основного списка, из recent,
+            или из kept leaders предыдущих чанков).
             Пустое множество — ошибка или кандидатов < 2.
         """
         if len(items) < 2:
@@ -1128,6 +1145,9 @@ class LLMFilter:
             return set()
 
         all_dup_indices: Set[int] = set()
+        # Накапливаемый контекст предыдущих чанков (kept leaders + dup items).
+        # Каждый следующий чанк видит ВСЕ результаты предыдущих чанков.
+        all_ctx: BuildDedupContext = BuildDedupContext(kept=[], dup=[])
 
         # Чанкование: не более _DEDUP_CHUNK_SIZE кандидатов на вызов
         for chunk_start in range(0, len(items), self._DEDUP_CHUNK_SIZE):
@@ -1153,7 +1173,7 @@ class LLMFilter:
                 self._log_cost_blocked_pending()
                 break
 
-            user_message = build_dedup_user_message(chunk, recent)
+            user_message = build_dedup_user_message(chunk, recent, ctx=all_ctx)
 
             usage_before = self._usage_totals()
             try:
@@ -1184,6 +1204,52 @@ class LLMFilter:
             )
             all_dup_indices.update(dup_indices)
 
+            # ── Cross-chunk context accumulation ─────────────────────────────────
+            # После успешной обработки чанка накапливаем его результаты
+            # в контексте для следующих чанков:
+            #   - kept: все non-dup items чанка → лидеры для будущих чанков
+            #   - dup: все dup items чанка с привязкой к их kept-оригиналам
+            #     (в пределах того же чанка — лидеры не в all_dup_indices)
+            chunk_dup_set = dup_indices  # Set[int] 0-based within full list
+
+            # MAJOR 1-фикс: ведём абсолютный индекс по items (не внутренний
+            # итератор range). Ключевая ошибка была: items[item_idx - chunk_start]
+            # при item_idx=chunk_start+1 для чанка 2 давало items[1] из чанка 1
+            # (всего чанк=2, items уже содержит данные чанка 1 → неправильное
+            # совпадение); для чанка 3+ items[:chunk_size] не содержал предыдущие
+            # чанки → контекст был пуст.
+            # Фикс: используем abs_idx (= item_idx) как абсолютный индекс в items,
+            # а chunk_local = abs_idx - chunk_start для доступа к chunk[].
+            for abs_idx in range(chunk_start, chunk_start + len(chunk)):
+                item = items[abs_idx]  # MAJOR 1-фикс: абсолютный индекс в items
+
+                if abs_idx in chunk_dup_set:
+                    # Дубль: привязываем к kept-лидеру (MAJOR 1-фикс: C/D numbering).
+                    # Вариант «без «duplicate of Cx»» — храним только title/source
+                    # дубля для контекста, LLM сопоставит по заголовку итак,
+                    # а разъехавшиеся номера C при наличии пропусков между чанками
+                    # больше невозможны (C-нумерация сквозная, enumerate(start=1)
+                    # во всех чанках, а kept.id — абсолютный; без привязки
+                    # «duplicate of Cx» контекст остаётся корректным).
+                    all_ctx.dup.append({
+                        "id": abs_idx,
+                        "title": item.title,
+                        "source": getattr(item, "source", ""),
+                        # MAJOR 3-фикс: summary/url не выводятся в промпт
+                        # (build_dedup_context_message использует только title+source),
+                        # хранить их в all_ctx нет смысла — экономия памяти при N→∞.
+                        # original_id убран: без «duplicate of Cx» в промпте
+                        # привязка не нужна, а её вычисление ломалось на кросс-чанках.
+                    })
+                else:
+                    # Kept item — лидер для будущих чанков
+                    all_ctx.kept.append({
+                        "id": abs_idx,
+                        "title": item.title,
+                        "source": getattr(item, "source", ""),
+                        # MAJOR 3-фикс: summary/url не выводятся в промпт.
+                    })
+
         logger.debug(
             "LLM-дедуп: %d/%d кандидатов помечены дубликатами",
             len(all_dup_indices), len(items),
@@ -1203,19 +1269,11 @@ class LLMFilter:
         Невалидная структура → пустое множество.
 
         Minor #4-фикс — защита от «самоссылки» / лидера чанка:
-          (a) Guard лидера: первый item чанка (chunk_offset+1 в 1-based) НЕ может
+          (a) Guard лидера первого чанка (chunk_offset=0, idx=1 1-based) НЕ может
               быть помечен как дубль — у него нет «более раннего» в чанке.
-              LLM может вернуть индекс первого item (ошибка модели или спам),
-              иначе первый item чанка никогда не выжил бы для других как «ранний».
-          (b) Guard пустого чанка: если модель пометила ВСЕ items чанка как дубли
-              (например, весь чанк = дубликаты recent-новостей) — оставляем хотя бы
-              первый item чанка (он станет «лидером» в next-цикле). Иначе все items
-              получат skipped/deferred и информация о событии потеряется.
-
-        Риск: осознанный компромисс. Если событие полностью описано одним
-        item из чанка и он помечен как дубль — событие потеряется для пуша.
-        Это приемлемо: дедуп рассчитан на пары (A/B), а не на полное
-        совпадение всего чанка. Защита (b) гарантирует: минимум 1 item выживает.
+              Для чанков 2+ лидер (chunk_offset) МОЖЕТ быть кросс-чанковым
+              дублем (реальный кейс: RU-версия события в чанке 1, EN-версия
+              в чанке 2 — лидер чанка 2 помечается дублем чанка 1).
 
         Parameters
         ----------
@@ -1273,19 +1331,15 @@ class LLMFilter:
                 # несуществующий индекс — игнорируем
                 continue
 
-            # Guard (a): лидер чанка (idx=1 1-based) не пропускается как дубль,
-            # потому что у него нет «более раннего» в пределах этого чанка.
-            # LLM может вернуть 1 по ошибке или спаму.
-            #
-            # Осознанный компромисс: лидер чанка (в т.ч. кросс-цикловый дубль-
-            # лидер) не может быть помечен дублем. Это защищает от ложного скипа
-            # ценой пропуска кросс-циклового дубля-лидера. Риск принят: выигрыш
-            # от защиты (A/B-пары не теряют «ранний» item) превышает редкий
-            # пропуск дубля-лидера.
-            if idx == 1:
+            # Guard (a): лидер первого чанка (idx=1, chunk_offset=0) не пропускается
+            # как дубль — у него нет «более раннего» в пределах этого чанка.
+            # Для чанков 2+ лидер (idx=1 1-based = chunk_offset в 0-based) МОЖЕТ
+            # быть кросс-чанковым дублем kept-лидера из предыдущего чанка
+            # (реальный кейс: RU-версия события в чанке 1, EN-версия в чанке 2).
+            if chunk_offset == 0 and idx == 1:
                 logger.debug(
-                    "LLM-дедуп: модель пометила лидера чанка (1-based idx=1) как "
-                    "дубль — игнорируем (защита от самоссылки)",
+                    "LLM-дедуп: модель пометила лидера первого чанка "
+                    "(1-based idx=1) как дубль — игнорируем (защита от самоссылки)",
                 )
                 continue
 

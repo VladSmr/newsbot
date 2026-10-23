@@ -16,7 +16,7 @@ state-машина:
       seen_titles периодически purge'ится по expires_at.
 
   NOTE: штатный дедуп — навсегда (URL хранится, пока существует запись).
-  Автоочистка: purge_* процедуры удаляют записи старше retention (default 90 дней).
+  Автоочистка: purge_* процедуры удаляют записи старше retention (default 1 день).
   Для больших таблиц (сотни тысяч строк) рекомендуется периодический
   PRAGMA incremental_vacuum для высвобождения pages — штатный VACUUM заблокирует
   БД на время перезаписи. auto_vacuum=INCREMENTAL выставляется при создании БД.
@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Generator, List, Optional, Set
 
 from .collector import NewsItem
+from .urlnorm import normalize_url
 
 logger = logging.getLogger("newsbot.storage")
 
@@ -96,9 +97,9 @@ class Storage:
     Идемпотентность: user_version выставляется ПОСЛЕ успешной миграции.
     """
 
-    SCHEMA_VERSION = 13
+    SCHEMA_VERSION = 14
     STATES = ("new", "pending", "delivered", "skipped", "deferred", "failed", "digested")
-    DEFAULT_RETENTION_DAYS = 90
+    DEFAULT_RETENTION_DAYS = 1
     DEFAULT_RETRY_THRESHOLD_SECONDS = 60
     # Лимит попыток для retry: terminal state при исчерпании.
     DEFAULT_MAX_RETRIES = 8
@@ -261,6 +262,7 @@ class Storage:
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 source      TEXT    NOT NULL,
                 url         TEXT    NOT NULL,
+                url_norm    TEXT,
                 title       TEXT    NOT NULL,
                 summary     TEXT    NOT NULL,
                 published   TEXT,
@@ -406,7 +408,7 @@ class Storage:
     def _create_indexes(self, conn: sqlite3.Connection) -> None:
         """Создаёт индексы. IntegrityError = дубли в old data, логируем явно."""
         for stmt in (
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_url ON items(url)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_url_norm ON items(url_norm)",
             "CREATE INDEX IF NOT EXISTS idx_items_state ON items(state)",
             "CREATE INDEX IF NOT EXISTS idx_items_state_at ON items(state_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_seen_title_source "
@@ -1054,6 +1056,98 @@ class Storage:
                         raise
                     logger.info("v13: колонка lang уже существует (конкурентный процесс)")
 
+        # (к) v14: url_norm TEXT — нормализованный URL для URL-based дедупа.
+        # UNIQUE INDEX по url_norm склеивает utm/без utm в одну запись.
+        # Для свежих БД колонка + индекс создаются в _create_indexes (в новой схеме).
+        if "items" in existing_tables:
+            current_items_cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(items)"
+            ).fetchall()}
+            if "url_norm" not in current_items_cols:
+                try:
+                    conn.execute("ALTER TABLE items ADD COLUMN url_norm TEXT")
+                    logger.info("Миграция v14: добавлена колонка items.url_norm")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+                    logger.info("v14: колонка url_norm уже существует (конкурентный процесс)")
+
+            # Backfill: заполняем url_norm для существующих записей.
+            # Идемпотентен (при повторном запуске — уже заполнено).
+            # MAJOR 3-фикс: keyset-пагинация вместо open cursor на UPDATE-таблице.
+            # SQLite undefined behaviour при SELECT по открытому курсору той же
+            # таблицы с последующим UPDATE (строки могут быть пропущены).
+            # При rowid > last_rowid — детерминированный порядок, без пропусков.
+            # Пачками по 10000 — безопасно для больших таблиц.
+            last_rowid = 0
+            while True:
+                batch = conn.execute(
+                    "SELECT rowid, url FROM items "
+                    "WHERE rowid > ? AND url_norm IS NULL "
+                    "ORDER BY rowid LIMIT 10000",
+                    (last_rowid,),
+                ).fetchall()
+                if not batch:
+                    break
+                rows_to_update = [(normalize_url(orig_url), rowid)
+                                  for rowid, orig_url in batch]
+                conn.executemany(
+                    "UPDATE items SET url_norm = ? WHERE rowid = ?",
+                    rows_to_update,
+                )
+                last_rowid = batch[-1][0]
+
+            # MAJOR 3-фикс: создание индекса ДО удаления старого.
+            # Если CREATE UNIQUE INDEX падает (дубли по нормализованному URL),
+            # старый индекс idx_items_url остаётся нетронутым — защита от
+            # «БД без unique-индекса по URL». При IntegrityError:
+            # логируем actionable-сообщение (какие именно дубли мешают) и
+            # НЕ устанавливаем user_version=14 — миграция повторится после
+            # ручной дедупликации (DROP дубликатов вручную или автоматически).
+            try:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_url_norm "
+                    "ON items(url_norm)"
+                )
+                # Индекс успешно создан — безопасно дропать старый.
+                conn.execute("DROP INDEX IF EXISTS idx_items_url")
+                logger.info("v14: idx_items_url → idx_items_url_norm")
+                # NOTE: user_version=14 выставляется ВЫЗЫВАЮЩИМ кодом
+                # после успешного commit. Здесь мы только меняем схему.
+            except sqlite3.IntegrityError as e:
+                # Приводим url_norm к множеству чтобы найти дубликата.
+                dup_rows = conn.execute(
+                    "SELECT url_norm, COUNT(*) AS cnt, MIN(rowid) AS keep_rowid "
+                    "FROM items WHERE url_norm IS NOT NULL "
+                    "GROUP BY url_norm HAVING cnt > 1"
+                ).fetchall()
+                dup_list = [f"'{r[0]}' ({r[1]} rows, keep rowid={r[2]})"
+                            for r in dup_rows]
+                logger.error(
+                    "v14: CREATE UNIQUE INDEX idx_items_url_norm НЕ создан "
+                    "(конфликт данных: нормализованные URL неуникальны). "
+                    "Дубликаты по нормализованному URL: %s. "
+                    "Старый индекс idx_items_url сохранён. "
+                    "Для продолжения — удалите дубликаты вручную: "
+                    "Вариант A (безопасный, рекомендуется): "
+                    "UPDATE items SET url_norm = NULL WHERE rowid NOT IN ("
+                    "  SELECT MIN(rowid) FROM items GROUP BY url_norm"
+                    "  HAVING url_norm IS NOT NULL"
+                    "); — строки с NULL-url_norm остаются (SQLite UNIQUE не конфликтует с NULL). "
+                    "Вариант B (полный DELETE): "
+                    "DELETE FROM items WHERE rowid NOT IN ("
+                    "  SELECT MIN(rowid) FROM items GROUP BY url_norm"
+                    "  HAVING url_norm IS NOT NULL"
+                    ") AND url_norm IS NOT NULL; "
+                    "Затем повторите миграцию (user_version=13). "
+                    "Исключение поднято — user_version НЕ обновлён.",
+                    "; ".join(dup_list) if dup_list else str(e),
+                )
+                # Re-raise: user_version останется 13 → миграция повторится
+                # после ручной дедупликации. НЕ удаляем старый индекс
+                # (IF EXISTS), чтобы при повторном apply старый idx всё ещё был.
+                raise
+
         conn.commit()
 
     # ------------------------------------------------------------------
@@ -1074,9 +1168,12 @@ class Storage:
         """
         conn = self._connect()
 
+        # (a) URL dedup по нормализованному ключу: склеивает utm/без utm,
+        # порядок параметров, fragment и т.п. в одну запись в БД.
+        url_norm = normalize_url(item.url)
         row = conn.execute(
-            "SELECT 1 FROM items WHERE url = ? LIMIT 1",
-            (item.url,),
+            "SELECT 1 FROM items WHERE url_norm = ? LIMIT 1",
+            (url_norm,),
         ).fetchone()
         if row:
             return True
@@ -1120,18 +1217,22 @@ class Storage:
         # БД/UNIQUE-индекс и уходил в LLM (оплата токенов).
         title = item.title[:MAX_TITLE_CHARS] if item.title else item.title
 
+        # Нормализованный URL (ключ дедупа — см. is_duplicate и v14 миграцию).
+        url_norm = normalize_url(item.url)
+
         try:
             with self._tx() as conn:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO items
-                    (source, url, title, summary, published, tags, cluster_key, lang,
-                     fetched_at, state, state_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
+                    (source, url, url_norm, title, summary, published, tags, cluster_key,
+                     lang, fetched_at, state, state_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
                     """,
                     (
                         item.source,
                         item.url,
+                        url_norm,
                         title,
                         summary,
                         item.published,
@@ -1222,17 +1323,19 @@ class Storage:
                     summary = item.summary[:MAX_SUMMARY_CHARS]
                     title = item.title[:MAX_TITLE_CHARS] if item.title else item.title
                     normalized = item.title_normalized()
+                    url_norm = normalize_url(item.url)
 
                     cur = conn.execute(
                         """
                         INSERT OR IGNORE INTO items
-                        (source, url, title, summary, published, tags, cluster_key, lang,
-                         fetched_at, state, state_at, retry_count)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, 0)
+                        (source, url, url_norm, title, summary, published, tags, cluster_key,
+                         lang, fetched_at, state, state_at, retry_count)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, 0)
                         """,
                         (
                             item.source,
                             item.url,
+                            url_norm,
                             title,
                             summary,
                             item.published,
@@ -1344,6 +1447,7 @@ class Storage:
         self,
         max_age_seconds: int = None,
         max_retries: int = None,
+        limit: int = None,
     ) -> List[NewsItem]:
         """
         Возвращает items state='pending' старше max_age_seconds
@@ -1356,6 +1460,10 @@ class Storage:
         Элементы с retry_count >= max_retries попадают ВРУЧНУЮ в recover_stuck_pending,
         который снимает их сразу (без ожидания 60 с) — recover вызывается
         ДО get_stuck_pending на старте цикла.
+
+        Args:
+            limit: макс. число возвращаемых items (защита RAM при большом backlog).
+                   None — без лимита.
         """
         if max_age_seconds is None:
             max_age_seconds = self.DEFAULT_RETRY_THRESHOLD_SECONDS
@@ -1365,8 +1473,7 @@ class Storage:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
         ).isoformat()
-        rows = conn.execute(
-            """
+        sql = """
             SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at,
                    llm_score, llm_summary, llm_reason, llm_urgent, retry_count
             FROM items
@@ -1374,9 +1481,12 @@ class Storage:
               AND state_at < ?
               AND retry_count < ?
             ORDER BY id ASC
-            """,
-            (cutoff, max_retries),
-        ).fetchall()
+            """
+        params: tuple = (cutoff, max_retries)
+        if limit is not None:
+            sql += "\n LIMIT ?"
+            params = (cutoff, max_retries, limit)
+        rows = conn.execute(sql, params).fetchall()
         return self._rows_to_items(rows, with_retry_count=True)
 
     def increment_retry_count(self, urls: List[str]) -> int:
@@ -1855,9 +1965,10 @@ class Storage:
     ) -> int:
         """
         Батчевое сохранение результатов LLM-оценки.
-        records — список dict: {url, score, summary, reason, urgent?, filtered_at?}
+        records — список dict: {url, score, summary, reason, urgent?, cluster_key?, filtered_at?}
         Если record содержит ключ 'urgent' (bool) — он пишется в llm_urgent (INTEGER 0/1).
-        Для обратной совместимости отсутствие ключа 'urgent' не меняет llm_urgent.
+        Если record содержит ключ 'cluster_key' (str) — он пишется в cluster_key.
+        Для обратной совместимости отсутствие ключа не меняет соответствующее поле.
         Возвращает количество обновлённых строк.
         """
         if not records:
@@ -1867,40 +1978,78 @@ class Storage:
         try:
             with self._tx() as conn:
                 for rec in records:
+                    cluster_key = rec.get("cluster_key")
                     urgent = rec.get("urgent")
                     if urgent is not None:
-                        cur = conn.execute(
-                            """
-                            UPDATE items
-                            SET llm_score = ?, llm_summary = ?, llm_reason = ?,
-                                llm_urgent = ?, filtered_at = ?
-                            WHERE url = ?
-                            """,
-                            (
-                                rec["score"],
-                                rec["summary"],
-                                rec["reason"],
-                                1 if urgent else 0,
-                                rec.get("filtered_at") or now_iso,
-                                rec["url"],
-                            ),
-                        )
+                        if cluster_key is not None:
+                            cur = conn.execute(
+                                """
+                                UPDATE items
+                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
+                                    llm_urgent = ?, filtered_at = ?, cluster_key = ?
+                                WHERE url = ?
+                                """,
+                                (
+                                    rec["score"],
+                                    rec["summary"],
+                                    rec["reason"],
+                                    1 if urgent else 0,
+                                    rec.get("filtered_at") or now_iso,
+                                    cluster_key,
+                                    rec["url"],
+                                ),
+                            )
+                        else:
+                            cur = conn.execute(
+                                """
+                                UPDATE items
+                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
+                                    llm_urgent = ?, filtered_at = ?
+                                WHERE url = ?
+                                """,
+                                (
+                                    rec["score"],
+                                    rec["summary"],
+                                    rec["reason"],
+                                    1 if urgent else 0,
+                                    rec.get("filtered_at") or now_iso,
+                                    rec["url"],
+                                ),
+                            )
                     else:
-                        cur = conn.execute(
-                            """
-                            UPDATE items
-                            SET llm_score = ?, llm_summary = ?, llm_reason = ?,
-                                filtered_at = ?
-                            WHERE url = ?
-                            """,
-                            (
-                                rec["score"],
-                                rec["summary"],
-                                rec["reason"],
-                                rec.get("filtered_at") or now_iso,
-                                rec["url"],
-                            ),
-                        )
+                        if cluster_key is not None:
+                            cur = conn.execute(
+                                """
+                                UPDATE items
+                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
+                                    filtered_at = ?, cluster_key = ?
+                                WHERE url = ?
+                                """,
+                                (
+                                    rec["score"],
+                                    rec["summary"],
+                                    rec["reason"],
+                                    rec.get("filtered_at") or now_iso,
+                                    cluster_key,
+                                    rec["url"],
+                                ),
+                            )
+                        else:
+                            cur = conn.execute(
+                                """
+                                UPDATE items
+                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
+                                    filtered_at = ?
+                                WHERE url = ?
+                                """,
+                                (
+                                    rec["score"],
+                                    rec["summary"],
+                                    rec["reason"],
+                                    rec.get("filtered_at") or now_iso,
+                                    rec["url"],
+                                ),
+                            )
                     total += cur.rowcount
             return total
         except Exception as e:
@@ -2588,19 +2737,21 @@ class Storage:
         MAX_SUMMARY_CHARS = 6000
         summary = item.summary[:MAX_SUMMARY_CHARS]
         title = item.title[:MAX_TITLE_CHARS] if item.title else item.title
+        url_norm = normalize_url(item.url)
 
         try:
             with self._tx() as conn:
                 cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO items
-                    (source, url, title, summary, published, tags, cluster_key, lang,
-                     fetched_at, state, state_at, retry_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', ?, 0)
+                    (source, url, url_norm, title, summary, published, tags, cluster_key,
+                     lang, fetched_at, state, state_at, retry_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'skipped', ?, 0)
                     """,
                     (
                         item.source,
                         item.url,
+                        url_norm,
                         title,
                         summary,
                         item.published,

@@ -357,17 +357,23 @@ class TestCrossSourceExactDedup(unittest.TestCase):
             _cleanup_db(path)
 
     def test_cross_source_window_respected(self):
-        """Кросс-источниковый дедуп работает только в пределах window_days."""
+        """
+        Кросс-источниковый дедуп работает только в пределах window_days.
+        Тестируется через filter_new (реальный путь), а не is_duplicate,
+        чтобы исполнялась кросс-источниковая ветка (dedup.py:527-546).
+        """
         path = _tmp_db()
         try:
             cfg = {"cross_source": True, "fuzzy": False, "window_days": 3}
             st = Storage(Path(path), dedup_config=cfg)
 
+            # Старая новость: 5 дней назад (за пределами window_days=3)
             item1 = _mk_item(title="Breaking News", source="SourceA",
                              url="https://a.com/1")
             st.save(item1)
+            st.set_state([item1.url], "delivered")
 
-            # Подвинем fetched_at вручную на 5 дней назад
+            # Подвигаем fetched_at в seen_titles на 5 дней назад
             import sqlite3
             conn = sqlite3.connect(path)
             old_date = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
@@ -378,11 +384,17 @@ class TestCrossSourceExactDedup(unittest.TestCase):
             conn.commit()
             conn.close()
 
-            # После подвигания fetched_at за пределы window — дубля быть не должно
+            # Кандидат с другим URL/источником, близкий к item1
             item2 = _mk_item(title="Breaking News", source="SourceB",
                              url="https://b.com/2")
-            self.assertFalse(st.is_duplicate(item2),
-                "Дубль за пределами window_days не должен детектиться")
+            # filter_new: проверяем реальную кросс-источниковую ветку
+            new_items, total, dup = filter_new([item2], st, dedup_config=cfg)
+
+            # За пределами window_days → дубль НЕ отклоняется (window не срабатывает)
+            self.assertEqual(dup, 0,
+                "Новость за пределами window_days не должна отклоняться как кросс-дубль")
+            self.assertEqual(len(new_items), 1,
+                "Кандидат с другим URL/источником должен пройти")
 
             st.close()
         finally:
@@ -1081,6 +1093,11 @@ class TestDedupNoNPlusOne(unittest.TestCase):
     def test_dedup_logic_unchanged(self):
         """
         M2 не меняет логику дедупа: те же дубли отклоняются, те же проходят.
+        Fuzzy-дубль отклоняется через filter_new (реальный путь), а не через
+        is_duplicate — чтобы исполнялась fuzzy-ветка, а не URL-дедуп.
+        Пары с ratio≥0.95 (SequenceMatcher):
+          'bitcoin fell to 60000 dollars' vs 'bitcoin fell to 60000 dollars on'
+          → ratio=0.951 ≥ 0.95, числа совпадают, Jaccard=1.0 → дубль.
         """
         path = _tmp_db()
         try:
@@ -1088,27 +1105,28 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                    "token_threshold": 0.8, "window_days": 3}
             st = Storage(Path(path), dedup_config=cfg)
 
-            # Прошлая новость: близкий заголовок (должен отфильтроваться по fuzzy)
+            # Прошлая новость: базовый заголовок
             past = _mk_item(
-                title="Российская армия сбила 34 дрона на юге страны",
+                title="bitcoin fell to 60000 dollars",
                 source="Src2",
                 url="https://past.com/1",
             )
             st.save(past)
             st.set_state([past.url], "delivered")
 
-            # Текущий кандидат: похожий заголовок
+            # Текущий кандидат: тот же заголовок с минимальным дополнением.
+            # ratio≈0.951 ≥ 0.95 → fuzzy-дубль. НЕ сохраняем вручную.
             current = _mk_item(
-                title="Сбито 34 беспилотника в южных регионах РФ",
+                title="bitcoin fell to 60000 dollars on",
                 source="Src1",
                 url="https://current.com/1",
             )
-            st.save(current)
+            # НЕ st.save(current) — filter_new сам сохраняет не-дубли
 
             new_items, total, dup = filter_new([current], st, dedup_config=cfg)
 
             # fuzzy dedup с threshold=0.95 должен отклонить
-            # (те же числа "34", близкие токены, высокий ratio)
+            # (те же числа "60000", высокий ratio≈0.951, Jaccard=1.0)
             self.assertEqual(dup, 1, "Fuzzy дубль должен быть отклонён")
             self.assertEqual(len(new_items), 0, "Новых items не осталось")
             st.close()

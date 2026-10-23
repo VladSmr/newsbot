@@ -26,8 +26,10 @@ deferred-items (до max_items сообщений с ретраями Telegram A
 """
 
 
+import hashlib
 import logging
 import math
+import re
 import time as _time
 from datetime import datetime, timedelta, timezone as tz
 from email.utils import parsedate_to_datetime as _parsedate_to_dt
@@ -215,6 +217,59 @@ def _normalize_digest_times(raw) -> List[tuple]:
     return slots
 
 
+def normalize_location(location: Optional[str]) -> str:
+    """
+    Нормализует location-строку для группировки (cap по локации).
+
+    MAJOR 5-фикс: лёгкая канонизация БЕЗ словаря алиасов.
+
+    Схема нормализации:
+      1. strip() + lowercase.
+      2. Пунктуация с пробелами вокруг → ", " (схлопывает "Moscow  Russia" в
+         "Moscow, Russia"; убирает trailing punctuation "Moscow, Russia.").
+      3. Trailing запятые/точки → убираются.
+      4. Leading "the " (case-insensitive) → убирается.
+
+    Принцип: LLM-инструкция в промпте задаёт формат; нормализация снимает
+    вариации капитализации, лишние пробелы и trailing punctuation.
+    Для ОДНОГО места LLM должен возвращать ОДНУ и ту же строку в пределах
+    одного цикла — это контролируется промптом, а не словарём.
+
+    Parameters
+    ----------
+    location : str or None
+        Строка от LLM.
+
+    Returns
+    -------
+    str
+        Нормализованная строка (lowercase, без trailing punctuation/пробелов).
+        Пустая входная строка → "" (вызывающий сам решает → 'other').
+    """
+    if not location:
+        return ""
+    s = location.strip()
+    if not s:
+        return ""
+    # lowercase
+    s = s.lower()
+    # ПОРЯДОК ВАЖЕН: сначала схлопываем пробелы, потом punctuation.
+    # Иначе "Moscow  Russia" (double-space, нет запятой) проходит step 1
+    # без изменений и только схлопывает пробел → "Moscow Russia" (без запятой).
+    # Сначала space collapse:
+    s = re.sub(r"[ \t]+", " ", s)
+    # Теперь punctuation с возможными пробелами вокруг → ", "
+    # (схлопывает ";", ".", "," и варианты "x  ,  y" → "x, y")
+    s = re.sub(r"\s*[.,;]\s*", ", ", s)
+    # Trailing точки и запятые (с возможными пробелами перед ними)
+    s = re.sub(r"[ \t]*[.][ \t]*$", "", s)
+    s = re.sub(r"[ \t]*[,][ \t]*$", "", s)
+    s = s.strip(" \t")
+    # Leading "the " — артикль не несёт семантики
+    s = re.sub(r"^(the)\s+", "", s, flags=re.IGNORECASE)
+    return s
+
+
 def _loc_day_key(item) -> Optional[tuple]:
     """
     (локация, день) из cluster_key или None, если item не попадает
@@ -231,7 +286,7 @@ def _loc_day_key(item) -> Optional[tuple]:
     if not cluster_key:
         return None
     parts = cluster_key.split('|')
-    location = parts[0]
+    location = (parts[0] if parts else 'other').strip().lower()
     if location == 'other':
         return None
     pub_day = parts[2] if len(parts) > 2 else 'unknown'
@@ -330,6 +385,120 @@ def _infer_category(item) -> str:
     return 'other'
 
 
+def _build_cluster_key_base(
+    location: str, stem: Optional[str], published: Optional[str],
+    title: Optional[str] = None,
+) -> str:
+    """
+    Внутренняя реализация сборки cluster_key.
+    Публичная обёртка build_cluster_key экспортируется для совместимости
+    (ранее — locations.build_cluster_key).
+    """
+    pub_day = published[:10] if (published and len(published) >= 10) else "unknown"
+    if stem:
+        return f"{location}|{stem}|{pub_day}"
+    else:
+        if title:
+            title_hash = hashlib.md5(title.encode()).hexdigest()[:12]
+        else:
+            title_hash = hashlib.md5(b"").hexdigest()[:12]
+        return f"{location}|nostem:{title_hash}|{pub_day}"
+
+
+# Публичная обёртка — заменяет locations.build_cluster_key.
+# Используется в тестах и для обратной совместимости.
+def build_cluster_key(
+    location: str, stem: Optional[str], published: Optional[str],
+    title: Optional[str] = None,
+) -> str:
+    """
+    Собирает cluster_key из компонентов.
+
+    Parameters
+    ----------
+    location : str
+        Каноническое название места (English). Нормализуется: lowercase + strip.
+    stem : str or None
+        Стем-хеш из title. None → nostem по title.
+    published : str or None
+        Дата в любом формате (используется первые 10 символов как YYYY-MM-DD).
+    title : str, optional
+        Исходный title для nostem-per-title hash.
+
+    Returns
+    -------
+    str
+        cluster_key: ``location|stem|day`` или ``location|nostem:hash|day``
+    """
+    # Нормализация: location всегда lowercase+strip для единообразия
+    loc = location.strip().lower() if location else ""
+    return _build_cluster_key_base(loc, stem, published, title)
+
+
+def rebuild_cluster_key(
+    llm_location: str, old_cluster_key: Optional[str],
+) -> str:
+    """
+    Пересобирает cluster_key с LLM-локацией вместо словарной.
+
+    Первые два аргумента (локация и stem) теперь разнесены по времени:
+    локация приходит от LLM ПОСЛЕ скоринга, stem вычислен при ингесте
+    и закодирован в old_cluster_key.
+
+    Для items без старого cluster_key возвращается ключ с LLM-локацией
+    и nostem (пустой title hash). Для items с пустой LLM-локацией →
+    'other' (cap не применяется — глобальные/непонятные темы).
+
+    Parameters
+    ----------
+    llm_location : str
+        Каноничное название места от LLM (English, max-specific).
+        Пустая строка = глобальная/непонятная тема.
+    old_cluster_key : str or None
+        Cluster_key, вычисленный при ингесте. Части stem и pub_day
+        используются повторно.
+
+    Returns
+    -------
+    str
+        Новый cluster_key: ``normalized_location|stem_or_nostem|pub_day``
+
+    MAJOR 5-фикс: нормализация локации.
+      (a) Промпт LLM запрашивает каноничный формат (english, «City, Country»);
+          разные написания «Moscow», «MOSCOW», «Moscow, Russia», «Россия, Москва»
+          должны давать одну строку.
+      (b) Лёгкая нормализация: strip → lowercase → схлопывание множественных
+          пробелов/запятых/точек. Без словаря алиасов — LLM-инструкция
+          в промпте задаёт формат.
+      (c) Ключ = нормализованная строка (полностью). Одинаковое место →
+          одинаковый ключ → cap работает.
+    """
+    # (b) Лёгкая нормализация: normalize_location — strip/lower/collapse spaces/punct.
+    #   «Moscow, Russia» → «moscow, russia»
+    #   «Moscow  Russia» → «moscow, russia»  (double-space collapsed, comma added)
+    #   «moscow , russia» → «moscow russia»  (trailing comma stripped)
+    #   «Moscow, Russia.» → «moscow, russia» (trailing dot stripped)
+    #   «The Moscow, Russia» → «moscow, russia» (leading the stripped)
+    loc_norm = normalize_location(llm_location)
+
+    if not loc_norm:
+        loc_norm = "other"
+
+    if old_cluster_key:
+        parts = old_cluster_key.split("|")
+        stem = parts[1] if len(parts) > 1 else ""
+        pub_day = parts[2] if len(parts) > 2 else "unknown"
+    else:
+        stem = ""
+        pub_day = "unknown"
+
+    if stem:
+        return f"{loc_norm}|{stem}|{pub_day}"
+    else:
+        title_hash = hashlib.md5(b"").hexdigest()[:12]
+        return f"{loc_norm}|nostem:{title_hash}|{pub_day}"
+
+
 def _cap_by_location(
     items: List[NewsItem],
     max_per_location: int = 2,
@@ -383,7 +552,7 @@ def _cap_by_location(
             continue
 
         parts = cluster_key.split('|')
-        location = parts[0] if parts else 'other'
+        location = (parts[0] if parts else 'other').strip().lower()
         pub_day = parts[2] if len(parts) > 2 else 'unknown'
 
         # bucket 'other' is not capped
@@ -605,6 +774,10 @@ class NewsPipeline:
         self._max_retries = int(
             config.get("database", {}).get("max_retries", Storage.DEFAULT_MAX_RETRIES)
         )
+        # лимит stuck-pending для get_stuck_pending (защита RAM от большого backlog)
+        self._stuck_pending_limit = int(
+            config.get("database", {}).get("stuck_pending_limit", 500)
+        )
 
         # кеш фидбэка для few-shot (Фаза 2c); fetched один раз за цикл
         self._feedback_context: Optional[tuple] = None
@@ -650,7 +823,7 @@ class NewsPipeline:
         off-peak, normal) — единая точка (DRY).
         """
         self.storage.purge_seen_titles()
-        retention = self.config.get("database", {}).get("retention_days", 90)
+        retention = self.config.get("database", {}).get("retention_days", 1)
         feedback_ret = self.config.get("feedback", {}).get("retention_days", 180)
         deferred_ret = self.config.get("database", {}).get(
             "deferred_retention_days",
@@ -1039,15 +1212,14 @@ class NewsPipeline:
         # останавливаемся до LLM/доставки/дайджеста/алертов.
         if self._is_paused():
             total_new_items_count = self.storage.count_by_state("new")
-            pending_items = self.storage.get_stuck_pending(
-                max_age_seconds=threshold,
-                max_retries=self._max_retries,
-            )
-            total_waiting = total_new_items_count + len(pending_items)
+            # FIX-3: вызываем count_by_state вместо get_stuck_pending() без limit
+            # (get_stuck_pending без limit грузит ВСЕ зависшие pending в RAM).
+            pending_count = self.storage.count_by_state("pending")
+            total_waiting = total_new_items_count + pending_count
             logger.info(
                 "PAUSED gate: обработка пропущена, %d items ждут возобновления "
                 "(new=%d, pending=%d)",
-                total_waiting, total_new_items_count, len(pending_items),
+                total_waiting, total_new_items_count, pending_count,
             )
             # очистка ВЫПОЛНЯЕТСЯ (purge не зависит от LLM/доставки)
             self._cleanup()
@@ -1055,11 +1227,10 @@ class NewsPipeline:
 
         if self._off_peak_only and not is_llm_allowed_now(self._off_peak_only):
             # вычисляем реальное число ожидающих items до return
-            stuck_items = self.storage.get_stuck_pending(
-                max_age_seconds=threshold,
-                max_retries=self._max_retries,
-            )
-            total_waiting = len(all_items) + len(stuck_items)
+            # FIX-3: вызываем count_by_state вместо get_stuck_pending() без limit
+            # (get_stuck_pending без limit грузит ВСЕ зависшие pending в RAM).
+            pending_count = self.storage.count_by_state("pending")
+            total_waiting = self.storage.count_by_state("new") + pending_count
             logger.info(
                 "off-peak gate: сейчас пик DeepSeek — LLM-обработка пропущена, "
                 "%d items ждут off-peak",
@@ -1100,6 +1271,7 @@ class NewsPipeline:
         stuck = self.storage.get_stuck_pending(
             max_age_seconds=threshold,
             max_retries=self._max_retries,
+            limit=getattr(self, "_stuck_pending_limit", 500),
         )
 
         if stuck:
@@ -1131,8 +1303,13 @@ class NewsPipeline:
             # Fresh retry: бюджет по-старому (минимум половины или len, кламп)
             retry_budget: int
             if stuck_fresh:
-                retry_budget = max(self._llm_calls_left // 2, len(stuck_fresh))
-                retry_budget = min(retry_budget, self._llm_calls_left)
+                # B13-фикс: резервируется ≥½ бюджета, но свежие кандидаты
+                # никогда не получают 0 при left>0 (даже если fresh_items > left//2).
+                # FIX-4: max(..., 1) применяется только если left > 0 (иначе 0).
+                if self._llm_calls_left > 0:
+                    retry_budget = min(max(self._llm_calls_left // 2, 1), len(stuck_fresh))
+                else:
+                    retry_budget = 0
                 if stuck_scored:
                     logger.info(
                         "B13: retry fresh %d items — бюджет %d/%d",
@@ -1248,10 +1425,18 @@ class NewsPipeline:
             if len(items) > budget:
                 logger.warning(
                     "LLM-бюджет %d/%d: обрабатываем первые %d items, "
-                    "остальные %d — pending (retry в след.цикле)",
+                    "остальные %d — back to 'new' (retry в след.цикле)",
                     budget, self._max_per_cycle, budget, len(items) - budget,
                 )
                 items_to_llm = items[:budget]
+                excess_urls = [i.url for i in items[budget:]]
+                if excess_urls:
+                    self.storage.set_state(excess_urls, "new")
+                    logger.debug(
+                        "Бюджетный срез: %d items возвращены в state='new' "
+                        "(retry_count сохранён)",
+                        len(excess_urls),
+                    )
 
             # batch_size из конфига; 1 = поштучный режим (всегда evaluate)
             batch_size = max(1, int(self.config.get("llm", {}).get("batch_size", 10)))
@@ -1301,12 +1486,21 @@ class NewsPipeline:
 
                     # M1: собираем результаты, но НЕ применяем route() сразу —
                     # сначала вычислим cluster-max, потом применим.
+                    # Задача: пересобираем cluster_key с LLM-локацией.
                     for item, res in zip(fresh_batch, batch_results):
                         # сохраняем результат в item (всегда, даже ok=False)
                         item.llm_score = res.score
                         item.llm_summary = res.summary
                         item.llm_reason = res.reason
                         item._batch_result = res
+                        # Пересобираем cluster_key с LLM-локацией.
+                        # Res.ok=False: LLM-ошибка → location='', rebuild даст 'other'.
+                        # Это безопасно: cap не применяется к 'other'.
+                        new_key = rebuild_cluster_key(
+                            getattr(res, "location", "") or "",  # defensive
+                            getattr(item, "cluster_key", None),
+                        )
+                        item.cluster_key = new_key
 
             logger.debug("LLM-вызовов за батч: %d", llm_call_count)
 
@@ -1418,19 +1612,31 @@ class NewsPipeline:
                     )
 
         try:
-            delivered_urls = self.delivery.send_batch(to_deliver)
+            delivered_urls, permanent_failed_urls = self.delivery.send_batch(to_deliver)
             if delivered_urls:
                 self.storage.set_state(delivered_urls, "delivered")
-                not_delivered = [i.url for i in to_deliver
-                                 if i.url not in delivered_urls]
-                if not_delivered:
-                    logger.info(
-                        "Доставлено %d/%d items; %d не доставлено (pending → retry)",
-                        len(delivered_urls), len(to_deliver), len(not_delivered),
-                    )
-            else:
-                not_delivered = [i.url for i in to_deliver]
-                logger.info("Доставлено 0 items (items остаются pending)")
+            # FIX-1: permanent_failed_urls → state='failed' напрямую (без retry_count).
+            # По образцу mark_failed_if_retries_exhausted / set_state('failed')
+            # в существующем коде (pipeline.py:2088, 2224, 2283).
+            if permanent_failed_urls:
+                self.storage.set_state(permanent_failed_urls, "failed")
+                logger.info(
+                    "Доставлено %d/%d items; %d permanent-failed (→ state='failed')",
+                    len(delivered_urls), len(to_deliver), len(permanent_failed_urls),
+                )
+            not_delivered = [i.url for i in to_deliver
+                             if i.url not in delivered_urls
+                             and i.url not in set(permanent_failed_urls)]
+            if not_delivered:
+                logger.info(
+                    "Доставлено %d/%d items; %d не доставлено (pending → retry)",
+                    len(delivered_urls), len(to_deliver), len(not_delivered),
+                )
+            elif not permanent_failed_urls:
+                logger.info(
+                    "Доставлено %d/%d items",
+                    len(delivered_urls), len(to_deliver),
+                )
         except (ChatIdNotBoundError, BotBlockedError) as e:
             # P1-фикс: ПОСТОЯННАЯ ошибка конфигурации/доступа, а не транзиентная.
             # ChatIdNotBoundError/BotBlockedError — подклассы TelegramDeliveryError,
@@ -1466,7 +1672,7 @@ class NewsPipeline:
         ]
         if excess_urls:
             logger.debug(
-                "Бюджетный срез: %d items не получили обработки → pending (retry в след.цикле)",
+                "Бюджетный срез: %d items срезаны → 'new' (retry в след.цикле)",
                 len(excess_urls),
             )
         # NOTE: excess_urls НЕ добавляются в failed_urls.
@@ -1514,6 +1720,7 @@ class NewsPipeline:
                     "summary": "",
                     "reason": "",
                     "urgent": False,
+                    "cluster_key": getattr(item, "cluster_key", None),
                 })
             else:
                 to_deliver.append(item)
@@ -1530,6 +1737,7 @@ class NewsPipeline:
                 "summary": res.summary,
                 "reason": res.reason,
                 "urgent": res.urgent,
+                "cluster_key": getattr(item, "cluster_key", None),
             })
         elif r == "digest":
             deferred_urls.append(item.url)
@@ -1539,6 +1747,7 @@ class NewsPipeline:
                 "summary": res.summary,
                 "reason": res.reason,
                 "urgent": res.urgent,
+                "cluster_key": getattr(item, "cluster_key", None),
             })
         else:
             # r == "push"
@@ -1550,6 +1759,7 @@ class NewsPipeline:
                 "summary": res.summary,
                 "reason": res.reason,
                 "urgent": res.urgent,
+                "cluster_key": getattr(item, "cluster_key", None),
             })
 
     def _check_and_mark_failed(self, failed_retry_urls: List[str]) -> None:

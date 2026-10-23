@@ -96,13 +96,15 @@ llm_score не тратят бюджет, few-shot блок в промпте) �
     читает оригинальные (не нормализованные) заголовки из `items` table
     (исключая `skipped/failed`), лимит 20 по умолчанию.
 
-**State-машина (v11):** new / pending / delivered / skipped / deferred / failed / digested.
+**State-машина (v13):** new / pending / delivered / skipped / deferred / failed / digested.
 `retry_count` INTEGER DEFAULT 0 в БД. При исчерпании retry_count >= max_retries
 → 'failed' (терминальный). Recovery C2: зависшие 'pending' с retry_count
 >= лимитом → 'failed' на старте цикла.
-Purge: 'new' + delivered/skipped/failed/digested старше retention_days (90).
-'deferred': отдельное окно `deferred_retention_days` (14 дней) — старые неотправленные
+Purge: 'new' старше 7 дней + delivered/skipped/failed/digested старше retention_days (1 день).
+'deferred': отдельное окно `deferred_retention_days` (3 дня) — старые неотправленные
 отложенные удаляются (критично для VPS 1 GB RAM; раньше копились бесконечно).
+**Осознанное решение владельца:** retention_days=1 и deferred_retention_days=3
+(не 90/14) — старые новости не нужны, хранилище экономится.
 'pending' — не удаляется (активный retry).
 K1-recovery ограничен `recovery_new_limit` (500) — при долгой паузе 'new' накапливались
 и загружались в RAM целиком.
@@ -110,12 +112,15 @@ K1-recovery ограничен `recovery_new_limit` (500) — при долго�
 и терминализируются при исчерпании лимита — at-least-once для candidates.
 skipped: LLM-фильтр (score<5) + кросс-источниковые дубли (уровни 1/2).
 
-**Схема БД v11** (SCHEMA_VERSION=11):
-- `items`: id, source, url, title, summary, published, fetched_at,
+**Схема БД v14** (SCHEMA_VERSION=14):
+- `items`: id, source, url, **url_norm TEXT (v14)**, title, summary, published, fetched_at,
   state, state_at, llm_score, llm_summary, llm_reason, **llm_urgent INTEGER 0/1 (v10/v11)**,
-  filtered_at, retry_count.
+  filtered_at, retry_count, **tags TEXT (v4), cluster_key TEXT (v12), lang TEXT (v13)**.
   `llm_urgent` — персистентный флаг срочности; восстанавливается на retry.
   Legacy-строки (до v10) с `llm_urgent=NULL` → `urgent=False` (безопасный дефолт).
+  `tags` — json-список `<category>` из фида (в `cluster_key` не входит).
+  `cluster_key` = `{location}|{stem_hash}|{pub_day}` (fallback: `nostem:{md5(title)}`);
+  используется для 2-часового доменного дедупа (всегда включён, не конфигурируется).
 - `seen_titles`: title_hash, source, fetched_at, expires_at,
   title_normalized (TTL 30 дн.; v9 для fuzzy).
 - `meta`: key TEXT PRIMARY KEY, value TEXT (для llm_balance_last_check,
@@ -270,6 +275,36 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - `test_llm_routing` — LLM routing
 - `test_digest_retry` — digest retry
 
+## Поведение, принятое владельцем (не менять без согласования)
+
+| Что | Решение | Где |
+|-----|---------|-----|
+| Retention: 7 дней (временно), deferred: 3 дня | Временно для отладки, откат одной строкой (было 1) | config.yaml |
+| Ночные сводки БПЛА без разрушений | Намеренно получают score 1–3, фильтруются | LLM-скоринг, SYSTEM_PROMPT |
+| Off-peak окна (01–04 и 06–10 UTC будни, выходные целиком) | Соответствуют официальному прайсу DeepSeek от 10.09.2026 | config.yaml, llm/offpeak.py |
+| Summary всегда на английском | Решение владельца: summary ВСЕГДА EN, независимо от языка статьи | newsbot/llm/prompts.py (SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT) |
+| CORROBORATION CAP (score ≤4) | Неподтверждённые одиночные сводки о жертвах/заявлениях — CAP 4 | newsbot/llm/prompts.py (SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT) |
+| LLM-локация | location извлекается LLM при скоринге; словарь locations.py удалён; cluster_key пересобирается после скоринга | newsbot/llm/prompts.py, pipeline.py |
+| Файловый лог | data/logs/newsbot.log, RotatingFileHandler 5 МБ, backupCount 3 | newsbot/log.py, config.yaml |
+
+## Текущая сессия: важные поведения (отражены в коде)
+
+**Telegram-доставка:**
+- Постоянные 4xx → `PermanentDeliveryError` → item сразу `state='failed'` (без retry_count), батч продолжается. `send_batch` возвращает `(delivered, permanent_failed)`.
+- 429 на последней попытке retry НЕ спит (нет смысла — бюджет исчерпан).
+
+**Retry-очередь:**
+- Очередь stuck pending ограничена `database.stuck_pending_limit=500` (защита RAM).
+- Резерв ≥½ бюджета при left>0: формула `min(max(left//2,1), len(stuck))`. Excess по бюджету возвращается в 'new'.
+
+**Balance-алерт:**
+- `get_balance`: NaN/inf/битый `total_balance` → `is_available=False` (без ложного алерта «баланс 0»).
+
+**LLM-цены:**
+- deepseek-flash верифицированы: off-peak input $0.15/output $0.60 за 1M токенов.
+- deepseek-v4-pro НЕ верифицированы (placeholder input $0.50/output $2.00).
+- Off-peak окна подтверждены официальным прайсом DeepSeek (peak 01–04 и 06–10 UTC будни; выходные целиком off-peak).
+
 ## Фиксы по ревью (краткий список)
 
 | ID    | Что исправлено                                                         |
@@ -327,7 +362,7 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 | R1    | Major #1-фикс: бюджет max_per_cycle считается в items (не в вызовах); списание = len(fresh_batch); B13-резервация согласована; бюджет<0 клампится в 0 |
 | R2    | Major #2-фикс: max_tokens=4096 (ранее 2048); finish_reason=length → LLMError+warning; JSONDecodeError → честный 1 retry (не break); batch_size=1 → evaluate(ok) не падает на finish_reason |
 | M1-INJ | M1-фикс: sanitize_item_field() — санитизация title/summary/source + нейтрализация делимитеров (<\|>/|>) в обоих путях: одиночном (LLMFilter.evaluate) и батчевом (build_batch_user_message) |
-| 2a     | deferred_retention_days: purge deferred по возрасту (14 дней, конфиг); new включён в основной purge; DEFAULT_DEFERRED_RETENTION_DAYS=14 (обоснование: 2 дайджеста/день + запас; критично для VPS 1 GB RAM) |
+| 2a     | deferred_retention_days: purge deferred по возрасту (3 дня, конфиг); new включён в основной purge; DEFAULT_DEFERRED_RETENTION_DAYS=3 (ранее 14; обоснование: 2 дайджеста/день + запас; критично для VPS 1 GB RAM) |
 | 2b     | recovery_new_limit: K1-recovery ограничен лимитом (500, конфиг); get_all_by_state(state, limit=...) не грузит неограниченный объём в RAM при долгой паузе |
 | 2c     | candidates remainder → increment_retry_count + _check_and_mark_failed (at-least-once для кандидатов; раньше retry_count не инкрементировался при сбое TG API) |
 | v10-PC | v10 post-check: defensive ADD COLUMN llm_urgent при user_version=10 без колонки (конкурентная миграция edge case) |

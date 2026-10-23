@@ -233,9 +233,8 @@ def test_push_feedback_unchanged(tmp_path):
     item = _mk_item(title="Push News")
     setattr(item, "feedback_target_id", 42)
 
-    delivered = mock_delivery.send_batch([item])
-
-    assert len(delivered) == 1
+    delivered_urls, _ = mock_delivery.send_batch([item])
+    assert len(delivered_urls) == 1
     calls = mock_delivery._calls
     send_calls = [c for c in calls if c[0] == "sendMessage"]
     assert len(send_calls) == 1

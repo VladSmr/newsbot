@@ -41,57 +41,11 @@ class FakeResponse:
             )
 
 
-class FakeChatCompletion:
-    """Захватывает последний POST-body для assertions."""
-
-    last_request_body: dict = {}
-
-    @classmethod
-    def install(cls, text_response: str, *, status_code: int = 200):
-        import httpx
-
-        def fake_post(url, **kwargs):
-            cls.last_request_body = kwargs.get("json", {})
-            return FakeResponse(
-                {"choices": [{"message": {"content": text_response}}]},
-                status_code=status_code,
-            )
-
-        import newsbot.llm.client as client_module
-        client_module.httpx.Client = FakeClientPost(text_response, status_code)
-        client_module.httpx.Client.post = fake_post
-
-    @classmethod
-    def uninstall(cls):
-        import httpx
-        import newsbot.llm.client as client_module
-        # restore real class
-        client_module.httpx.Client = httpx.Client
-
-
-class FakeClientPost:
-    """Подменяет httpx.Client для POST в DeepSeekClient."""
-
-    def __init__(self, text_response: str, status_code: int = 200):
-        self.text_response = text_response
-        self.status_code = status_code
-
-    def post(self, url, **kwargs):
-        FakeChatCompletion.last_request_body = kwargs.get("json", {})
-        return FakeResponse(
-            {"choices": [{"message": {"content": self.text_response}}]},
-            status_code=self.status_code,
-        )
-
-
 def make_client(model_response: str, *, status_code: int = 200) -> DeepSeekClient:
     """
     Возвращает DeepSeekClient, у которого POST подменён на мок.
     """
-    import httpx
     import newsbot.llm.client as client_module
-
-    original_client_class = client_module.httpx.Client
 
     class _MockClient:
         is_closed = False
@@ -117,7 +71,7 @@ def make_client(model_response: str, *, status_code: int = 200) -> DeepSeekClien
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockClient  # type: ignore
+    _mock_httpx_client(_MockClient)
     client = DeepSeekClient(
         api_key="mock-key-not-logged",
         base_url="https://api.deepseek.com",
@@ -127,9 +81,33 @@ def make_client(model_response: str, *, status_code: int = 200) -> DeepSeekClien
 
 
 def unmock():
-    import httpx
-    import newsbot.llm.client as client_module
-    client_module.httpx.Client = httpx.Client
+    _unmock_httpx()
+
+
+# ─────────────────────────────────────────────────────────────────
+# httpx.Client isolation helpers — always save before replace,
+# always restore unconditionally after each test.
+# ─────────────────────────────────────────────────────────────────
+
+_module_httpx_saved: type = None
+
+
+def _mock_httpx_client(mock_cls: type) -> None:
+    """Save current httpx.Client (once), replace with mock_cls."""
+    import newsbot.llm.client as cm
+    global _module_httpx_saved
+    if _module_httpx_saved is None:
+        _module_httpx_saved = cm.httpx.Client
+    cm.httpx.Client = mock_cls  # type: ignore[assignment]
+
+
+def _unmock_httpx() -> None:
+    """Restore httpx.Client from saved reference (idempotent)."""
+    import newsbot.llm.client as cm
+    global _module_httpx_saved
+    if _module_httpx_saved is not None:
+        cm.httpx.Client = _module_httpx_saved
+        _module_httpx_saved = None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -270,9 +248,6 @@ class TestParseResponseUrgent:
 
     def _parse(self, raw: dict) -> FilterResult:
         """Прямой вызов _parse_response через LLMFilter.evaluate."""
-        import httpx
-        import newsbot.llm.client as client_module
-
         resp_str = json.dumps(raw)
 
         class _Mock:
@@ -296,7 +271,7 @@ class TestParseResponseUrgent:
             def __exit__(s, *args):
                 pass
 
-        client_module.httpx.Client = _Mock  # type: ignore
+        _mock_httpx_client(_Mock)  # type: ignore
         client = DeepSeekClient("key", "https://api.deepseek.com", "model")
         cfg = make_filter_config()
         flt = LLMFilter(cfg, client=client)
@@ -410,7 +385,7 @@ def test_chat_json_invalid_json_raises_llm_error():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockClient  # type: ignore
+    _mock_httpx_client(_MockClient)
 
     client = DeepSeekClient(
         api_key="mock-key",
@@ -459,7 +434,7 @@ def test_chat_json_http_500_retry_then_fail():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockClient500  # type: ignore
+    _mock_httpx_client(_MockClient500)  # type: ignore
 
     client = DeepSeekClient(
         api_key="mock-key",
@@ -527,7 +502,7 @@ def test_chat_json_usage_accumulated():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockUsageClient  # type: ignore
+    _mock_httpx_client(_MockUsageClient)  # type: ignore
 
     client = DeepSeekClient(
         api_key="mock-key",
@@ -582,7 +557,7 @@ def test_chat_json_usage_absent_no_crash():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockNoUsageClient  # type: ignore
+    _mock_httpx_client(_MockNoUsageClient)  # type: ignore
 
     client = DeepSeekClient(
         api_key="mock-key",
@@ -647,7 +622,7 @@ def test_chat_json_usage_deepseek_top_level():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockUsageClient  # type: ignore
+    _mock_httpx_client(_MockUsageClient)  # type: ignore
 
     client = DeepSeekClient(
         api_key="mock-key",
@@ -712,7 +687,7 @@ def test_chat_json_usage_only_cached_hit():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockUsageClient  # type: ignore
+    _mock_httpx_client(_MockUsageClient)  # type: ignore
 
     client = DeepSeekClient(
         api_key="mock-key",
@@ -844,7 +819,7 @@ def test_get_balance_parsed():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockBalanceClient  # type: ignore
+    _mock_httpx_client(_MockBalanceClient)  # type: ignore
 
     client = DeepSeekClient(
         api_key="mock-key",
@@ -884,7 +859,7 @@ def test_get_balance_empty_infos():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockClient  # type: ignore
+    _mock_httpx_client(_MockClient)
     client = DeepSeekClient("key", "https://api.deepseek.com", "model")
 
     try:
@@ -950,7 +925,7 @@ def test_filter_score_9_push():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _Mock  # type: ignore
+    _mock_httpx_client(_Mock)  # type: ignore
     client = DeepSeekClient("key", "https://api.deepseek.com", "model")
     cfg = make_filter_config()
     flt = LLMFilter(cfg, client=client)
@@ -988,7 +963,7 @@ def test_filter_score_6_digest():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _Mock  # type: ignore
+    _mock_httpx_client(_Mock)  # type: ignore
     client = DeepSeekClient("key", "https://api.deepseek.com", "model")
     cfg = make_filter_config()
     flt = LLMFilter(cfg, client=client)
@@ -1026,7 +1001,7 @@ def test_filter_score_4_skip():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _Mock  # type: ignore
+    _mock_httpx_client(_Mock)  # type: ignore
     client = DeepSeekClient("key", "https://api.deepseek.com", "model")
     cfg = make_filter_config()
     flt = LLMFilter(cfg, client=client)
@@ -1063,7 +1038,7 @@ def test_filter_llm_error_returns_ok_false():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _MockError  # type: ignore
+    _mock_httpx_client(_MockError)  # type: ignore
     client = DeepSeekClient("key", "https://api.deepseek.com", "model", max_retries=1)
     cfg = make_filter_config()
     flt = LLMFilter(cfg, client=client)
@@ -1102,7 +1077,7 @@ def test_filter_score_out_of_range_returns_ok_false():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _Mock  # type: ignore
+    _mock_httpx_client(_Mock)  # type: ignore
     client = DeepSeekClient("key", "https://api.deepseek.com", "model")
     cfg = make_filter_config()
     flt = LLMFilter(cfg, client=client)
@@ -1139,7 +1114,7 @@ def test_filter_empty_summary_returns_ok_false():
         def __exit__(s, *args):
             pass
 
-    client_module.httpx.Client = _Mock  # type: ignore
+    _mock_httpx_client(_Mock)  # type: ignore
     client = DeepSeekClient("key", "https://api.deepseek.com", "model")
     cfg = make_filter_config()
     flt = LLMFilter(cfg, client=client)

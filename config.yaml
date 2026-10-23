@@ -120,7 +120,7 @@ poll_interval_minutes: 15
 # --- База данных ---
 database:
   path: data/newsbot.db
-  retention_days: 1        # удалять delivered/skipped/failed/digested + 'new' items старше N дней
+  retention_days: 7        # временно для отладки, откат одной строкой (было 1)
   retry_threshold_sec: 60 # pending считается зависшим через N секунд
   max_retries: 8           # лимит retry попыток → state=failed
   deferred_retention_days: 3  # удалять старые deferred-items старше N дней (не попали в digest).
@@ -128,11 +128,14 @@ database:
                                   # deferred теперь НЕ удаляется при закрытии окна (v1.1.5).
   recovery_new_limit: 500     # макс. 'new'-items, загружаемых в RAM при K1-recovery за один цикл
                                   # (при долгой паузе 'new' накапливаются; лимит защищает RAM)
+  stuck_pending_limit: 500      # макс. 'pending'-items, загружаемых из retry-очереди за один цикл
+                                  # (аналогичная защита RAM от большого backlog)
 
 # --- Логирование ---
 logging:
   level: INFO
   format: "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s"
+  file: data/logs/newsbot.log   # ротируемый файл: 5 МБ, 3 backup-файла
 
 # --- Telegram (заполняется на этапе 2) ---
 telegram:
@@ -244,10 +247,17 @@ llm:
   # B12: system_prompt очищен. Источник истины — newsbot/llm/prompts.py.
   # Раскомментируйте и заполните только для override; иначе используется код.
   # system_prompt: ""
-  # Pricing: USD per 1M tokens (verify current DeepSeek prices before production)
+  # Pricing: USD per 1M tokens (DeepSeek-V4.1-Flash, verified from official price page, effective 10.09.2026)
+  # Структура: {input, output} — flat (peak/off-peak не поддерживается cost-guard'ом filter.py).
+  # Верифицированные данные для DeepSeek-V4.1-Flash:
+  #   Off-Peak: cache_hit=$0.003, cache_miss=$0.15, output=$0.60
+  #   Peak:     cache_hit=$0.006, cache_miss=$0.30, output=$1.20
+  # NOTE: cost-guard (_accumulate_daily_cost) использует {input, output} без разделения
+  # peak/off-peak, поэтому ниже — off-peak цены (они же фактически рабочие при off-peak).
+  # deepseek-v4-pro: прайс-картинка покрывает только Flash — цена не верифицирована.
   pricing:
-    deepseek-flash:  {input: 0.27, output: 1.10}   # TODO: verify with DeepSeek docs
-    deepseek-v4-pro: {input: 0.50, output: 2.00}   # TODO: verify with DeepSeek docs
+    deepseek-flash:  {input: 0.15, output: 0.60}
+    deepseek-v4-pro: {input: 0.50, output: 2.00}   # v4-pro: не верифицировано, прайс-картинка покрывает только Flash
   # Daily cost limit per model (USD per UTC day); 0 = disabled
   # Items exceeding the limit remain pending and retry in the next cycle
   daily_cost_limit: 0.50

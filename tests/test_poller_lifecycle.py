@@ -23,17 +23,17 @@ from newsbot.telegram_io import TelegramPoller
 
 def test_stop_no_second_poller():
     """
-    Minor: stop() при зависшем poll не создаёт второй поллер.
+    Major: stop() при зависшем poll не создаёт второй поллер.
 
     Сценарий:
       — poller.start() запускает поток
-      — _run_loop внутри потока «зависает» (long-poll не отвечает)
-      — stop() вызван: _stop_event.set() + join с достаточным timeout
-      — после join: если поток всё ещё alive — _thread НЕ обнуляется
-      — повторный start() видит что _thread alive и НЕ создаёт новый
+      — _run_loop внутри потока «зависает» (ждёт _stop_event, не time.sleep)
+      — stop(max_join=0.1) ограничивает join → поток остаётся alive,
+        _thread не обнуляется
+      — повторный start() видит alive и НЕ создаёт новый
 
-    Без фикса: join(5) при poll_timeout=25 → поток не успевает,
-    _thread=None → start() создаёт новый поток → 409 Conflict.
+    Фикс: side_effect ждёт poller._stop_event.wait() (не time.sleep),
+    длительность ограничена max_join через patch Thread.join.
     """
     with patch("newsbot.storage.Storage") as MockStorage, \
          patch("newsbot.telegram_io._TgClient") as MockClient:
@@ -43,8 +43,19 @@ def test_stop_no_second_poller():
         MockStorage.return_value = mock_storage
 
         mock_client = MagicMock()
-        # Зависающий getUpdates (не отвечает никогда)
-        mock_client.getUpdates.side_effect = lambda **kwargs: time.sleep(3600)
+
+        poller_holder = {}
+
+        def fake_get_updates(**kwargs):
+            # Ждём _stop_event — детерминированный дедлайн через max_join.
+            # Не time.sleep: это вызывало реальное ожидание 30 с.
+            p = poller_holder.get("poller")
+            if p is not None:
+                p._stop_event.wait(timeout=10.0)
+            time.sleep(0.5)  # имитация минимального poll-overhead
+            return []
+
+        mock_client.getUpdates.side_effect = fake_get_updates
         MockClient.return_value = mock_client
 
         poller = TelegramPoller(
@@ -54,6 +65,7 @@ def test_stop_no_second_poller():
             on_digest=MagicMock(),
             poll_timeout=25,
         )
+        poller_holder["poller"] = poller
 
         # Запускаем — поток стартует
         poller.start()
@@ -62,22 +74,16 @@ def test_stop_no_second_poller():
         assert poller._thread is not None
         assert poller._thread.is_alive()
 
-        # stop() с фиксированным timeout (poll_timeout+5 = 30с)
-        start_stop = time.time()
-        poller.stop()
-        elapsed = time.time() - start_stop
+        # stop(max_join=0.1): join ограничен 0.1 с, поток остаётся alive
+        started = time.monotonic()
+        poller.stop(max_join=0.1)
+        elapsed = time.monotonic() - started
 
-        # join должен был ждать полный timeout (~30 с),
-        # не 5 с как было до фикса
-        assert elapsed >= 25, (
-            f"stop() вернулся слишком быстро ({elapsed:.1f}s) — "
-            f"join timeout слишком короткий"
-        )
-        # Поток всё ещё alive (long-poll не отвечает)
+        assert elapsed < 2.0, f"stop(max_join=0.1) ждал {elapsed:.1f}с"
+        # Поток всё ещё alive (не успел завершиться за 0.1 с)
         assert poller._thread is not None
-        # И он всё ещё alive
         assert poller._thread.is_alive(), (
-            "Поток не должен был завершиться (long-poll завис)"
+            "Поток не должен был завершиться за 0.1 с"
         )
 
         # Повторный start: _thread alive → не создаём новый
@@ -85,14 +91,15 @@ def test_stop_no_second_poller():
             MockThread.return_value = MagicMock()
             MockThread.return_value.start = MagicMock()
             poller.start()
-            # Thread() должен был быть вызван 0 раз (поток ещё alive)
+            # Thread() должен быть вызван 0 раз (поток ещё alive)
             assert MockThread.call_count == 0, (
                 f"start() создал новый Thread при alive _thread: "
                 f"{MockThread.call_count} вызовов"
             )
 
-        # cleanup
-        poller._stop_event.set()  # разбудить long-poll
+        # cleanup: разбудить поток и дождаться завершения
+        poller._stop_event.set()
+        poller.close(join_timeout=5.0)
 
 
 def test_close_waits_for_thread():

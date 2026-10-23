@@ -3,7 +3,7 @@
 ConsoleDelivery - output news to stdout.
 """
 import logging
-from typing import List, Optional, Protocol
+from typing import List, Optional, Protocol, Tuple
 
 from ..storage import NewsItem
 from . import format_time_utc
@@ -14,18 +14,19 @@ logger = logging.getLogger("newsbot.delivery.console")
 class Delivery(Protocol):
     """
     Base delivery protocol.
-    Both implementations return List[str] - URLs of successfully delivered items.
+    Both implementations return Tuple[List[str], List[str]] -
+    (successful_urls, permanent_failed_urls). Console has no permanent failures.
 
     Contract: send_text / send_digest receive text that is ALREADY valid HTML
     (already escaped if necessary). Implementations MUST NOT re-escape it.
     """
 
-    def send(self, items: List[NewsItem]) -> List[str]:
-        """Single send — alias for send_batch."""
+    def send(self, items: List[NewsItem]) -> Tuple[List[str], List[str]]:
+        """Single send — alias for send_batch. Returns (successful_urls, permanent_failed_urls)."""
         ...
 
-    def send_batch(self, items: List[NewsItem]) -> List[str]:
-        """Return List[str]: URLs of successfully delivered items."""
+    def send_batch(self, items: List[NewsItem]) -> Tuple[List[str], List[str]]:
+        """Return Tuple[List[str], List[str]]: (successful_urls, permanent_failed_urls)."""
         ...
 
     def send_text(self, text: str) -> bool:
@@ -49,18 +50,18 @@ class Delivery(Protocol):
 
 
 class ConsoleDelivery(Delivery):
-    def send(self, items: List[NewsItem]) -> List[str]:
-        """Single send - alias for send_batch."""
+    def send(self, items: List[NewsItem]) -> Tuple[List[str], List[str]]:
+        """Single send — alias for send_batch."""
         return self.send_batch(items)
 
-    def send_batch(self, items: List[NewsItem]) -> List[str]:
+    def send_batch(self, items: List[NewsItem]) -> Tuple[List[str], List[str]]:
         """
         Print items to stdout.
-        Return list of URLs of printed items.
-        Contract matches TelegramDelivery: pipeline expects List[str].
+        Return (urls, permanent_failed_urls).
+        Console has no permanent failures — second element is always [].
         """
         if not items:
-            return []
+            return [], []
 
         for item in items:
             body = item.llm_summary if item.llm_summary else item.summary
@@ -80,7 +81,7 @@ class ConsoleDelivery(Delivery):
         print(f"\n{'='*60}  Всего: {len(items)} новостей")
         logger.info("ConsoleDelivery: выведено %d новостей", len(items))
 
-        return [item.url for item in items]
+        return [item.url for item in items], []
 
     def send_text(self, text: str) -> bool:
         """Print text to stdout."""

@@ -104,6 +104,8 @@ def _mk_pipeline(db_path, digest_cfg=None):
         "llm": {"enabled": False},
     }
     p = NewsPipeline(cfg)
+    # Закрываем первое соединение (создано в __init__ из db_path) перед подменой
+    p.storage.close()
     p.storage = Storage(db_path)
     return p
 
@@ -1101,7 +1103,7 @@ class TestBackfillRunningCountsInvariant(unittest.TestCase):
 # =============================================================================
 
 class TestBuildClusterKeyRawTitleHash(unittest.TestCase):
-    """locations.build_cluster_key хеширует СЫРОЙ title (без normalize)."""
+    """pipeline.build_cluster_key хеширует СЫРОЙ title (без normalize)."""
 
     def test_emoji_title_uses_raw_title(self):
         """
@@ -1109,7 +1111,7 @@ class TestBuildClusterKeyRawTitleHash(unittest.TestCase):
         Раньше (normalize → stem fallback): оба дали бы hash от normalize()
         который может совпасть. После фикса: hash от сырого title.
         """
-        from newsbot.locations import build_cluster_key
+        from newsbot.pipeline import build_cluster_key
         key1 = build_cluster_key(
             "France", None, "2026-01-01", title="🤖 AI News 2024",
         )
@@ -1124,7 +1126,7 @@ class TestBuildClusterKeyRawTitleHash(unittest.TestCase):
 
     def test_same_title_same_cluster_key(self):
         """Идентичный title → идентичный cluster_key."""
-        from newsbot.locations import build_cluster_key
+        from newsbot.pipeline import build_cluster_key
         key1 = build_cluster_key(
             "France", None, "2026-01-01", title="Same Headline",
         )

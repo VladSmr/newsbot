@@ -713,11 +713,11 @@ def test_rows_to_items_null_fetched_at_fallback(tmp_path, caplog):
     )
 
 
-def test_delete_items_before_removes_terminal_inside_window(tmp_path):
+def test_delete_items_before_removes_terminal_older_than_cutoff(tmp_path):
     """
     MAJOR 4: delete_items_before(window_start_iso) удаляет ТЕРМИНАЛЬНЫЕ
-    items (delivered/skipped/digested/failed) с fetched_at < window_start_iso.
-    'deferred' и 'skipped' НЕ удаляются delete_items_before.
+    items (delivered/skipped/failed) с fetched_at < window_start_iso.
+    'deferred' НЕ удаляются delete_items_before.
     Тестируем напрямую через Storage (минуя pipeline), чтобы избежать
     сложностей с digest workflow и outdated-fresh fixtures.
     """
@@ -1192,19 +1192,21 @@ def test_purge_items_keeps_fresh_pending_as_pending(tmp_path):
 
 def test_purge_items_negative_retention_does_not_wipe(tmp_path):
     """
-    Major: retention_days=-1 (опечатка) НЕ должен сносить все терминальные
-    items. Отрицательное значение → default (90), а не 0/cutoff=now.
+    Major: retention_days=-1 (опечатка) → default (DEFAULT_RETENTION_DAYS),
+    НЕ падает в исключение и НЕ использует cutoff=now (что снесло бы ВСЕ данные).
+    С DEFAULT_RETENTION_DAYS=1: items старше 1 дня удаляются (expected),
+    но deferred по default=3 сохраняется (отдельный параметр deferred_retention_days).
     """
     db_path = tmp_path / "purge_negative.db"
     s = Storage(db_path)
 
-    # 5 дней: по default 90 — не удаляются; при старом max(days,0)=0 — удалились бы.
-    ts = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+    # 100 дней назад: старше DEFAULT_RETENTION_DAYS=1 → УДАЛЯЮТСЯ (expected)
+    ts = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
     for i, state in enumerate(("delivered", "skipped", "failed", "digested")):
         _insert_hardening_item(
             db_path, state, f"https://neg.example/{i}", f"{state}-item", ts,
         )
-    # deferred 1 день: default deferred_retention=3 → сохраняется.
+    # deferred 1 день назад: default deferred_retention=3 → сохраняется (отказ на -1 → default 3).
     recent_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     _insert_hardening_item(
         db_path, "deferred", "https://neg.example/def", "def", recent_ts,
@@ -1212,12 +1214,14 @@ def test_purge_items_negative_retention_does_not_wipe(tmp_path):
 
     deleted = s.purge_items(retention_days=-1, deferred_retention_days=-1)
 
-    assert deleted == 0, f"retention_days=-1 не должен ничего удалять, deleted={deleted}"
+    # 4 терминальных старше 1 дня — удалились. deferred по default=3 сохранился.
+    assert deleted == 4, f"retention_days=-1 → default 1, 4 items старше 1 дня удалились, deleted={deleted}"
     for i, state in enumerate(("delivered", "skipped", "failed", "digested")):
         row = _fetch_item_row(db_path, f"https://neg.example/{i}")
-        assert row is not None and row["state"] == state, \
-            f"{state} не должен удаляться при retention_days=-1"
-    assert _fetch_item_row(db_path, "https://neg.example/def") is not None
+        assert row is None, f"{state} должен быть удалён (старше 1 дня, default=1)"
+    # deferred живёт по deferred_retention_days=3 (отказ на -1 → default 3)
+    assert _fetch_item_row(db_path, "https://neg.example/def") is not None, \
+        "deferred не должен удаляться при deferred_retention_days=-1 (→ default 3)"
     s.close()
 
 

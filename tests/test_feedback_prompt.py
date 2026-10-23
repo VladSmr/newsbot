@@ -684,7 +684,7 @@ class TestPipelineFeedbackIntegration:
                 pass
 
             def send_batch(self_, items):
-                return [i.url for i in items]
+                return ([i.url for i in items], [])
 
             def send_text(self_, text):
                 return True
@@ -787,7 +787,7 @@ class TestPipelineFeedbackIntegration:
                 pass
 
             def send_batch(self_, items):
-                return [i.url for i in items]
+                return ([i.url for i in items], [])
 
             def send_text(self_, text):
                 return True
@@ -877,7 +877,7 @@ class TestPipelineFeedbackIntegration:
                 pass
 
             def send_batch(self_, items):
-                return [i.url for i in items]
+                return ([i.url for i in items], [])
 
             def send_text(self_, text):
                 return True
@@ -966,7 +966,7 @@ class TestPipelineFeedbackIntegration:
                 pass
 
             def send_batch(self_, items):
-                return [i.url for i in items]
+                return ([i.url for i in items], [])
 
             def send_text(self_, text):
                 return True
@@ -1193,14 +1193,12 @@ class TestLanguageRule:
     """v1.3.0: усиленное правило языка summary — per-item, без перевода в один язык."""
 
     PHRASES = [
-        "Each summary MUST be written in the SAME language as that item's input news text",
-        "MUST get English summaries",
-        "MUST get Russian summaries",
-        "Do NOT translate summaries into a single common language",
+        "LANGUAGE RULE (STRICT)",
+        "ALWAYS in English",
     ]
 
     def test_language_rule_in_both_prompts(self):
-        """Новая формулировка присутствует и в SYSTEM_PROMPT, и в BATCH_SYSTEM_PROMPT."""
+        """v1.4.0: summary ВСЕГДА на английском, правило присутствует в обоих промптах."""
         from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
         for phrase in self.PHRASES:
             assert phrase in SYSTEM_PROMPT, \
@@ -1209,9 +1207,9 @@ class TestLanguageRule:
                 f"'{phrase}' not found in BATCH_SYSTEM_PROMPT"
 
     def test_summary_field_reminder(self):
-        """Напоминание в описании поля summary — в обоих промптах."""
+        """v1.4.0: напоминание о языке summary — в обоих промптах."""
         from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
-        reminder = "do not translate into Russian by default"
+        reminder = "ALWAYS in English"
         assert reminder in SYSTEM_PROMPT
         assert reminder in BATCH_SYSTEM_PROMPT
 

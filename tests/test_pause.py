@@ -14,6 +14,7 @@ tests/test_pause.py — тесты паузы (/stop, /continue).
 import logging
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -78,6 +79,19 @@ def _tmp_db():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     return path
+
+
+def _cleanup_db(path):
+    """Безопасное удаление tmp-файла БД + WAL-мусора (Windows)."""
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(path + suffix)
+        except (FileNotFoundError, PermissionError):
+            time.sleep(0.1)
+            try:
+                os.unlink(path + suffix)
+            except (FileNotFoundError, PermissionError):
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -224,10 +238,7 @@ class TestPipelineIsPaused(unittest.TestCase):
                         self.assertTrue(pipeline._is_paused())
                         pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def test_is_paused_false_when_meta_0(self):
         from newsbot.storage import Storage
@@ -245,10 +256,7 @@ class TestPipelineIsPaused(unittest.TestCase):
                         self.assertFalse(pipeline._is_paused())
                         pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def test_is_paused_false_when_meta_absent(self):
         from newsbot.storage import Storage
@@ -265,10 +273,7 @@ class TestPipelineIsPaused(unittest.TestCase):
                         self.assertFalse(pipeline._is_paused())
                         pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def test_is_paused_exception_safe(self):
         from newsbot.pipeline import NewsPipeline
@@ -317,10 +322,7 @@ class TestPipelinePausedGate(unittest.TestCase):
                         delivery.send_batch.assert_not_called()
                         pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def test_paused_items_remain_new(self):
         """При паузе set_state не вызывается (items остаются в state='new')."""
@@ -361,10 +363,7 @@ class TestPipelinePausedGate(unittest.TestCase):
                         delivery.send_text.assert_not_called()
                         pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def test_paused_cleanup_still_runs(self):
         """При паузе purge_seen_titles и purge_items выполняются."""
@@ -399,10 +398,7 @@ class TestPipelinePausedGate(unittest.TestCase):
                         pipeline.storage = MagicMock()
         finally:
             real_st.close()
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def test_paused_logs_waiting_count(self):
         """При паузе логируется сообщение с PAUSED gate."""
@@ -482,7 +478,7 @@ class TestPipelinePausedGate(unittest.TestCase):
             st.get_stuck_pending = real_st.get_stuck_pending
 
             delivery = MagicMock()
-            delivery.send_batch.return_value = []
+            delivery.send_batch.return_value = ([], [])
             delivery.send_text.return_value = True
 
             with patch.object(NewsPipeline, "_build_llm_filter", return_value=None):
@@ -544,10 +540,7 @@ class TestPipelinePausedGate(unittest.TestCase):
             pipeline.storage = MagicMock()
         finally:
             real_st.close()
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def _make_config(self):
         # NIT: sources=[] чтобы не дёргать реальную сеть через FeedCollector.collect()
@@ -581,7 +574,7 @@ class TestMidBatchPause(unittest.TestCase):
         try:
             cfg = self._make_config_no_llm()
             delivery = MagicMock()
-            delivery.send_batch.return_value = []
+            delivery.send_batch.return_value = ([], [])
 
             with patch.object(NewsPipeline, "_build_llm_filter", return_value=None):
                 with patch.object(NewsPipeline, "_build_delivery", return_value=delivery):
@@ -634,10 +627,7 @@ class TestMidBatchPause(unittest.TestCase):
 
             pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def _make_config_no_llm(self):
         return {
@@ -667,7 +657,7 @@ class TestMidBatchPause(unittest.TestCase):
         try:
             cfg = self._make_config()
             delivery = MagicMock()
-            delivery.send_batch.return_value = []
+            delivery.send_batch.return_value = ([], [])
 
             with patch.object(NewsPipeline, "_build_llm_filter", return_value=None):
                 with patch.object(NewsPipeline, "_build_delivery", return_value=delivery):
@@ -752,10 +742,7 @@ class TestMidBatchPause(unittest.TestCase):
 
             pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def _make_config(self):
         return {
@@ -798,10 +785,7 @@ class TestPausePriorityOverOffpeak(unittest.TestCase):
             delivery.send_text.assert_not_called()
             pipeline.storage = MagicMock()
         finally:
-            try:
-                os.unlink(path)
-            except Exception:
-                pass
+            _cleanup_db(path)
 
     def _make_config(self):
         return {

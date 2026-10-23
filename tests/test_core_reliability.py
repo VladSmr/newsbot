@@ -961,7 +961,8 @@ class _FakeDelivery:
         self.delivered_urls = delivered_urls or []
 
     def send_batch(self, items):
-        return self.delivered_urls
+        # FIX-1: send_batch теперь возвращает Tuple[List[str], List[str]]
+        return (self.delivered_urls, [])
 
 
 class TestProcessBatchC1(unittest.TestCase):
@@ -1229,12 +1230,17 @@ class TestProcessBatchC1(unittest.TestCase):
                 "Срезанный бюджетом item[1] НЕ должен быть в failed_urls")
             self.assertNotIn("https://budget4.com/1", result,
                 "Срезанный бюджетом item[4] НЕ должен быть в failed_urls")
-            # Проверка через Storage: items[1..4] остались pending (не отправлены на delivery)
-            pending_items = {i.url for i in storage.get_all_by_state("pending")}
+            # Major #3-фикс: items[1..4] срезаны бюджетом → возвращаются в state='new'
+            # (не остаются pending навсегда, retry_count сохранён)
+            new_items = {i.url for i in storage.get_all_by_state("new")}
             for i in range(1, 5):
                 url = f"https://budget{i}.com/1"
-                self.assertIn(url, pending_items,
-                    f"item[{i}] ({url}) должен остаться pending")
+                self.assertIn(url, new_items,
+                    f"item[{i}] ({url}) должен быть в state='new' (срезан бюджетом)")
+            # pending должен быть пустой (все items либо delivered, либо back to new)
+            self.assertNotIn("https://budget1.com/1",
+                {i.url for i in storage.get_all_by_state("pending")},
+                "Срезанный item не должен остаться pending")
             storage.close()
         finally:
             _cleanup_db(db_path)
@@ -1291,11 +1297,12 @@ if _HAS_PYTEST:
             p.sources = cfg["sources"]
             p.storage = Storage(Path(db_path))
             p.delivery = MagicMock()
-            p.delivery.send_batch.return_value = []
+            p.delivery.send_batch.return_value = ([], [])
             p.llm_filter = None
             p._max_per_cycle = 150
             p._llm_calls_left = 150
             p._max_retries = 8
+            p._stuck_pending_limit = 500
             p._feedback_context = None
             p._off_peak_only = False
 
@@ -1325,6 +1332,150 @@ if _HAS_PYTEST:
             )
 
             p.storage.close()
+        finally:
+            _cleanup_db(db_path)
+
+
+# =============================================================================
+# Major #1: stuck_pending_limit в get_stuck_pending
+# =============================================================================
+
+class TestStuckPendingLimit(unittest.TestCase):
+    def test_get_stuck_pending_respects_limit(self):
+        """get_stuck_pending возвращает не более limit items."""
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            # 20 pending items
+            for i in range(20):
+                item = _mk_item(title=f"Stuck{i}", url=f"https://stuck{i}.com/1")
+                st.save(item)
+
+            conn = st._connect()
+            conn.execute(
+                "UPDATE items SET state='pending', state_at='2000-01-01T00:00:00+00:00' "
+                "WHERE url LIKE 'https://stuck%.com/1'"
+            )
+            conn.commit()
+            st.close()
+
+            st2 = Storage(Path(path))
+            # limit=5 → возвращается не более 5
+            stuck = st2.get_stuck_pending(max_age_seconds=0, max_retries=8, limit=5)
+            self.assertLessEqual(len(stuck), 5,
+                f"get_stuck_pending(limit=5) должен вернуть ≤5, got {len(stuck)}")
+
+            # Без лимита — все 20
+            stuck_all = st2.get_stuck_pending(max_age_seconds=0, max_retries=8)
+            self.assertEqual(len(stuck_all), 20,
+                f"Без лимита должны вернуться все 20, got {len(stuck_all)}")
+            st2.close()
+        finally:
+            _cleanup_db(path)
+
+
+# =============================================================================
+# Major #3: budget-excess items возвращаются в state='new' (не зависают pending)
+# =============================================================================
+
+class TestExcessItemsBackToNew(unittest.TestCase):
+    def test_budget_excess_set_back_to_new(self):
+        """
+        Items, срезанные бюджетом, возвращаются в state='new'.
+        retry_count сохраняется (не сбрасывается).
+        """
+        import tempfile
+        import os as _os
+
+        fd, db_path = tempfile.mkstemp(suffix=".db")
+        _os.close(fd)
+        _os.unlink(db_path)
+        try:
+            st = Storage(Path(db_path))
+            # Fresh items без llm_score (нужен LLM-фильтр)
+            items = [
+                _mk_item(title=f"B{i}", url=f"https://excess{i}.com/1")
+                for i in range(5)
+            ]
+            for item in items:
+                st.save(item)
+
+            conn = st._connect()
+            # Изначально new (как после save_many), retry_count=2 (уже были в retry)
+            for i in range(5):
+                conn.execute(
+                    "UPDATE items SET retry_count=2 WHERE url=?",
+                    (f"https://excess{i}.com/1",)
+                )
+            conn.commit()
+            st.close()
+
+            # Создаём pipeline с реальным storage
+            from unittest.mock import MagicMock
+            from newsbot.llm.filter import FilterResult
+            from newsbot.pipeline import NewsPipeline
+
+            mock_llm = MagicMock()
+            mock_llm.push_threshold = 7
+            mock_llm.digest_threshold = 5
+            mock_llm.push_urgent_only = False
+
+            def eval_single(item, feedback_context=None):
+                return FilterResult(ok=True, score=10, summary="s", reason="r")
+            mock_llm.evaluate.side_effect = eval_single
+            mock_llm.evaluate_batch.side_effect = (
+                lambda items, feedback_context=None: [
+                    mock_llm.evaluate(item, feedback_context) for item in items
+                ]
+            )
+
+            # Доставляется только item[0]; items[1..4] срезаны бюджетом
+            mock_delivery = MagicMock()
+            mock_delivery.send_batch.return_value = (["https://excess0.com/1"], [])
+
+            st2 = Storage(Path(db_path))
+
+            pipeline = NewsPipeline.__new__(NewsPipeline)
+            pipeline.config = {
+                "database": {"path": db_path, "max_retries": 8},
+                "llm": {"enabled": True, "batch_size": 10},
+                "telegram": {"token": "", "chat_id": ""},
+            }
+            pipeline.sources = []
+            pipeline.storage = st2
+            pipeline.delivery = mock_delivery
+            pipeline.llm_filter = mock_llm
+            pipeline._max_per_cycle = 150
+            pipeline._llm_calls_left = 150
+            pipeline._max_retries = 8
+            pipeline._feedback_context = None
+
+            # budget=1 → только item[0] обработан; items[1..4] → back to 'new'
+            result = pipeline._process_batch(items, budget_override=1)
+
+            # Items[1..4] не в failed_urls (не дошли до delivery)
+            self.assertNotIn("https://excess1.com/1", result)
+            self.assertNotIn("https://excess4.com/1", result)
+
+            # Items[1..4] → state='new'
+            new_items = {i.url for i in st2.get_all_by_state("new")}
+            for i in range(1, 5):
+                url = f"https://excess{i}.com/1"
+                self.assertIn(url, new_items,
+                    f"{url} должен быть в state='new' (срезан бюджетом)")
+
+            # retry_count сохранён (не сброшен)
+            conn2 = st2._connect()
+            rc_map = dict(conn2.execute(
+                "SELECT url, retry_count FROM items"
+            ).fetchall())
+            conn2.close()
+            for i in range(1, 5):
+                url = f"https://excess{i}.com/1"
+                self.assertEqual(rc_map.get(url), 2,
+                    f"retry_count для {url} должен остаться 2, got {rc_map.get(url)}")
+
+            st2.close()
         finally:
             _cleanup_db(db_path)
 

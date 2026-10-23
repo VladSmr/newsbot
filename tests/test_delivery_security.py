@@ -191,14 +191,42 @@ class TestHttpxLogLevel:
     """K4: httpx/httpcore логируют на WARNING, не INFO."""
 
     def test_httpx_level_is_warning(self):
-        setup_logging({"level": "DEBUG"})
+        root_logger = logging.getLogger()
+        root_orig_level = root_logger.level
+        root_orig_handlers = root_logger.handlers[:]
         httpx_logger = logging.getLogger("httpx")
-        assert httpx_logger.level <= logging.WARNING
+        httpx_orig_level = httpx_logger.level
+        httpx_orig_handlers = httpx_logger.handlers[:]
+        try:
+            setup_logging({"level": "DEBUG"})
+            assert httpx_logger.level == logging.WARNING, (
+                f"httpx logger level should be WARNING ({logging.WARNING}), "
+                f"got {httpx_logger.level} ({logging.getLevelName(httpx_logger.level)})"
+            )
+        finally:
+            root_logger.level = root_orig_level
+            root_logger.handlers[:] = root_orig_handlers
+            httpx_logger.level = httpx_orig_level
+            httpx_logger.handlers[:] = httpx_orig_handlers
 
     def test_httpcore_level_is_warning(self):
-        setup_logging({"level": "DEBUG"})
+        root_logger = logging.getLogger()
+        root_orig_level = root_logger.level
+        root_orig_handlers = root_logger.handlers[:]
         httpcore_logger = logging.getLogger("httpcore")
-        assert httpcore_logger.level <= logging.WARNING
+        httpcore_orig_level = httpcore_logger.level
+        httpcore_orig_handlers = httpcore_logger.handlers[:]
+        try:
+            setup_logging({"level": "DEBUG"})
+            assert httpcore_logger.level == logging.WARNING, (
+                f"httpcore logger level should be WARNING ({logging.WARNING}), "
+                f"got {httpcore_logger.level} ({logging.getLevelName(httpcore_logger.level)})"
+            )
+        finally:
+            root_logger.level = root_orig_level
+            root_logger.handlers[:] = root_orig_handlers
+            httpcore_logger.level = httpcore_orig_level
+            httpcore_logger.handlers[:] = httpcore_orig_handlers
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -377,7 +405,7 @@ class Test429Handling:
              patch.object(td, "_wait"):
             result = td.send_batch(items)
 
-        assert result == [items[0].url]
+        assert result == ([items[0].url], [])
         assert sent.call_count == 2, "после ошибки батч должен прерваться"
 
 
@@ -401,13 +429,15 @@ class TestTelegramNoTokenLeak:
                 handler = logging.StreamHandler(log_capture)
                 handler.setLevel(logging.WARNING)
                 logger = logging.getLogger("newsbot.delivery.telegram")
+                orig = logger.level
                 logger.addHandler(handler)
                 logger.setLevel(logging.WARNING)
 
                 try:
-                    with pytest.raises(Exception):  # может быть TelegramDeliveryError
+                    with pytest.raises(TelegramDeliveryError):
                         td._api_call("getMe", {})
                 finally:
+                    logger.setLevel(orig)
                     logger.removeHandler(handler)
 
                 log_output = log_capture.getvalue()
@@ -420,17 +450,22 @@ class TestTelegramNoTokenLeak:
         td = TelegramDelivery(token="bot1234567890:SECRET_TOKEN", chat_id="123")
 
         exc = httpx.TimeoutException("Client timeout at https://bot1234567890:SECRET_TOKEN/sendMessage")
-        with patch.object(td._http, "post", side_effect=exc):
-            log_capture = io.StringIO()
-            handler = logging.StreamHandler(log_capture)
-            handler.setLevel(logging.WARNING)
-            logger = logging.getLogger("newsbot.delivery.telegram")
-            logger.addHandler(handler)
-            logger.setLevel(logging.WARNING)
+        logger = logging.getLogger("newsbot.delivery.telegram")
+        orig_logger_level = logger.level
+        try:
+            with patch.object(td._http, "post", side_effect=exc):
+                log_capture = io.StringIO()
+                handler = logging.StreamHandler(log_capture)
+                handler.setLevel(logging.WARNING)
+                logger.addHandler(handler)
+                logger.setLevel(logging.WARNING)
 
-            result = td.send_text("test")  # должен вернуть False, не бросить
+                result = None
+                result = td.send_text("test")  # должен вернуть False, не бросить
 
-            logger.removeHandler(handler)
+                logger.removeHandler(handler)
+        finally:
+            logger.setLevel(orig_logger_level)
             assert result is False
             log_output = log_capture.getvalue()
             assert "SECRET_TOKEN" not in log_output
@@ -747,7 +782,7 @@ class TestSendPacing:
 
         with patch("newsbot.delivery.telegram.time.sleep") as mock_sleep:
             result = td.send_batch([])
-        assert result == []
+        assert result == ([], [])
         assert mock_sleep.call_count == 0
 
 

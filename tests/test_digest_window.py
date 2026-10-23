@@ -100,6 +100,8 @@ def _mk_pipeline(db_path, digest_cfg=None, llm_filter=None):
         "llm": {"enabled": False},
     }
     p = NewsPipeline(cfg)
+    # Закрываем первое соединение перед подменой
+    p.storage.close()
     p.storage = Storage(db_path)
     if llm_filter is not None:
         p.llm_filter = llm_filter

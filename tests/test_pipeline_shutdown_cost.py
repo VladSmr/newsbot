@@ -108,7 +108,7 @@ class MockDelivery:
 
     def send_batch(self, items):
         self.sent.extend(i.url for i in items)
-        return [i.url for i in items]
+        return ([i.url for i in items], [])
 
     def send_text(self, text):
         return True
