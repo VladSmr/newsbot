@@ -56,6 +56,32 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
     Быстрый дедуп по cluster_key: если ОДИН cluster_key (тема+день)
     уже был за последние hours — блокируем. Разные темы от одного
     источника НЕ блокируются.
+
+    M2-фикс: сравниваем по суффиксу stem|day (без локационного префикса).
+    При ингесте item получает stub-ключ `other|stem|day` (loc=other, stub),
+    после скоринга pipeline._process_batch пересобирает ключ с LLM-локацией
+    → `moscow|stem|day` (loc=moscow, пересобранный).
+    При прямом сравнении `other|abc|day` != `moscow|abc|day` → guard не срабатывает.
+    Инвариант guard: ловит «та же тема + тот же день», независимо от того,
+    пересобран ли ключ в БД. Сравнение по суффиксу `%|stem|day` обеспечивает
+    этот инвариант — prefix (location) игнорируется.
+
+    Fallback на exact match: для старых ключей без `|` (например `cb_rate_2024`)
+    суффикс неприменим, используем точное совпадение.
+
+    NOTE: суффиксный LIKE с leading wildcard = full scan по cluster_key.
+    Вызывается один раз на item в filter_new; при ~10k items/день и 2h-окне
+    сканируется ~800 строк — приемлемо. Дополнительный фильтр по pub_day
+    в SQL не применяется (pub_day извлекается из cluster_key через Python-
+    split, а не из отдельного столбца; без отдельного индекса по pub_day
+    дополнительный фильтр не даёт выигрыша, только усложняет запрос).
+
+    NOTE: 32-битный stem_hash (8 hex). При ~10k заголовков/день вероятность
+    коллизии ≈ 10^-5 (birthday paradox: ~N^2/2^32 ≈ 10^8/4*10^9 ≈ 2.5e-2,
+    но stem_hash = md5[:8] = 32 бита, поэтому P ≈ N^2/2^(32+1) ≈ 10^8/8.6e9
+    ≈ 1.2e-2 ≈ 1.2%). При коллизии guard может пропустить нерелевантную
+    новость как дубль — осознанный компромисс (широкий stem менее агрессивен,
+    чем точный match, и не приводит к потере новостей).
     """
     cluster_key = getattr(item, 'cluster_key', None)
     if not cluster_key:
@@ -63,10 +89,28 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
         conn = storage._connect()
-        row = conn.execute(
-            "SELECT 1 FROM items WHERE cluster_key=? AND fetched_at>=? LIMIT 1",
-            (cluster_key, cutoff),
-        ).fetchone()
+        if '|' in cluster_key:
+            # Новый формат: `loc|stem|day` — сравниваем по суффиксу stem|day.
+            # Отрезаем локационный префикс: suffix = "stem|day".
+            # Паттерн `'%' || ? ESCAPE '\'` = suffix match (LIKE с leading wildcard).
+            # ESCAPE '\' защищает от метасимволов %/_ в stem (теоретически,
+            # md5-hex не содержит их, но защита обязательна).
+            # Пример: cluster_key='other|abc12345|2026-10-21'
+            #   → suffix='abc12345|2026-10-21'
+            #   → паттерн '%abc12345|2026-10-21'
+            #   → MATCH: 'other|abc12345|2026-10-21', 'moscow|abc12345|2026-10-21'
+            #   → NO MATCH: 'other|def99999|2026-10-21', 'moscow|def99999|2026-10-21'
+            suffix = cluster_key.split('|', 1)[1]
+            row = conn.execute(
+                "SELECT 1 FROM items WHERE cluster_key LIKE '%' || ? ESCAPE '\\' AND fetched_at>=? LIMIT 1",
+                (suffix, cutoff),
+            ).fetchone()
+        else:
+            # Старый формат без `|`: точное совпадение.
+            row = conn.execute(
+                "SELECT 1 FROM items WHERE cluster_key=? AND fetched_at>=? LIMIT 1",
+                (cluster_key, cutoff),
+            ).fetchone()
         return row is not None
     except Exception as e:
         logger.warning("Доменный дедуп: ошибка, fail-open: %s", e)

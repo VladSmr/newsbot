@@ -12,6 +12,7 @@ tests/test_digest_schedule.py — тесты логики выбора окна 
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timezone as tz, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -24,12 +25,25 @@ def _tmp_db():
     return path
 
 
+@contextmanager
 def _patch_dt_now(fake_utc: datetime):
     """
-    Патчит ссылку newsbot.pipeline.datetime — мокает только class-level,
-    не builtin. Все методы экземпляра (.replace, .astimezone, .timestamp)
-    работают с реальными объектами.
+    Патчит newsbot.pipeline.datetime и _local_now() так, чтобы pipeline
+    видел детерминированное local time в UTC+3, согласованное с fake_utc.
+
+    fake_utc — aware UTC datetime. _local_now() возвращает aware UTC+3.
+
+    Проблема: _local_now() (pipeline.py:118) делает
+    datetime.now(tz.utc).astimezone() → astimezone на aware-объекте
+    конвертирует в TZ ХОСТА. Без патча _local_now тесты с fake_now_utc=06:00
+    (задумано как 09:00 MSK) упадут на хосте с TZ≠MSK.
     """
+    utc3 = tz(timedelta(hours=3))
+    fake_local = fake_utc.astimezone(utc3)  # aware UTC+3
+
+    def fake_local_now():
+        return fake_local
+
     real_dt = datetime
     fake_cls = MagicMock()
     fake_cls.now.return_value = fake_utc
@@ -37,7 +51,9 @@ def _patch_dt_now(fake_utc: datetime):
     fake_cls.timedelta = timedelta
     fake_cls.replace = real_dt.replace
     fake_cls.fromisoformat = real_dt.fromisoformat
-    return patch('newsbot.pipeline.datetime', fake_cls)
+    with patch('newsbot.pipeline.datetime', fake_cls), \
+         patch('newsbot.pipeline._local_now', fake_local_now):
+        yield
 
 
 class TestDigestScheduleFreshDb(unittest.TestCase):
@@ -62,8 +78,8 @@ class TestDigestScheduleFreshDb(unittest.TestCase):
                         pipeline.storage = st
                         pipeline.llm_filter = MagicMock()
 
-                        with _patch_dt_now(fake_now_utc):
-                            with patch.object(pipeline, "run_digest") as mock_digest:
+                        with _patch_dt_now(fake_now_utc), \
+                             patch.object(pipeline, "run_digest") as mock_digest:
                                 pipeline._maybe_run_digest()
                                 # 07:00 < 08:00 → дайджест НЕ вызван
                                 mock_digest.assert_not_called()

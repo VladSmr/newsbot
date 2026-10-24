@@ -1205,6 +1205,163 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
+    def test_domain_recent_duplicate_suffix_match_different_location_same_stem(self):
+        """
+        M2-фикс: ingest-ключ 'other|abc|day' должен детектировать дубль
+        для БД-ключа 'moscow|abc|day' (тот же stem, другая location).
+        Суффиксный матч: '%abc|day' ловит обе строки.
+        """
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+
+            # Item в БД с LLM-пересобранным ключом (после скоринга).
+            # fetched_at — свежий (< 2h), state≠skipped.
+            db_item = _mk_item(
+                title="ЦБ повысил ставку",
+                source="kommersant.ru",
+                url="https://kommersant.ru/db",
+                cluster_key="moscow|abc12345|2026-10-24",
+            )
+            st.save(db_item)
+            # state по умолчанию 'new' — подходит под guard.
+
+            # Ingest-time item: та же тема (тот же stem), та же дата,
+            # но stub-локация 'other'.
+            ingest_item = _mk_item(
+                title="ЦБ повысил ставку",
+                source="ria.ru",
+                url="https://ria.ru/ingest",
+                cluster_key="other|abc12345|2026-10-24",
+            )
+
+            from newsbot.dedup import _domain_recent_duplicate
+            result = _domain_recent_duplicate(ingest_item, st)
+            self.assertTrue(
+                result,
+                "Ingest-ключ 'other|abc|day' должен блокироваться при наличии "
+                "в БД 'moscow|abc|day' (тот же stem+day, другая location)"
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_suffix_match_different_stem_passes(self):
+        """
+        M2-фикс: ingest-ключ 'other|abc|day' НЕ должен блокировать item
+        с БД-ключом 'moscow|xyz|day' (другой stem) — это разные темы.
+        """
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+
+            db_item = _mk_item(
+                title="Курс доллара вырос",
+                source="ria.ru",
+                url="https://ria.ru/db",
+                cluster_key="moscow|xyz99999|2026-10-24",
+            )
+            st.save(db_item)
+
+            ingest_item = _mk_item(
+                title="ЦБ повысил ставку",
+                source="kommersant.ru",
+                url="https://kommersant.ru/ingest",
+                cluster_key="other|abc12345|2026-10-24",  # другой stem
+            )
+
+            from newsbot.dedup import _domain_recent_duplicate
+            result = _domain_recent_duplicate(ingest_item, st)
+            self.assertFalse(
+                result,
+                "Разные stem → разные темы → guard не должен блокировать"
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_suffix_match_same_stem_different_day(self):
+        """
+        M2-фикс: ingest-ключ 'other|abc|24.10.2026' не должен блокировать
+        item с БД-ключом 'moscow|abc|23.10.2026' (другой день).
+        """
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+
+            db_item = _mk_item(
+                title="ЦБ повысил ставку вчера",
+                source="kommersant.ru",
+                url="https://kommersant.ru/db-yesterday",
+                cluster_key="moscow|abc12345|2026-10-23",
+            )
+            st.save(db_item)
+
+            ingest_item = _mk_item(
+                title="ЦБ повысил ставку сегодня",
+                source="ria.ru",
+                url="https://ria.ru/ingest-today",
+                cluster_key="other|abc12345|2026-10-24",  # другой день
+            )
+
+            from newsbot.dedup import _domain_recent_duplicate
+            result = _domain_recent_duplicate(ingest_item, st)
+            self.assertFalse(
+                result,
+                "Другой день → guard не должен блокировать"
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_legacy_exact_match_no_pipe(self):
+        """
+        Fallback на exact match для старых ключей без '|' (легаси).
+        Суффиксный матч не применяется, работает точное совпадение.
+        Существующие тесты test_dedup.py:1138-1206 должны остаться зелёными.
+        """
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            # Легаси-ключ без '|'
+            db_item = _mk_item(
+                title="Курс доллара",
+                source="ria.ru",
+                url="https://ria.ru/legacy",
+                cluster_key="dollar_rate_2024",
+            )
+            st.save(db_item)
+
+            ingest_item = _mk_item(
+                title="Курс доллара сегодня",
+                source="kommersant.ru",
+                url="https://kommersant.ru/new",
+                cluster_key="dollar_rate_2024",  # тот же легаси-ключ
+            )
+
+            from newsbot.dedup import _domain_recent_duplicate
+            result = _domain_recent_duplicate(ingest_item, st)
+            self.assertTrue(
+                result,
+                "Легаси-ключ без '|' → exact match → guard должен блокировать"
+            )
+
+            # Другой легаси-ключ → не блокируется
+            other_item = _mk_item(
+                title="Курс евро",
+                source="ria.ru",
+                url="https://ria.ru/euro",
+                cluster_key="euro_rate_2024",
+            )
+            result2 = _domain_recent_duplicate(other_item, st)
+            self.assertFalse(
+                result2,
+                "Другой легаси-ключ → не блокируется"
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
 
 # =============================================================================
 # LIMIT: кросс-source дедуп не должен усекаться 500 самыми свежими

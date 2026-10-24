@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -653,7 +653,7 @@ class TestNewPurge(unittest.TestCase):
             conn = st._connect()
             conn.execute(
                 "UPDATE items SET state_at=? WHERE url=?",
-                (datetime.now(timezone.utc).isoformat(), "https://failp.example/1")
+                ((datetime.now(timezone.utc) - timedelta(days=1)).isoformat(), "https://failp.example/1"),
             )
             conn.commit()
 
@@ -717,6 +717,7 @@ class TestStateAtUpdatedOnPending(unittest.TestCase):
             ).fetchone()[0]
 
             # Повторный set_state в pending (N2: должен обновить state_at)
+            time.sleep(0.002)  # разнести microsecond двух вызовов
             st.set_state(["https://sat.example/1"], "pending")
             new_at = conn.execute(
                 "SELECT state_at FROM items WHERE url=?", ("https://sat.example/1",)

@@ -304,6 +304,68 @@ class TestRebuildClusterKeyLLM(unittest.TestCase):
         self.assertEqual(parts[0], "france")
         self.assertTrue(parts[1].startswith("nostem:"))
 
+    def test_rebuild_same_old_key_different_title_different_keys(self):
+        """
+        Minor-фикс: два вызова с одинаковым old_cluster_key (без stem),
+        но РАЗНЫМИ title → РАЗНЫЕ cluster_key.
+        Это ключевое свойство nostem-per-title hash: разные новости
+        без stem не должны склеиваться в один cluster.
+        """
+        old_key = "other||2026-10-20"  # пустой stem
+        k1 = rebuild_cluster_key("Russia", old_key, title="AI 2024")
+        k2 = rebuild_cluster_key("Russia", old_key, title="AI 2025")
+        self.assertNotEqual(
+            k1, k2,
+            "Одинаковый old_key, разные title → разные cluster_key"
+        )
+        # Оба начинаются с 'russia' и содержат nostem:
+        self.assertTrue(k1.startswith("russia|nostem:"))
+        self.assertTrue(k2.startswith("russia|nostem:"))
+        # Хеши разные
+        self.assertNotEqual(k1.split("|")[1], k2.split("|")[1])
+
+    def test_rebuild_title_none_old_key_nostem_uses_old_key_stem(self):
+        """
+        При old_cluster_key с nostem и title=None: nostem-ветка использует
+        пустой title → md5(b"") — детерминированный, но неуникальный hash.
+        Ключ не пустой (содержит 'nostem:da39a3ee5e6b').
+        Это крайний случай: реальные items всегда имеют title или url
+        (url fallback обрабатывается вызывающей стороной в _process_batch).
+        """
+        old_key = "other||2026-10-20"  # пустой stem
+        k = rebuild_cluster_key("Germany", old_key, title=None)
+        parts = k.split("|")
+        self.assertEqual(parts[0], "germany")
+        self.assertTrue(parts[1].startswith("nostem:"))
+        # md5(b"").hexdigest()[:12] = da39a3ee5e6b
+        self.assertEqual(parts[1], "nostem:d41d8cd98f00")
+        self.assertNotEqual(k, "")  # не пустой ключ
+
+    def test_rebuild_title_provided_used_for_nostem_hash(self):
+        """
+        title используется для вычисления nostem-hash.
+        Два вызова с РАЗНЫМИ title и пустым stem → разные keys.
+        """
+        old_key = "other||2026-10-20"
+        import hashlib
+        h_a = hashlib.md5("Headline Alpha".encode()).hexdigest()[:12]
+        h_b = hashlib.md5("Headline Beta".encode()).hexdigest()[:12]
+        k_a = rebuild_cluster_key("France", old_key, title="Headline Alpha")
+        k_b = rebuild_cluster_key("France", old_key, title="Headline Beta")
+        self.assertTrue(k_a.endswith(f"nostem:{h_a}|2026-10-20"), f"Got: {k_a}")
+        self.assertTrue(k_b.endswith(f"nostem:{h_b}|2026-10-20"), f"Got: {k_b}")
+
+    def test_rebuild_empty_string_title_vs_none_same_hash(self):
+        """
+        title='' и title=None дают одинаковый md5(b"")-based hash
+        (крайний случай, оба означают «нет данных для хеша»).
+        """
+        old_key = "other||2026-10-20"
+        k_none = rebuild_cluster_key("Spain", old_key, title=None)
+        k_empty = rebuild_cluster_key("Spain", old_key, title="")
+        self.assertEqual(k_none, k_empty,
+                         "title=None и title='' должны давать одинаковый hash")
+
 
 # ─────────────────────────────────────────────────────────────────
 # 4. locations.py нигде не импортируется

@@ -258,32 +258,65 @@ class TestStorageLLM:
         """
         К5: deferred НЕ удаляется purge (дайджест ещё не реализован,
         данные сохраняем). delivered/skipped/failed — удаляются.
+
+        Фикс: раньше использовался retention_days=0 с state_at=now для всех items.
+        При max(|now - now|) < микросекунды SQLite datetime('now') vs datetime.now()
+        могли дать микросекундную гонку → терминальные items не удалялись.
+        Решение: retention_days=1 + терминальные items со state_at=2 дня назад
+        (гарантированно старше cutoff). deferred со state_at=2 дня назад
+        остаётся (cutoff = now - 1 day, state_at = now - 2 days → state_at > cutoff).
         """
         path, cleanup = fresh_db()
         try:
+            from datetime import timedelta
             s = Storage(path)
+            conn = s._connect()
+            two_days_ago = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
 
-            # deferred item — должен ОСТАТЬСЯ
+            # deferred item — должен ОСТАТЬСЯ (старше retention_days, но deferred
+            # имеет своё окно deferred_retention_days)
             item_def = make_item(url="https://e.com/deferred", title="D", summary="S")
             s.save(item_def)
             s.set_state(["https://e.com/deferred"], "deferred")
+            # deferred по умолчанию имеет deferred_retention_days=14, не затрагивается
+            # терминальным cutoff. Для надёжности: state_at старше cutoff.
+            conn.execute(
+                "UPDATE items SET state_at=? WHERE url=?",
+                (two_days_ago, "https://e.com/deferred"),
+            )
+            conn.commit()
 
-            # delivered item — должен УДАЛИТЬСЯ
+            # delivered item — должен УДАЛИТЬСЯ (state_at=2 дня назад < cutoff=now-1дн)
             item_del = make_item(url="https://e.com/delivered", title="X", summary="Y")
             s.save(item_del)
             s.set_state(["https://e.com/delivered"], "delivered")
+            conn.execute(
+                "UPDATE items SET state_at=? WHERE url=?",
+                (two_days_ago, "https://e.com/delivered"),
+            )
+            conn.commit()
 
             # skipped item — должен УДАЛИТЬСЯ
             item_skip = make_item(url="https://e.com/skipped", title="Z", summary="W")
             s.save(item_skip)
             s.set_state(["https://e.com/skipped"], "skipped")
+            conn.execute(
+                "UPDATE items SET state_at=? WHERE url=?",
+                (two_days_ago, "https://e.com/skipped"),
+            )
+            conn.commit()
 
             # failed item — должен УДАЛИТЬСЯ
             item_fail = make_item(url="https://e.com/failed", title="F", summary="G")
             s.save(item_fail)
             s.set_state(["https://e.com/failed"], "failed")
+            conn.execute(
+                "UPDATE items SET state_at=? WHERE url=?",
+                (two_days_ago, "https://e.com/failed"),
+            )
+            conn.commit()
 
-            deleted = s.purge_items(retention_days=0)
+            deleted = s.purge_items(retention_days=1)
             assert deleted == 3, f"ожидалось 3 удалённых (delivered/skipped/failed), получено {deleted}"
 
             # deferred — ОСТАЛСЯ

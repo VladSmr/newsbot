@@ -786,7 +786,7 @@ class TestConfigLLMNumericRanges:
             cfg = load_config(str(cfg_file))
 
         assert cfg["llm"]["batch_size"] == 10
-        assert cfg["llm"]["max_tokens"] == 4096
+        assert cfg["llm"]["max_tokens"] == 4608
         assert cfg["llm"]["temperature"] == 0
         assert cfg["llm"]["daily_cost_limit"] == 0.50
         assert all(
@@ -801,7 +801,7 @@ class TestConfigLLMNumericRanges:
         cfg_file.write_text("llm:\n  max_tokens: 999999999\n", encoding="utf-8")
 
         cfg = load_config(str(cfg_file))
-        assert cfg["llm"]["max_tokens"] == 4096
+        assert cfg["llm"]["max_tokens"] == 4608
 
 
 # ── P1: telegram.poll_timeout — тип, диапазон, кламп ─────────────────────────

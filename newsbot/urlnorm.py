@@ -23,6 +23,11 @@ from urllib.parse import urlparse, urlencode, parse_qsl
 # Параметры запроса, которые вырезаются при нормализации.
 # Содержит основные трекеры: UTM (все варианты), рекламные ID,
 # referrer-параметры и сервисные параметры популярных платформ.
+#
+# M3-фикс: НЕ вырезаем слишком общие параметры, которые могут легитимно
+# различать страницы (s, ref, network, device, keyword, placement,
+# campaign_id, matchtype). При неоднозначности — лучше недодедупить,
+# чем потерять статью.
 TRACKING_PARAMS: frozenset = frozenset({
     # UTM-метки (все официальные и нестандартные)
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
@@ -38,26 +43,18 @@ TRACKING_PARAMS: frozenset = frozenset({
     "mc_eid",        # Mailchimp
     "mc_cid",        # Mailchimp
     # Партнёрские / аналитика
-    "ref",           # Generic referrer
     "referrer",
     "spm",           # Alibaba / Alibaba Cloud
     "aff_id",
     "aff_sub",
     "aff_click_id",
-    "campaign_id",
     "ad_id",
     "adgroup_id",
     "creative_id",
-    "placement",
-    "network",
-    "device",
-    "matchtype",
     "feed_item_id",
-    "keyword",
     # Социальные сети / мессенджеры
     "igshid",        # Instagram
     "twclid",        # Twitter/X
-    "s",             # TikTok (share parameter)
     # Прочее
     "zanpid",
     "mbid",          # Mailchimp bid

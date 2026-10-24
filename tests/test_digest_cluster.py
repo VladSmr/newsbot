@@ -97,7 +97,14 @@ def _mk_pipeline_unit(llm_filter=None, digest_cfg=None, off_peak_only=False):
         with patch.object(NewsPipeline, "_build_llm_filter", return_value=llm_filter):
             p = NewsPipeline(cfg)
             p.llm_filter = llm_filter
-            return p
+    # Подменяем storage.get_shown_for_window, чтобы unit-тесты
+    # _cluster_deferred_duplicates не падали на обращении к self.storage
+    # (pipeline через __new__ не имеет storage — он создаётся в __init__).
+    # Mock возвращает пустой список — кросс-оконный дедуп в unit-тестах не проверяем.
+    mock_storage = MagicMock()
+    mock_storage.get_shown_for_window.return_value = []
+    p.storage = mock_storage
+    return p
 
 
 def _mk_pipeline_integration(db_path, digest_cfg=None, llm_filter=None):
@@ -142,38 +149,44 @@ class TestClusterUnit(unittest.TestCase):
         ]
 
         p = _mk_pipeline_unit(llm_filter=mock_filter)
-        result = p._cluster_deferred_duplicates(items)
+        result_dups, _ = p._cluster_deferred_duplicates(items, "2026-01-01T00:00:00+00:00")
 
-        self.assertEqual(result, {"https://ex.com/u1", "https://ex.com/u2"})
-        self.assertNotIn("https://ex.com/u0", result, "Лидер не должен быть в дублях")
+        self.assertEqual(result_dups, {"https://ex.com/u1", "https://ex.com/u2"})
+        self.assertNotIn("https://ex.com/u0", result_dups, "Лидер не должен быть в дублях")
 
     def test_empty_list_returns_empty(self):
         """Пустой список → вызов LLM не делается, пустое множество."""
         mock_filter = MagicMock()
         p = _mk_pipeline_unit(llm_filter=mock_filter)
 
-        result = p._cluster_deferred_duplicates([])
-        self.assertEqual(result, set())
+        result_dups, _ = p._cluster_deferred_duplicates([], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(result_dups, set())
         mock_filter.detect_duplicates.assert_not_called()
 
     def test_single_item_returns_empty(self):
-        """1 item → вызов LLM не делается."""
+        """1 item + empty RECENT → detect_duplicates вызывается, возвращает {} (empty).
+        NOTE: Fix 4a изменил семантику — 1 item проверяется против RECENT
+        (если RECENT непуст, может отсечься). При пустом RECENT → пустой result.
+        """
         mock_filter = MagicMock()
+        mock_filter.detect_duplicates.return_value = set()
         p = _mk_pipeline_unit(llm_filter=mock_filter)
 
-        result = p._cluster_deferred_duplicates([_mk_item(title="Only", url="https://ex.com/o1")])
-        self.assertEqual(result, set())
-        mock_filter.detect_duplicates.assert_not_called()
+        result_dups, _ = p._cluster_deferred_duplicates(
+            [_mk_item(title="Only", url="https://ex.com/o1")],
+            "2026-01-01T00:00:00+00:00",
+        )
+        self.assertEqual(result_dups, set())
 
     def test_llm_filter_none_returns_empty(self):
         """llm_filter is None → безопасный пропуск."""
         p = _mk_pipeline_unit(llm_filter=None)
 
-        result = p._cluster_deferred_duplicates([
+        result_dups, _ = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/a0"),
             _mk_item(title="B", url="https://ex.com/a1"),
-        ])
-        self.assertEqual(result, set())
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(result_dups, set())
 
     def test_detect_duplicates_raises_returns_empty(self):
         """detect_duplicates бросает исключение → безопасный пропуск."""
@@ -182,11 +195,11 @@ class TestClusterUnit(unittest.TestCase):
 
         p = _mk_pipeline_unit(llm_filter=mock_filter)
 
-        result = p._cluster_deferred_duplicates([
+        result_dups, _ = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/b0"),
             _mk_item(title="B", url="https://ex.com/b1"),
-        ])
-        self.assertEqual(result, set())
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(result_dups, set())
 
     def test_detect_duplicates_returns_non_set_returns_empty(self):
         """detect_duplicates вернул не (set|frozenset) → безопасный пропуск."""
@@ -195,11 +208,11 @@ class TestClusterUnit(unittest.TestCase):
 
         p = _mk_pipeline_unit(llm_filter=mock_filter)
 
-        result = p._cluster_deferred_duplicates([
+        result_dups, _ = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/c0"),
             _mk_item(title="B", url="https://ex.com/c1"),
-        ])
-        self.assertEqual(result, set())
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(result_dups, set())
 
     def test_detect_duplicates_returns_frozenset_accepted(self):
         """detect_duplicates вернул frozenset → принимается (set | frozenset)."""
@@ -208,22 +221,22 @@ class TestClusterUnit(unittest.TestCase):
 
         p = _mk_pipeline_unit(llm_filter=mock_filter)
 
-        result = p._cluster_deferred_duplicates([
+        result_dups, _ = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/d0"),
             _mk_item(title="B", url="https://ex.com/d1"),
-        ])
-        self.assertEqual(result, {"https://ex.com/d1"})
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(result_dups, {"https://ex.com/d1"})
 
     def test_cluster_duplicates_false_bool_skips_llm(self):
         """cluster_duplicates=false (bool) → вызов LLM не делается."""
         mock_filter = MagicMock()
         p = _mk_pipeline_unit(llm_filter=mock_filter, digest_cfg={"cluster_duplicates": False})
 
-        result = p._cluster_deferred_duplicates([
+        result_dups, _ = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/e0"),
             _mk_item(title="B", url="https://ex.com/e1"),
-        ])
-        self.assertEqual(result, set())
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(result_dups, set())
         mock_filter.detect_duplicates.assert_not_called()
 
     def test_cluster_duplicates_false_string_skips_llm(self):
@@ -234,11 +247,11 @@ class TestClusterUnit(unittest.TestCase):
             digest_cfg={"cluster_duplicates": "false"},
         )
 
-        result = p._cluster_deferred_duplicates([
+        result_dups, _ = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/f0"),
             _mk_item(title="B", url="https://ex.com/f1"),
-        ])
-        self.assertEqual(result, set())
+        ], "2026-01-01T00:00:00+00:00")
+        self.assertEqual(result_dups, set())
         mock_filter.detect_duplicates.assert_not_called()
 
     def test_cluster_duplicates_default_true(self):
@@ -258,12 +271,12 @@ class TestClusterUnit(unittest.TestCase):
                 p = NewsPipeline(cfg)
                 p.llm_filter = mock_filter
 
-        result = p._cluster_deferred_duplicates([
+        result_dups, _ = p._cluster_deferred_duplicates([
             _mk_item(title="A", url="https://ex.com/g0"),
             _mk_item(title="B", url="https://ex.com/g1"),
-        ])
+        ], "2026-01-01T00:00:00+00:00")
         mock_filter.detect_duplicates.assert_called_once()
-        self.assertEqual(result, {"https://ex.com/g1"})
+        self.assertEqual(result_dups, {"https://ex.com/g1"})
 
     def test_off_peak_skips_llm(self):
         """off_peak_only=True + в пик → вызов LLM не делается."""
@@ -273,12 +286,12 @@ class TestClusterUnit(unittest.TestCase):
         with patch("newsbot.pipeline.is_llm_allowed_now", return_value=False):
             p = _mk_pipeline_unit(llm_filter=mock_filter, off_peak_only=True)
 
-            result = p._cluster_deferred_duplicates([
+            result_dups, _ = p._cluster_deferred_duplicates([
                 _mk_item(title="A", url="https://ex.com/h0"),
                 _mk_item(title="B", url="https://ex.com/h1"),
-            ])
+            ], "2026-01-01T00:00:00+00:00")
 
-        self.assertEqual(result, set())
+        self.assertEqual(result_dups, set())
         mock_filter.detect_duplicates.assert_not_called()
 
     def test_off_peak_allows_llm_in_off_peak(self):
@@ -289,13 +302,13 @@ class TestClusterUnit(unittest.TestCase):
         with patch("newsbot.pipeline.is_llm_allowed_now", return_value=True):
             p = _mk_pipeline_unit(llm_filter=mock_filter, off_peak_only=True)
 
-            result = p._cluster_deferred_duplicates([
+            result_dups, _ = p._cluster_deferred_duplicates([
                 _mk_item(title="A", url="https://ex.com/j0"),
                 _mk_item(title="B", url="https://ex.com/j1"),
-            ])
+            ], "2026-01-01T00:00:00+00:00")
 
         mock_filter.detect_duplicates.assert_called_once()
-        self.assertEqual(result, {"https://ex.com/j1"})
+        self.assertEqual(result_dups, {"https://ex.com/j1"})
 
     def test_out_of_range_indices_ignored(self):
         """Индексы за пределами списка игнорируются."""
@@ -305,9 +318,9 @@ class TestClusterUnit(unittest.TestCase):
         p = _mk_pipeline_unit(llm_filter=mock_filter)
 
         items = [_mk_item(title=str(i), url=f"https://ex.com/k{i}") for i in range(3)]
-        result = p._cluster_deferred_duplicates(items)
+        result_dups, _ = p._cluster_deferred_duplicates(items, "2026-01-01T00:00:00+00:00")
 
-        self.assertEqual(result, {"https://ex.com/k1"})
+        self.assertEqual(result_dups, {"https://ex.com/k1"})
 
     def test_string_indices_ignored(self):
         """Не-числовые индексы (строки, None) игнорируются."""
@@ -317,9 +330,9 @@ class TestClusterUnit(unittest.TestCase):
         p = _mk_pipeline_unit(llm_filter=mock_filter)
 
         items = [_mk_item(title=str(i), url=f"https://ex.com/l{i}") for i in range(5)]
-        result = p._cluster_deferred_duplicates(items)
+        result_dups, _ = p._cluster_deferred_duplicates(items, "2026-01-01T00:00:00+00:00")
 
-        self.assertEqual(result, {"https://ex.com/l1"})
+        self.assertEqual(result_dups, {"https://ex.com/l1"})
 
 
 # =============================================================================

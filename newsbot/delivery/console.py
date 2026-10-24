@@ -66,7 +66,8 @@ class ConsoleDelivery(Delivery):
         for item in items:
             body = item.llm_summary if item.llm_summary else item.summary
             print(f"\n{'='*60}")
-            print(f"[{item.source}] {item.title}")
+            title_display = item.llm_title if item.llm_title else item.title
+            print(f"[{item.source}] {title_display}")
             if body:
                 print(f"   {body[:300]}")
             if item.llm_score is not None:

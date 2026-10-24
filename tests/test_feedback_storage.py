@@ -43,10 +43,12 @@ def storage(tmp_path):
 
 @pytest.fixture
 def news_item():
-    """Базовый NewsItem для тестов."""
+    """Базовый NewsItem для тестов (fresh-объект каждый вызов)."""
+    import uuid
+    uid = uuid.uuid4().hex[:8]
     return NewsItem(
         source="TestSource",
-        url="https://example.com/article",
+        url=f"https://example.com/{uid}",
         title="Тестовая статья",
         summary="Краткое содержание тестовой статьи.",
         published="2026-01-01",
@@ -539,6 +541,7 @@ def test_record_feedback_unknown_target_returns_false(storage):
 def test_get_recent_feedback_order_by_updated_at_desc(storage, news_item):
     """F5: re-vote поднимает запись наверх (updated_at DESC)."""
     t1 = storage.add_feedback_target_from_item(news_item, kind="push")
+    time.sleep(0.01)   # разнести timestamps для детерминированного порядка
     storage.record_feedback(t1, "like")
 
     item2 = NewsItem(
@@ -547,9 +550,11 @@ def test_get_recent_feedback_order_by_updated_at_desc(storage, news_item):
         published_parsed=None,
     )
     t2 = storage.add_feedback_target_from_item(item2, kind="push")
+    time.sleep(0.01)
     storage.record_feedback(t2, "dislike")
 
     # re-vote на первом item
+    time.sleep(0.01)
     storage.record_feedback(t1, "like")
 
     rows = storage.get_recent_feedback()

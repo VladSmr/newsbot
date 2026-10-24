@@ -59,6 +59,7 @@ class FilterResult:
     urgent: bool = False
     cost_blocked: bool = False
     location: str = ""  # LLM-extracted location, English, canonical
+    title_en: Optional[str] = None  # EN title from LLM; None if not provided / fallback
 
 
 # ----------------------------------------------------------------------
@@ -652,6 +653,15 @@ class LLMFilter:
             # ── location (Задача: LLM вместо словаря) ──────────────────
             location = str(item_raw.get("location") or "").strip()
 
+            # ── title_en: EN-перевод заголовка от LLM (tolerant) ─────
+            # m4-fix: только str. int/float → None (не "42").
+            raw_title_en = item_raw.get("title_en")
+            title_en: Optional[str] = None
+            if isinstance(raw_title_en, str):
+                title_en = raw_title_en.strip()
+                if not title_en:
+                    title_en = None
+
             results[index] = FilterResult(
                 ok=True,
                 score=score,
@@ -659,6 +669,7 @@ class LLMFilter:
                 reason=reason,
                 urgent=urgent,
                 location=location,
+                title_en=title_en,
             )
 
         return results
@@ -1078,6 +1089,17 @@ class LLMFilter:
         # Пустая строка / отсутствие → '' (глобальная/непонятная тема).
         location = str(raw.get("location") or "").strip()
 
+        # ── title_en: EN-перевод заголовка от LLM ─────────────────────
+        # m4-fix: принимается только str. int/float — вредный выход из LLM
+        # (модель ошиблась с форматом) → None (не сохранять "42" как заголовок).
+        # Отсутствует/пусто/не-строка → None (не роняем ответ).
+        raw_title_en = raw.get("title_en")
+        title_en: Optional[str] = None
+        if isinstance(raw_title_en, str):
+            title_en = raw_title_en.strip()
+            if not title_en:
+                title_en = None
+
         return FilterResult(
             ok=True,
             score=score,
@@ -1085,6 +1107,7 @@ class LLMFilter:
             reason=reason,
             urgent=urgent,
             location=location,
+            title_en=title_en,
         )
 
     # ── detect_duplicates ─────────────────────────────────────────────────────────
@@ -1127,11 +1150,19 @@ class LLMFilter:
             0-based индексы items, которые являются дубликатами
             БОЛЕЕ РАННЕЙ новости (из основного списка, из recent,
             или из kept leaders предыдущих чанков).
-            Пустое множество — ошибка или кандидатов < 2.
+            Пустое множество — ошибка.
         """
-        if len(items) < 2:
+        # Guard: пустой список — дедуп невозможен.
+        if not items:
             return set()
-
+        # Guard: ровно 1 item — пропускается только при ПУСТОМ RECENT
+        # (нет кросс-оконных дублей, лидеру не с чем сравниваться).
+        # При непустом RECENT (backfill/guarantee или кросс-оконный дедуп
+        # в _cluster_deferred_duplicates) — одиночный кандидат ДОЛЖЕН
+        # проверяться против показанных. Pipeline-гарантии сняты;
+        # guard здесь блокировал бы ЛЕГИТИМНЫЙ дедуп.
+        if len(items) == 1 and not recent:
+            return set()
         # MAJOR-фикс: cost-guard ДО любого LLM-вызова. Без него при исчерпанном
         # дневном лимите скоринг блокируется, а дедуп продолжал тратить деньги
         # каждый цикл (вызывается из pipeline до скоринга и в cluster-deferred).
@@ -1199,8 +1230,9 @@ class LLMFilter:
             self._record_usage(usage_before)
 
             # Парсим ответ: {"duplicates": [1, 3, ...]}
+            # recent передаётся для условного guard (лидер не пропускается только при пустом RECENT).
             dup_indices = self._parse_dedup_response(
-                raw, len(chunk), chunk_start,
+                raw, len(chunk), chunk_start, recent,
             )
             all_dup_indices.update(dup_indices)
 
@@ -1261,6 +1293,7 @@ class LLMFilter:
         raw: Dict[str, Any],
         chunk_len: int,
         chunk_offset: int,
+        recent: List[dict],
     ) -> Set[int]:
         """
         Парсит ответ LLM ``{"duplicates": [1, 2, ...]}`` → Set[int] 0-based.
@@ -1268,12 +1301,17 @@ class LLMFilter:
         Битые/несуществующие/вне-диапазона индексы — игнорируются.
         Невалидная структура → пустое множество.
 
-        Minor #4-фикс — защита от «самоссылки» / лидера чанка:
+        MAJOR-фикс — защита от «самоссылки» / лидера чанка:
           (a) Guard лидера первого чанка (chunk_offset=0, idx=1 1-based) НЕ может
               быть помечен как дубль — у него нет «более раннего» в чанке.
-              Для чанков 2+ лидер (chunk_offset) МОЖЕТ быть кросс-чанковым
-              дублем (реальный кейс: RU-версия события в чанке 1, EN-версия
-              в чанке 2 — лидер чанка 2 помечается дублем чанка 1).
+              ДЛЯ ЧАНКОВ 2+: лидер МОЖЕТ быть кросс-чанковым дублем kept-лидера
+              из предыдущего чанка (реальный кейс: RU-версия в чанке 1, EN-версия
+              в чанке 2).
+          (b) Однако если RECENT (показанные) НЕПУСТЫ — лидер первого чанка
+              ДОЛЖЕН быть проверен против них (4b-фикс). Обоснование старого guard'а
+              ("нет более раннего в чанке") устарело: дубль мог быть показан
+              ранее в другом дайджесте. Guard остаётся когда RECENT пуст
+              (классический внутри-чанковый дедуп без внешнего контекста).
 
         Parameters
         ----------
@@ -1331,15 +1369,15 @@ class LLMFilter:
                 # несуществующий индекс — игнорируем
                 continue
 
-            # Guard (a): лидер первого чанка (idx=1, chunk_offset=0) не пропускается
-            # как дубль — у него нет «более раннего» в пределах этого чанка.
-            # Для чанков 2+ лидер (idx=1 1-based = chunk_offset в 0-based) МОЖЕТ
-            # быть кросс-чанковым дублем kept-лидера из предыдущего чанка
-            # (реальный кейс: RU-версия события в чанке 1, EN-версия в чанке 2).
-            if chunk_offset == 0 and idx == 1:
+            # Guard: лидер первого чанка не пропускается как дубль, ЕСЛИ
+            # RECENT пуст (классический внутри-чанковый дедуп).
+            # При непустом RECENT лидер ДОЛЖЕН быть проверен против показанных
+            # (реальный кейс: дубль показан утром, вечерний лидер — тот же дубль).
+            if chunk_offset == 0 and idx == 1 and not recent:
                 logger.debug(
                     "LLM-дедуп: модель пометила лидера первого чанка "
-                    "(1-based idx=1) как дубль — игнорируем (защита от самоссылки)",
+                    "(1-based idx=1) как дубль — игнорируем (RECENT пуст, "
+                    "защита от самоссылки)",
                 )
                 continue
 

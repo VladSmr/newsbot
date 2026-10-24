@@ -97,7 +97,7 @@ class Storage:
     Идемпотентность: user_version выставляется ПОСЛЕ успешной миграции.
     """
 
-    SCHEMA_VERSION = 14
+    SCHEMA_VERSION = 15
     STATES = ("new", "pending", "delivered", "skipped", "deferred", "failed", "digested")
     DEFAULT_RETENTION_DAYS = 1
     DEFAULT_RETRY_THRESHOLD_SECONDS = 60
@@ -276,6 +276,7 @@ class Storage:
                 llm_summary TEXT,
                 llm_reason  TEXT,
                 llm_urgent  INTEGER,
+                llm_title   TEXT,
                 filtered_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0
             )
@@ -403,12 +404,31 @@ class Storage:
                     raise
                 logger.info("v13 post-check: колонка lang уже существует")
 
+        # ── 5d. v15: defensive post-check для llm_title ─────────────
+        # Аналогично v10/v13: при user_version=15 без колонки
+        # (конкурентная миграция) — добавляем идемпотентно.
+        it_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+        if "llm_title" not in it_cols:
+            try:
+                conn.execute("ALTER TABLE items ADD COLUMN llm_title TEXT")
+                logger.info("v15 post-check: добавлена колонка items.llm_title")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
+                logger.info("v15 post-check: колонка llm_title уже существует")
+
         logger.debug("БД инициализирована (v%d): %s", self.SCHEMA_VERSION, self.db_path)
 
     def _create_indexes(self, conn: sqlite3.Connection) -> None:
         """Создаёт индексы. IntegrityError = дубли в old data, логируем явно."""
         for stmt in (
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_url_norm ON items(url_norm)",
+            # M4: не-unique индекс по url заменяет дропнутый idx_items_url.
+            # UNIQUE-констрейнт теперь на url_norm (v14). Индекс по url
+            # ускоряет set_state, increment_retry_count, update_llm_results_batch,
+            # get_urls_with_retry_gte, mark_failed_if_retries_exhausted
+            # (WHERE url IN (...)), которые иначе деградируют до полного скана.
+            "CREATE INDEX IF NOT EXISTS idx_items_url ON items(url)",
             "CREATE INDEX IF NOT EXISTS idx_items_state ON items(state)",
             "CREATE INDEX IF NOT EXISTS idx_items_state_at ON items(state_at)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_seen_title_source "
@@ -1059,6 +1079,14 @@ class Storage:
         # (к) v14: url_norm TEXT — нормализованный URL для URL-based дедупа.
         # UNIQUE INDEX по url_norm склеивает utm/без utm в одну запись.
         # Для свежих БД колонка + индекс создаются в _create_indexes (в новой схеме).
+        #
+        # B1-фикс (crash-loop): если миграция падает с IntegrityError (конфликт
+        # дублирующихся url_norm), Вариант A восстановления работает благодаря
+        # best-effort backfill: при старте бота после ручного Варианта A
+        # url_norm IS NULL у конфликтных строк; backfill пытается заполнить их
+        # заново, но при конфликте (другое значение url_norm уже существует)
+        # оставляет IS NULL — UNIQUE-индекс создаётся, бот стартует.
+        # Конфликтные строки с url_norm IS NULL не участвуют в URL-дедупе.
         if "items" in existing_tables:
             current_items_cols = {r[1] for r in conn.execute(
                 "PRAGMA table_info(items)"
@@ -1073,12 +1101,36 @@ class Storage:
                     logger.info("v14: колонка url_norm уже существует (конкурентный процесс)")
 
             # Backfill: заполняем url_norm для существующих записей.
+            # B1-фикс: best-effort INSERT semantics — если нормализованное
+            # значение уже занято другой строкой, НЕ перезаписываем,
+            # оставляем url_norm IS NULL (SQLite UNIQUE-индекс с NULL не
+            # конфликтует). Это размыкает crash-loop: после ручного Варианта A
+            # рестарт → backfill пропускает конфликтные строки → UNIQUE-индекс
+            # создаётся → бот стартует.
+            #
+            # B1-фикс (Variant A): O(N²) → O(N).
+            # Старый код: per-row `SELECT 1 FROM items WHERE url_norm = ?`
+            # — full scan на каждую строку, всё в одной транзакции.
+            # На 100k+ legacy-строках → десятки минут старта.
+            # Исправление: один раз загружаем занятые url_norm в Python-set,
+            # затем O(1) lookup per row. При успешном UPDATE добавляем в set,
+            # чтобы строки батча «видели» занятые значения от предыдущих строк.
+            #
             # Идемпотентен (при повторном запуске — уже заполнено).
             # MAJOR 3-фикс: keyset-пагинация вместо open cursor на UPDATE-таблице.
             # SQLite undefined behaviour при SELECT по открытому курсору той же
             # таблицы с последующим UPDATE (строки могут быть пропущены).
             # При rowid > last_rowid — детерминированный порядок, без пропусков.
             # Пачками по 10000 — безопасно для больших таблиц.
+            #
+            # Вариант B (предварительный индекс) отклонён: память ~10 МБ
+            # на 100k URL приемлема, а индекс до backfill не ускоряет
+            # INSERT INTO items (url_norm IS NULL) — индекс по NULL не работает.
+            occupied_norm = {
+                row[0] for row in conn.execute(
+                    "SELECT url_norm FROM items WHERE url_norm IS NOT NULL"
+                ).fetchall()
+            }
             last_rowid = 0
             while True:
                 batch = conn.execute(
@@ -1089,12 +1141,21 @@ class Storage:
                 ).fetchall()
                 if not batch:
                     break
-                rows_to_update = [(normalize_url(orig_url), rowid)
-                                  for rowid, orig_url in batch]
-                conn.executemany(
-                    "UPDATE items SET url_norm = ? WHERE rowid = ?",
-                    rows_to_update,
-                )
+                for rowid, orig_url in batch:
+                    url_norm = normalize_url(orig_url)
+                    try:
+                        if url_norm in occupied_norm:
+                            # url_norm уже занят другой строкой — пропускаем.
+                            continue
+                        conn.execute(
+                            "UPDATE items SET url_norm = ? WHERE rowid = ? AND url_norm IS NULL",
+                            (url_norm, rowid),
+                        )
+                        occupied_norm.add(url_norm)
+                    except sqlite3.IntegrityError:
+                        # Конфликт с concurrently-вставленной строкой (между
+                        # occupied_norm load и UPDATE). Пропускаем.
+                        pass
                 last_rowid = batch[-1][0]
 
             # MAJOR 3-фикс: создание индекса ДО удаления старого.
@@ -1128,13 +1189,19 @@ class Storage:
                     "(конфликт данных: нормализованные URL неуникальны). "
                     "Дубликаты по нормализованному URL: %s. "
                     "Старый индекс idx_items_url сохранён. "
-                    "Для продолжения — удалите дубликаты вручную: "
-                    "Вариант A (безопасный, рекомендуется): "
+                    "Для продолжения — дедуплицируйте вручную: "
+                    "Вариант A (безопасный, рекомендуется): обнулите url_norm "
+                    "у дублирующихся строк (не уникальных), чтобы UNIQUE-индекс "
+                    "мог быть создан: "
                     "UPDATE items SET url_norm = NULL WHERE rowid NOT IN ("
                     "  SELECT MIN(rowid) FROM items GROUP BY url_norm"
                     "  HAVING url_norm IS NOT NULL"
-                    "); — строки с NULL-url_norm остаются (SQLite UNIQUE не конфликтует с NULL). "
-                    "Вариант B (полный DELETE): "
+                    "); — после этого миграция применится: backfill при старте "
+                    "заполнит url_norm заново, но для конфликтных строк "
+                    "url_norm останется NULL (best-effort, не конфликтует с UNIQUE). "
+                    "Строки с url_norm IS NULL не участвуют в URL-дедупликации "
+                    "(продедуп по ним не работает). "
+                    "Вариант B (радикальный DELETE): удалить дубликаты полностью: "
                     "DELETE FROM items WHERE rowid NOT IN ("
                     "  SELECT MIN(rowid) FROM items GROUP BY url_norm"
                     "  HAVING url_norm IS NOT NULL"
@@ -1147,6 +1214,21 @@ class Storage:
                 # после ручной дедупликации. НЕ удаляем старый индекс
                 # (IF EXISTS), чтобы при повторном apply старый idx всё ещё был.
                 raise
+
+        # (л) v15: llm_title TEXT — EN-перевод заголовка от LLM.
+        # Идемпотентно: try/except для конкурентной миграции.
+        if "items" in existing_tables:
+            current_items_cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(items)"
+            ).fetchall()}
+            if "llm_title" not in current_items_cols:
+                try:
+                    conn.execute("ALTER TABLE items ADD COLUMN llm_title TEXT")
+                    logger.info("Миграция v15: добавлена колонка items.llm_title")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
+                    logger.info("v15: колонка llm_title уже существует (конкурентный процесс)")
 
         conn.commit()
 
@@ -1473,12 +1555,18 @@ class Storage:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
         ).isoformat()
-        sql = """
+        # M6: `<=` вместо `<` при max_age_seconds==0. При max_age_seconds=0
+        # cutoff=now, state_at тоже now → `<` отсекает только-что созданные
+        # pending-items (race по микросекундам в тестах). `<=` корректен:
+        # state_at=now означает «awaiting обработки прямо сейчас» — такие items
+        # принадлежат текущему retry-окну и должны быть возвращены.
+        state_at_op = "<=" if max_age_seconds == 0 else "<"
+        sql = f"""
             SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at,
-                   llm_score, llm_summary, llm_reason, llm_urgent, retry_count
+                   llm_score, llm_summary, llm_reason, llm_urgent, llm_title, retry_count
             FROM items
             WHERE state = 'pending'
-              AND state_at < ?
+              AND state_at {state_at_op} ?
               AND retry_count < ?
             ORDER BY id ASC
             """
@@ -1648,7 +1736,7 @@ class Storage:
         conn = self._connect()
         sql = """
             SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at, state_at,
-                   llm_score, llm_summary, llm_reason, llm_urgent
+                   llm_score, llm_summary, llm_reason, llm_urgent, llm_title
             FROM items
             WHERE state = ?
             ORDER BY id ASC
@@ -1667,6 +1755,22 @@ class Storage:
         row = conn.execute(
             "SELECT COUNT(*) FROM items WHERE state = ?",
             (state,),
+        ).fetchone()
+        return row[0] if row else 0
+
+    def count_deferred_before(self, cutoff_iso: str) -> int:
+        """
+        Возвращает количество deferred-items с fetched_at < cutoff_iso.
+        Лёгкий COUNT(*) — используется для логирования «дропнутых» при
+        закрытии дайджест-окна.
+
+        fetched_at всегда tz-aware ISO; строковое сравнение корректно
+        для ISO+00:00.
+        """
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM items WHERE state='deferred' AND fetched_at < ?",
+            (cutoff_iso,),
         ).fetchone()
         return row[0] if row else 0
 
@@ -1699,7 +1803,7 @@ class Storage:
         params: list = []
         sql = """
             SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at, state_at,
-                   llm_score, llm_summary, llm_reason, llm_urgent
+                   llm_score, llm_summary, llm_reason, llm_urgent, llm_title
             FROM items
             WHERE state = 'deferred'
         """
@@ -1732,6 +1836,42 @@ class Storage:
         rows = conn.execute(sql, params).fetchall()
         return self._rows_to_items(rows)
 
+    def get_skipped_items(
+        self,
+        since_iso: Optional[str] = None,
+        min_score: int = 0,
+        limit: int = 50,
+    ) -> List[NewsItem]:
+        """
+        Возвращает skipped-items с llm_score >= min_score, fetched_at >= since_iso.
+        Сортировка: llm_score DESC, fetched_at ASC.
+
+        Используется для гарантии кино (добор из skipped с score >= 3).
+        Категоризация по source/tags выполняется вызывающей стороной
+        (pipeline._infer_category — категория в БД не хранится).
+
+        NOTE: items с llm_score IS NULL не возвращаются (не скорились —
+        добор бессмысленен).
+        """
+        conn = self._connect()
+        params: list = []
+        sql = """
+            SELECT source, url, title, summary, published, tags, cluster_key, lang,
+                   fetched_at, state_at, llm_score, llm_summary, llm_reason, llm_urgent, llm_title
+            FROM items
+            WHERE state = 'skipped'
+              AND llm_score IS NOT NULL
+              AND llm_score >= ?
+        """
+        params.append(int(min_score))
+        if since_iso is not None:
+            sql += " AND fetched_at >= ?"
+            params.append(since_iso)
+        sql += " ORDER BY llm_score DESC, fetched_at ASC"
+        sql += f" LIMIT {int(limit)}"
+        rows = conn.execute(sql, params).fetchall()
+        return self._rows_to_items(rows)
+
     def set_digested(self, urls: List[str]) -> int:
         """
         Переводит URLs в терминальный state='digested'.
@@ -1739,7 +1879,9 @@ class Storage:
         """
         return self.set_state(urls, "digested")
 
-    def delete_items_before(self, cutoff_iso: str) -> int:
+    def delete_items_before(
+        self, cutoff_iso: str, retention_days: Optional[int] = None,
+    ) -> int:
         """
         Удаляет items в терминальных состояниях (delivered/skipped/digested/
         failed) с fetched_at < cutoff_iso.
@@ -1749,18 +1891,52 @@ class Storage:
         (deferred_retention_days, v1.1.5) и очищается отдельным purge_items
         по state_at.
 
+        M5-фикс: effective cutoff = более ранняя из (cutoff_iso, now - retention_days).
+        Ничего новее retention_days границы не удаляется НИКОГДА, даже если
+        дайджест пришёл раньше (например, запуск в 20:00 для окна ~12ч при
+        retention_days=7: item от 08:05 живёт, несмотря на window_start~08:00).
+        Консистентность с purge_items: оба метода уважают retention_days.
+        Разница: delete_items_before использует fetched_at (когда item
+        был впервые найден), purge_items использует state_at (когда item
+        получил финальное состояние delivered/skipped/failed/digested).
+
         fetched_at всегда tz-aware ISO (см. save/_rows_to_items),
         строковое сравнение корректно (лексикографически для ISO+00:00);
         julianday() блокировал индекс и был NULL-небезопасен.
 
+        Args:
+            cutoff_iso: верхняя граница дайджест-окна (ISO-8601).
+            retention_days: если задано — удалять не старше retention_days дней
+                             (даже если cutoff_iso раньше). None = без ограничения
+                             (обратная совместимость, deprecated: теперь None
+                             означает DEFAULT_RETENTION_DAYS=1, как в purge_items).
+
         Возвращает количество удалённых строк items.
         """
+        effective_cutoff = cutoff_iso
+        # B3-фикс: None → DEFAULT_RETENTION_DAYS (консистентность с purge_items).
+        # pipeline.py:2587 передаёт retention_days без дефолта (None → clamp
+        # выключен). При отсутствии применяем дефолт 1, чтобы clamp заработал.
+        resolved_retention = (
+            retention_days if retention_days is not None
+            else self.DEFAULT_RETENTION_DAYS
+        )
+        if resolved_retention is not None:
+            retention_cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=resolved_retention)
+            ).isoformat()
+            # Более ранняя граница = менее агрессивная (меньше удалений).
+            # min: если retention_days "моложе" window_start — используем
+            # retention_days (не удаляем ничего новее retention-границы).
+            if retention_cutoff < effective_cutoff:
+                effective_cutoff = retention_cutoff
+
         with self._tx() as conn:
             cur = conn.execute(
                 "DELETE FROM items "
                 "WHERE fetched_at < ? "
                 "  AND state IN ('delivered','skipped','digested','failed')",
-                (cutoff_iso,),
+                (effective_cutoff,),
             )
             return cur.rowcount
 
@@ -1822,11 +1998,13 @@ class Storage:
             # LLM-поля: читаем безопасно (могут отсутствовать в старых записях).
             # v10: llm_urgent читается для retry (C1-фикс).
             llm_urgent: Optional[bool] = None
+            llm_title: Optional[str] = None
             for val_name, attr_name in (
                 ("llm_score", "llm_score"),
                 ("llm_summary", "llm_summary"),
                 ("llm_reason", "llm_reason"),
                 ("llm_urgent", "llm_urgent"),
+                ("llm_title", "llm_title"),
             ):
                 try:
                     val = row[val_name]
@@ -1839,6 +2017,8 @@ class Storage:
                             llm_reason = str(val)
                         elif val_name == "llm_urgent":
                             llm_urgent = bool(val)  # INTEGER 0/1 → bool
+                        elif val_name == "llm_title":
+                            llm_title = str(val) if val else None
                 except Exception:
                     pass
 
@@ -1910,6 +2090,7 @@ class Storage:
                 llm_summary=llm_summary,
                 llm_reason=llm_reason,
                 llm_urgent=llm_urgent,
+                llm_title=llm_title,
             )
             if with_retry_count:
                 ni.retry_count = retry_count  # type: ignore
@@ -1965,10 +2146,13 @@ class Storage:
     ) -> int:
         """
         Батчевое сохранение результатов LLM-оценки.
-        records — список dict: {url, score, summary, reason, urgent?, cluster_key?, filtered_at?}
+        records — список dict: {url, score, summary, reason, urgent?, cluster_key?, filtered_at?, title_en?}
         Если record содержит ключ 'urgent' (bool) — он пишется в llm_urgent (INTEGER 0/1).
         Если record содержит ключ 'cluster_key' (str) — он пишется в cluster_key.
-        Для обратной совместимости отсутствие ключа не меняет соответствующее поле.
+        Если record содержит ключ 'title_en' (str, не-None) — он пишется в llm_title (v15).
+        Если record НЕ содержит ключ 'title_en' или title_en is None — llm_title НЕ трогается
+        (существующее значение в БД сохраняется). Это защищает retry-путь от затирания
+        EN-заголовка при синтезе FilterResult без title_en.
         Возвращает количество обновлённых строк.
         """
         if not records:
@@ -1980,76 +2164,52 @@ class Storage:
                 for rec in records:
                     cluster_key = rec.get("cluster_key")
                     urgent = rec.get("urgent")
-                    if urgent is not None:
+                    title_en = rec.get("title_en")  # v15: None → не трогать поле
+
+                    if title_en is not None:
+                        # title_en передан → пишем в llm_title
+                        sets = "llm_score = ?, llm_summary = ?, llm_reason = ?, filtered_at = ?, llm_title = ?"
+                        extra_sets = []
+                        params_extra: list = []
+                        if urgent is not None:
+                            extra_sets.append("llm_urgent = ?")
+                            params_extra.append(1 if urgent else 0)
                         if cluster_key is not None:
-                            cur = conn.execute(
-                                """
-                                UPDATE items
-                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
-                                    llm_urgent = ?, filtered_at = ?, cluster_key = ?
-                                WHERE url = ?
-                                """,
-                                (
-                                    rec["score"],
-                                    rec["summary"],
-                                    rec["reason"],
-                                    1 if urgent else 0,
-                                    rec.get("filtered_at") or now_iso,
-                                    cluster_key,
-                                    rec["url"],
-                                ),
-                            )
-                        else:
-                            cur = conn.execute(
-                                """
-                                UPDATE items
-                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
-                                    llm_urgent = ?, filtered_at = ?
-                                WHERE url = ?
-                                """,
-                                (
-                                    rec["score"],
-                                    rec["summary"],
-                                    rec["reason"],
-                                    1 if urgent else 0,
-                                    rec.get("filtered_at") or now_iso,
-                                    rec["url"],
-                                ),
-                            )
+                            extra_sets.append("cluster_key = ?")
+                            params_extra.append(cluster_key)
+                        if extra_sets:
+                            sets += ", " + ", ".join(extra_sets)
+
+                        params = [
+                            rec["score"], rec["summary"], rec["reason"],
+                            rec.get("filtered_at") or now_iso, title_en,
+                        ] + params_extra + [rec["url"]]
+                        cur = conn.execute(
+                            f"UPDATE items SET {sets} WHERE url = ?",
+                            params,
+                        )
                     else:
+                        # title_en отсутствует/None → НЕ пишем llm_title (preserve)
+                        sets = "llm_score = ?, llm_summary = ?, llm_reason = ?, filtered_at = ?"
+                        extra_sets = []
+                        params_extra: list = []
+                        if urgent is not None:
+                            extra_sets.append("llm_urgent = ?")
+                            params_extra.append(1 if urgent else 0)
                         if cluster_key is not None:
-                            cur = conn.execute(
-                                """
-                                UPDATE items
-                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
-                                    filtered_at = ?, cluster_key = ?
-                                WHERE url = ?
-                                """,
-                                (
-                                    rec["score"],
-                                    rec["summary"],
-                                    rec["reason"],
-                                    rec.get("filtered_at") or now_iso,
-                                    cluster_key,
-                                    rec["url"],
-                                ),
-                            )
-                        else:
-                            cur = conn.execute(
-                                """
-                                UPDATE items
-                                SET llm_score = ?, llm_summary = ?, llm_reason = ?,
-                                    filtered_at = ?
-                                WHERE url = ?
-                                """,
-                                (
-                                    rec["score"],
-                                    rec["summary"],
-                                    rec["reason"],
-                                    rec.get("filtered_at") or now_iso,
-                                    rec["url"],
-                                ),
-                            )
+                            extra_sets.append("cluster_key = ?")
+                            params_extra.append(cluster_key)
+                        if extra_sets:
+                            sets += ", " + ", ".join(extra_sets)
+
+                        params = [
+                            rec["score"], rec["summary"], rec["reason"],
+                            rec.get("filtered_at") or now_iso,
+                        ] + params_extra + [rec["url"]]
+                        cur = conn.execute(
+                            f"UPDATE items SET {sets} WHERE url = ?",
+                            params,
+                        )
                     total += cur.rowcount
             return total
         except Exception as e:
@@ -2549,7 +2709,8 @@ class Storage:
             sql += " WHERE verdict = ?"
             params.append(verdict)
         sql += (
-            " ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC "
+            " ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC, "
+            "ROWID DESC "
             "LIMIT ?"
         )
         params.append(limit)
@@ -2723,6 +2884,83 @@ class Storage:
             params + [limit],
         ).fetchall()
         return [(r[0], r[1]) for r in rows]
+
+    def get_shown_for_window(
+        self,
+        cutoff_iso: str,
+        limit: int = 200,
+    ) -> List[dict]:
+        """
+        Возвращает новости, УЖЕ показанные (state IN ('digested', 'delivered'))
+        за текущее дайджест-окно (fetched_at >= cutoff_iso).
+
+        Используется как RECENT-контекст в LLM-дедупликации дайджеста
+        (``_cluster_deferred_duplicates``), чтобы отсекать кросс-оконные дубли:
+        новость, показанная утром (digested), не попадала в вечерний дайджест
+        даже если вечером другой источник опубликовал перефразированную версию.
+
+        Формат возврата — ``List[dict]`` с ключами ``title`` и ``source``:
+        это exactly тот формат, который ожидает ``LLMFilter.detect_duplicates``
+        для второго аргумента ``recent``.
+
+        Лимит 200 — компромисс между полнотой RECENT-контекста и стоимостью
+        токенов: LLM-дедуп шлёт все recent titles в каждый чанк, при ~200 items
+        и ~100 символах на title → ~20K символов, что укладывается в бюджет
+        MAX_DEDUP_CTX_CHARS (~12000) с запасом на kept/dup из предыдущих чанков.
+        Реальное окно дайджеста (24ч) редко генерирует больше 100–150 уникальных
+        digested/delivered items, 200 — консервативный верхний порог.
+
+        NOTE: кандидаты текущего окна (``deferred``) НЕ попадают в выборку
+        (state='deferred' ≠ 'digested'/'delivered'), поэтому инвариант
+        «recent не содержит кандидатов» соблюдается автоматически.
+
+        NOTE: ``llm_summary`` и ``url`` НЕ возвращаются — они не используются
+        в RECENT-контексте LLM-дедупа (см. ``build_dedup_context_message``:
+        только title+source, summary/url отброшены в MAJOR-фиксе ради
+        символьного бюджета и устранения O(N²) роста).
+
+        MAJOR-фикс (4d): граница — COALESCE(state_at, fetched_at), где
+        state_at = момент доставки (set_digested/delivered). Для старых строк
+        (state_at=NULL) fallback → fetched_at. Новость, пролежавшая в deferred
+        >24ч и доставленная утром (state_at внутри окна), попадает в RECENT
+        вечернего окна.
+
+        Args:
+            cutoff_iso: граница окна (ISO-8601, UTC). Все items с
+                fetched_at >= cutoff_iso попадают в выборку.
+                Для дайджеста это ``window_start_iso`` (начало текущего окна).
+            limit: максимум возвращаемых записей (default 200).
+                0 = без лимита (используйте осознанно).
+
+        Returns:
+            List[dict], каждый dict: ``{'title': str, 'source': str}``.
+            Пустой список если ничего не найдено или при ошибке БД.
+        """
+        try:
+            conn = self._connect()
+            params: list = [cutoff_iso]
+            limit_sql = ""
+            if limit and limit > 0:
+                limit_sql = " LIMIT ?"
+                params.append(int(limit))
+            rows = conn.execute(
+                f"""
+                SELECT title, source
+                FROM items
+                WHERE state IN ('digested', 'delivered')
+                  AND COALESCE(state_at, fetched_at) >= ?
+                ORDER BY COALESCE(state_at, fetched_at) DESC{limit_sql}
+                """,
+                params,
+            ).fetchall()
+            return [{"title": r[0], "source": r[1]} for r in rows]
+        except Exception as e:
+            logger.warning(
+                "get_shown_for_window: ошибка при cutoff=%s: %s — "
+                "возвращаем пустой список (fail-open)",
+                cutoff_iso, e,
+            )
+            return []
 
     def save_skipped(self, item: NewsItem) -> bool:
         """

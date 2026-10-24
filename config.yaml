@@ -157,6 +157,13 @@ digest:
   cluster_duplicates: true          # финальная LLM-кластеризация deferred перед отправкой (убирает дубли одного события)
   max_age_hours: 24                 # выбирать deferred-items не старше N часов (суточное окно)
   bootstrap_window_hours: 24        # окно начального наполнения дайджеста (сутки)
+  window_anchor: "20:00"             # якорь HH:MM в локальном времени; граница окна =
+                                    # всегда вчерашний предшествующий якорь (08:00 → вчера 20:00,
+                                    # 20:00 → вчера 20:00). При anchor-режиме max_age_hours не
+                                    # ограничивает выборку (lag scheduler не урезает 24ч-окно
+                                    # владельца). При отсутствии/битом значении — fallback на
+                                    # digest_window_started_at из meta.
+  guarantee_min_score: 3           # порог llm_score для добора skipped-items в гарантию категорий
   max_per_location: 2               # макс. новостей на локацию/день в дайджесте
 
   # Минимум новостей по категории (каждая учитывается по скорингу)
@@ -235,7 +242,7 @@ llm:
     threshold: 2.0
     check_interval_hours: 24
   max_per_cycle: 150            # макс. LLM-оценок (items) на цикл (Major #1-фикс: теперь в items, не в вызовах)
-  max_tokens: 4096             # лимит completion tokens (Major #2-фикс: батч 10 items ≈ 4000 токенов + запас)
+  max_tokens: 4608             # лимит completion tokens (v15: title_en +25-50 токенов/item × 10 = +250-500; поднят с 4096)
   batch_size: 10              # оценка ≤10 новостей одним LLM-вызовом (1=поштучно)
   # off_peak_only: ограничить LLM-вызовы непиковыми часами DeepSeek (×0.5).
   #   По умолчанию false (текущее поведение — без ограничений).

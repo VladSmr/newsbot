@@ -115,7 +115,7 @@ class TestLangStorage:
             ).fetchall()}
             assert "lang" in cols2, "миграция v14 не добавила items.lang"
             version = s2._connect().execute("PRAGMA user_version").fetchone()[0]
-            assert int(version) == Storage.SCHEMA_VERSION == 14
+            assert int(version) == Storage.SCHEMA_VERSION == 15
 
             items = s2.get_all_by_state("new")
             assert len(items) == 1
@@ -1087,7 +1087,7 @@ class TestDedupFloatIndices:
         """[1.0, 2.0] → дубли найдены (1.0 = лидер чанка, 2.0 → индекс 1)."""
         flt = self._filter()
         dups = flt._parse_dedup_response(
-            {"duplicates": [1.0, 2.0]}, chunk_len=3, chunk_offset=0
+            {"duplicates": [1.0, 2.0]}, chunk_len=3, chunk_offset=0, recent=[],
         )
         assert dups == {1}
 
@@ -1097,13 +1097,14 @@ class TestDedupFloatIndices:
             {"duplicates": [2.5, float("nan"), float("inf"), 3.0]},
             chunk_len=3,
             chunk_offset=0,
+            recent=[],
         )
         assert dups == {2}
 
     def test_float_out_of_range_ignored(self):
         flt = self._filter()
         assert flt._parse_dedup_response(
-            {"duplicates": [4.0]}, chunk_len=3, chunk_offset=0
+            {"duplicates": [4.0]}, chunk_len=3, chunk_offset=0, recent=[],
         ) == set()
 
 

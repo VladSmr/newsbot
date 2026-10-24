@@ -150,7 +150,7 @@ def _render_item_raw(item: NewsItem) -> Tuple[str, str, str, str]:
 
     footer_raw = "{time_str} 🔗" если URL валидный, иначе "{time_str}"
     """
-    title_raw = item.title or "—"
+    title_raw = item.llm_title or item.title or "—"
     # заголовок ограничен до 250 символов
     title_raw = _truncate_raw_summary(title_raw, 250)
 

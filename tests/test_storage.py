@@ -115,7 +115,10 @@ class TestUrlNormalizationDedup:
     def test_utm_without_utm_collapsed(self, tmp_db):
         """Статья с utm и без — один и тот же ключ → дубликат."""
         url_bare = "https://www.aljazeera.com/news/politics/article"
-        url_tracked = f"{url_bare}?utm_source=rss&traffic_source=rss&ref=newsletter"
+        # M3-фикс: utm и traffic_source вырезаются; ref остаётся (не в TRACKING_PARAMS),
+        # поэтому ref в URL-параметрах делает нормализованные ключи разными.
+        # Тест проверяет: utm + traffic_source убираются → bare vs utm = дубликат.
+        url_tracked = f"{url_bare}?utm_source=rss&traffic_source=rss"
 
         item1 = NewsItem(
             source="Al Jazeera",
@@ -136,7 +139,7 @@ class TestUrlNormalizationDedup:
         saved1 = tmp_db.save(item1)
         assert saved1, "Первый item должен быть сохранён"
 
-        # Второй — дубликат (та же нормализованная ссылка)
+        # Второй — дубликат (utm + traffic_source вырезаны → ключи совпадают)
         assert tmp_db.is_duplicate(item2), "item2 должен считаться дубликатом item1"
         saved2 = tmp_db.save(item2)
         assert not saved2, "Дубликат не должен вставляться"
@@ -235,14 +238,17 @@ class TestUrlNormalizationDedup:
         assert "url_norm" in cols, "Колонка url_norm должна существовать в items"
 
     def test_url_norm_index_created(self, tmp_db):
-        """UNIQUE INDEX idx_items_url_norm существует."""
+        """UNIQUE INDEX idx_items_url_norm существует, idx_items_url — не-unique замена."""
         conn = tmp_db._connect()
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"
         ).fetchall()
         index_names = {r[0] for r in rows}
         assert "idx_items_url_norm" in index_names, f"Индекс url_norm должен существовать: {index_names}"
-        assert "idx_items_url" not in index_names, "Старый индекс url должен быть заменён"
+        # M4: idx_items_url восстановлен как не-unique (для ускорения WHERE url IN(...))
+        assert "idx_items_url" in index_names, (
+            f"Индекс idx_items_url должен существовать (не-unique замена): {index_names}"
+        )
 
     def test_trailing_slash_dedup(self, tmp_db):
         """URL с завершающим слэшом и без — дубликаты."""
@@ -324,7 +330,7 @@ class TestV14Migration:
         storage2 = Storage(db_path=db_path)
         conn3 = storage2._connect()
         version = conn3.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 14, f"user_version должен быть 14, got {version}"
+        assert version == 15, f"user_version должен быть 15, got {version}"
 
         # Проверяем: нет NULL в url_norm
         nulls = conn3.execute(
@@ -536,14 +542,155 @@ class TestV14Migration:
         conn4.close()
         storage2.close()
 
-        assert version == 14, f"user_version должен быть 14, got {version}"
+        assert version == 15, f"user_version должен быть 15, got {version}"
         assert "idx_items_url_norm" in indexes, (
             f"idx_items_url_norm должен существовать: {indexes}"
         )
-        assert "idx_items_url" not in indexes, (
-            f"Старый idx_items_url должен быть удалён: {indexes}"
+        # M4: idx_items_url остаётся в БД (восстановлен как не-unique)
+        assert "idx_items_url" in indexes, (
+            f"idx_items_url должен существовать (не-unique): {indexes}"
         )
         assert nulls == 0, f"Не должно быть url_norm IS NULL, found {nulls}"
+
+    def test_migration_variant_a_then_restart_succeeds(self, tmp_path):
+        """
+        B1-тест: crash-loop на v13→v14 с дублирующимися url_norm.
+        1. Миграция падает (IntegrityError, user_version=13, старый idx_items_url сохранён).
+        2. Оператор выполняет Вариант A: обнуляет url_norm у дубликатов.
+        3. Рестарт: backfill (B1-фикс) заполняет url_norm для неконфликтных строк;
+           конфликтные строки остаются url_norm IS NULL.
+        4. UNIQUE-индекс idx_items_url_norm создаётся; idx_items_url дропнут.
+        5. Бот стартует (user_version=14).
+        """
+        import sqlite3
+
+        db_path = tmp_path / "variant_a_test.db"
+
+        # Создаём v14-совместимую схему без Storage (минуя миграцию)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA user_version = 14")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                url TEXT NOT NULL,
+                url_norm TEXT,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                published TEXT,
+                tags TEXT,
+                cluster_key TEXT,
+                lang TEXT,
+                fetched_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'new',
+                state_at TEXT NOT NULL,
+                llm_score INTEGER,
+                llm_summary TEXT,
+                llm_reason TEXT,
+                llm_urgent INTEGER,
+                filtered_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_items_url ON items(url);
+            CREATE TABLE IF NOT EXISTS seen_titles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title_hash TEXT NOT NULL,
+                source TEXT,
+                fetched_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                title_normalized TEXT
+            );
+        """)
+        now = "2025-10-01T00:00:00"
+
+        # Три строки: S1 и S2 конфликтуют по url_norm,
+        # S3 — нормальный неконфликтный URL.
+        conn.execute(
+            "INSERT INTO items (source, url, title, summary, published, "
+            "fetched_at, state, state_at, url_norm) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)",
+            ("S1", "https://c.com?utm_source=rss", "Title 1", "x", "2025-10-01", now, now, "https://c.com/"),
+        )
+        conn.execute(
+            "INSERT INTO items (source, url, title, summary, published, "
+            "fetched_at, state, state_at, url_norm) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)",
+            ("S2", "https://c.com/", "Title 2", "x", "2025-10-01", now, now, "https://c.com/"),
+        )
+        conn.execute(
+            "INSERT INTO items (source, url, title, summary, published, "
+            "fetched_at, state, state_at, url_norm) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)",
+            ("S3", "https://d.com/page", "Title 3", "x", "2025-10-01", now, now, "https://d.com/page"),
+        )
+        conn.commit()
+        conn.close()
+
+        # Подменяем user_version → 13 (имитируем v13 БД)
+        conn2 = sqlite3.connect(str(db_path))
+        conn2.execute("PRAGMA user_version = 13")
+        conn2.close()
+
+        # Миграция должна поднять IntegrityError
+        integrity_error_raised = False
+        try:
+            Storage(db_path=db_path)
+        except sqlite3.IntegrityError:
+            integrity_error_raised = True
+        assert integrity_error_raised, "Первая миграция должна упасть на IntegrityError"
+
+        # Вариант A: обнуляем url_norm у дубликатов (оставляем MIN rowid)
+        conn3 = sqlite3.connect(str(db_path))
+        conn3.execute(
+            "UPDATE items SET url_norm = NULL WHERE rowid NOT IN ("
+            "  SELECT MIN(rowid) FROM items GROUP BY url_norm"
+            "  HAVING url_norm IS NOT NULL"
+            ")"
+        )
+        conn3.commit()
+        # Убеждаемся что конфликтные строки обнулены
+        null_count = conn3.execute(
+            "SELECT COUNT(*) FROM items WHERE url_norm IS NULL"
+        ).fetchone()[0]
+        conn3.close()
+        assert null_count == 1, f"После Вариант A ровно 1 строка с url_norm IS NULL, got {null_count}"
+
+        # Рестарт: миграция должна пройти успешно (B1-фикс: backfill
+        # пропускает конфликтную строку, UNIQUE-индекс создаётся)
+        storage2 = Storage(db_path=db_path)
+        conn4 = storage2._connect()
+
+        version = conn4.execute("PRAGMA user_version").fetchone()[0]
+        indexes = {
+            r[0] for r in conn4.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        nulls_after = conn4.execute(
+            "SELECT COUNT(*) FROM items WHERE url_norm IS NULL"
+        ).fetchone()[0]
+        conn4.close()
+        storage2.close()
+
+        assert version == 15, f"user_version должен быть 15, got {version}"
+        assert "idx_items_url_norm" in indexes, (
+            f"idx_items_url_norm должен существовать: {indexes}"
+        )
+        # M4: idx_items_url остаётся (восстановлен как не-unique)
+        assert "idx_items_url" in indexes, (
+            f"idx_items_url должен существовать (не-unique): {indexes}"
+        )
+        # Конфликтная строка осталась с url_norm IS NULL (B1: best-effort)
+        assert nulls_after == 1, (
+            f"Конфликтная строка осталась с url_norm IS NULL, got {nulls_after}"
+        )
+        # Неконфликтная строка залита (backfill сработал для S3)
+        conn5 = sqlite3.connect(str(db_path))
+        non_null = conn5.execute(
+            "SELECT COUNT(*) FROM items WHERE url_norm IS NOT NULL"
+        ).fetchone()[0]
+        conn5.close()
+        assert non_null == 2, f"Должны быть 2 строки с заполненным url_norm, got {non_null}"
 
     def test_migration_idempotent(self, tmp_path):
         """
@@ -583,8 +730,8 @@ class TestV14Migration:
         conn2.close()
         storage2.close()
 
-        assert v1 == 14, f"Первая миграция: user_version={v1}"
-        assert v2 == 14, f"Повторный вызов: user_version={v2}"
+        assert v1 == 15, f"Первая миграция: user_version={v1}"
+        assert v2 == 15, f"Повторный вызов: user_version={v2}"
         assert "idx_items_url_norm" in indexes, (
             f"Индекс после повторного вызова: {indexes}"
         )

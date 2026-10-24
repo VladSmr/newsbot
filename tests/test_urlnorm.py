@@ -71,14 +71,14 @@ class TestTrackingParams:
         url = (
             "https://example.com/page?"
             "fbclid=abc123&gclid=xyz&mc_cid=mid&mc_eid=eid&"
-            "ref=newsletter&id=99"
+            "referrer=newsletter&id=99"
         )
         result = normalize_url(url)
         assert "fbclid" not in result
         assert "gclid" not in result
         assert "mc_cid" not in result
         assert "mc_eid" not in result
-        assert "ref=" not in result
+        assert "referrer=" not in result
         assert "id=99" in result
 
     def test_spam_referrer_removed(self):
@@ -91,11 +91,13 @@ class TestTrackingParams:
 
     def test_utm_with_legit_params_kept(self):
         """Легитимные параметры сохраняются рядом с utm."""
-        url = "https://example.com/view?p=12345&category=tech&ref=section"
+        url = "https://example.com/view?p=12345&category=tech&ref=section&s=menu"
         result = normalize_url(url)
         assert "p=12345" in result
         assert "category=tech" in result
-        # ref удаляется, но другие остаются
+        # ref, s — НЕ в TRACKING_PARAMS, сохраняются
+        assert "ref=section" in result
+        assert "s=menu" in result
         assert "utm_source" not in result
 
     def test_empty_tracking_params_removed(self):

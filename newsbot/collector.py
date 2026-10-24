@@ -114,6 +114,7 @@ class NewsItem:
     llm_score: Optional[int] = None          # оценка 0..10
     llm_summary: Optional[str] = None       # выжимка от LLM
     llm_reason: Optional[str] = None         # краткое пояснение
+    llm_title: Optional[str] = None         # EN-перевод заголовка от LLM (v15)
     # C1: llm_urgent — персистентный флаг срочности (INTEGER 0/1 в БД, v10).
     # None при первом LLM-вызове; заполняется после evaluate + update_llm_results_batch.
     # Retry: восстанавливается из БД через _rows_to_items → retry сохраняет срочность.
@@ -430,10 +431,25 @@ class FeedCollector:
                              getattr(entry, "title", "")[:50])
                 continue
 
+            # M4b-фикс: относительные ссылки (/path, ../page) резолвятся
+            # через urljoin относительно feed_url (параметр `url` функции
+            # _fetch_feed). Абсолютные URL не меняются.
+            from urllib.parse import urljoin
+            resolved_link = urljoin(url, link)
+
+            # M4b-фикс: требуем валидный http(s)+host. Невалидная ссылка
+            # (пустой host, кривой URL) — WARNING и item пропускается.
+            if not self._validate_url(resolved_link):
+                logger.warning(
+                    "[%s] пропущен entry с невалидной ссылкой: %s  (feed: %s)",
+                    name, resolved_link[:200], feed_url,
+                )
+                continue
+
             # URL normalization (tracking-параметры, lowercase, sort, fragment).
             # Применяется ДО создания NewsItem — нормализованный URL сохраняется
             # в БД и используется при дедупликации (is_duplicate + UNIQUE index).
-            link_normalized = normalize_url(link)
+            link_normalized = normalize_url(resolved_link)
 
             # P2-фикс: ошибка конвертации ОДНОГО entry (кривой _strip_html,
             # не-str term в tags, битый title в extract_location) не должна
@@ -523,14 +539,19 @@ def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Opt
     if title:
         from .stemmer import stem_hash
         stem = stem_hash(title)
-        import hashlib
         loc = ""  # локация пока неизвестна → пустая → 'other'
         loc_norm = loc.strip().lower() or "other"
         pub_day = published_str[:10] if (published_str and len(published_str) >= 10) else "unknown"
         if stem:
             cluster_key = f"{loc_norm}|{stem}|{pub_day}"
         else:
-            title_hash = hashlib.md5(b"").hexdigest()[:12]
+            # M1-фикс: nostem-per-title hash — разные title → разные keys.
+            # title гарантированно non-empty здесь (попали в if title:).
+            # link передаётся как fallback (если title по какой-то причине пустой
+            # при вызове из build_cluster_key).
+            import hashlib
+            title_or_url = title if title else (link or "")
+            title_hash = hashlib.md5(title_or_url.encode()).hexdigest()[:12]
             cluster_key = f"{loc_norm}|nostem:{title_hash}|{pub_day}"
 
     return NewsItem(

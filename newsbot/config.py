@@ -114,7 +114,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_per_cycle": 150,
         "off_peak_only": False,
         "batch_size": 10,
-        "max_tokens": 4096,
+        "max_tokens": 4608,  # v15: title_en +25-50 токенов/item × 10 batch = +250-500; поднят с 4096
         "llm_dedup": True,
         "push_urgent_only": True,
         # Pricing: USD per 1M tokens (DeepSeek-V4.1-Flash, verified from official price page, effective 10.09.2026)

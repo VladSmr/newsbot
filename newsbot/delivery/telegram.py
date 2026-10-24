@@ -431,7 +431,7 @@ class TelegramDelivery:
         _MAX_RAW_TITLE = 250  # до escape, чтобы избежать обрыва сущностей
         _MAX_RAW_FOOTER_SOURCE = 100
 
-        raw_title = _strip_control_chars(item.title or "—")
+        raw_title = _strip_control_chars(item.llm_title or item.title or "—")
         if len(raw_title) > _MAX_RAW_TITLE:
             raw_title = raw_title[:_MAX_RAW_TITLE]
 

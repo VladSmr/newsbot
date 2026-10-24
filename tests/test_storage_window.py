@@ -224,6 +224,120 @@ class TestStorageWindow(unittest.TestCase):
         self.assertEqual(deleted, 0)
 
     # ─────────────────────────────────────────────────────────────────
+    # M5: retention_days ограничивает оконную чистку снизу
+    # ─────────────────────────────────────────────────────────────────
+
+    def test_delete_items_before_retention_days_7_item_08h_ago_lives(self):
+        """
+        M5-тест: item доставлен 8 часов назад. Дайджест в 20:00,
+        window_start ~08:00, но retention_days=7. Строка ЖИВА
+        (ноже retention-границы — 7 дней назад < 8 часов назад).
+        """
+        # 8 часов назад: fetched_at < window_start, но > retention_days
+        self._insert("delivered", hours_ago=8, title="Recent8h", url="https://ex.com/8h")
+        window_start = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+
+        # retention_days=7: effective_cutoff = min(window_start, now - 7 дней)
+        # 8 часов назад НЕ старше now - 7 дней → НЕ удаляется
+        deleted = self.storage.delete_items_before(
+            window_start, retention_days=7,
+        )
+        self.assertEqual(deleted, 0,
+            "Item 8ч назад при retention_days=7 не должен быть удалён")
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        remaining = conn.execute(
+            "SELECT title FROM items"
+        ).fetchall()
+        conn.close()
+        self.assertIn("Recent8h", {r["title"] for r in remaining},
+            "Recent8h item должен остаться в БД")
+
+    def test_delete_items_before_retention_days_7_item_8days_ago_removed(self):
+        """
+        M5-тест: item доставлен 8 дней назад. Дайджест в 20:00,
+        window_start ~08:00, но retention_days=7. Строка УДАЛЯЕТСЯ
+        (старше retention-границы — now - 7 дней < 8 дней назад).
+        """
+        # 8 дней назад: fetched_at < window_start И < now - 7 дней
+        self._insert("delivered", hours_ago=8 * 24, title="Old8days", url="https://ex.com/8d")
+        window_start = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+
+        # retention_days=7: effective_cutoff = min(window_start, now - 7 дней)
+        # 8 дней назад > now - 7 дней назад → УДАЛЯЕТСЯ
+        deleted = self.storage.delete_items_before(
+            window_start, retention_days=7,
+        )
+        self.assertEqual(deleted, 1,
+            "Item 8 дней назад при retention_days=7 должен быть удалён")
+
+    def test_delete_items_before_retention_days_none_uses_default(self):
+        """
+        B3-тест: retention_days=None → DEFAULT_RETENTION_DAYS=1 (как purge_items).
+        Item 48ч назад всё равно удаляется: он старше cutoff 24ч, даже если
+        effective_cutoff не ограничен retention (48ч > 24ч cutoff → DELETED).
+        """
+        # Item 48ч назад — за пределами 24ч окна
+        self._insert("delivered", hours_ago=48, title="Old48", url="https://ex.com/48h")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+        # B3-fix: None → resolved_retention=1. effective_cutoff = min(24h, 1d) = 24h.
+        # 48ч назад < 24ч cutoff → УДАЛЯЕТСЯ (same result, different reason).
+        deleted = self.storage.delete_items_before(cutoff, retention_days=None)
+        self.assertEqual(deleted, 1,
+            "При retention_days=None (B3-fix: default=1) удаляется по window_start (24ч назад)")
+
+    def test_delete_items_before_retention_days_wins_when_older_than_window(self):
+        """
+        M5-тест: window_start старше retention_days → effective cutoff = retention.
+        Окно ~25ч назад, но retention=7 дней → effective_cutoff = now - 7 дней
+        (min: более поздняя/свежая граница = менее агрессивная, удаляет меньше).
+        """
+        # 8 часов назад — за пределами 25ч окна, но внутри 7-дневного retention
+        self._insert("delivered", hours_ago=8, title="WithinRetention", url="https://ex.com/ret")
+        # Окно 25ч назад (например, был пропуск цикла)
+        window_start = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+
+        # retention_days=7: min(window_start, now - 7 дней) = now - 7 дней
+        # 8ч назад НЕ старше now - 7 дней → ЖИВ
+        deleted = self.storage.delete_items_before(
+            window_start, retention_days=7,
+        )
+        self.assertEqual(deleted, 0,
+            "Item 8ч назад при retention_days=7 жив, даже если window_start=25ч назад")
+
+    def test_delete_items_before_retention_clamp_min_semantics(self):
+        """
+        M5-тест: РАЗЛИЧАЮЩИЙ — retention_days "моложе" window_start.
+        Окно 25ч назад, но retention=7 дней.
+        Old max-семантика (max): effective_cutoff=25h → items 13-25h ago УДАЛЯЮТСЯ
+        (BUG: они новее retention-границы 7d и не должны удаляться).
+        New min-семантика (min): effective_cutoff=7d → items 13-25h ЖИВЫ (FIXED).
+        """
+        # Item 20ч назад: fetched_at < window_start (25ч), но НЕ старше
+        # retention (7d) → ЖИВ с min, УДАЛЯЕТСЯ с max.
+        self._insert("delivered", hours_ago=20, title="ShouldLive",
+                     url="https://ex.com/20h")
+        window_start = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+
+        deleted = self.storage.delete_items_before(
+            window_start, retention_days=7,
+        )
+        # New min: effective_cutoff = min(25h, 7d) = 7d. 20h NOT < 7d → ЖИВ.
+        # Old max: effective_cutoff = max(25h, 7d) = 25h. 20h < 25h → DELETE (BUG).
+        self.assertEqual(deleted, 0,
+            "Item 20ч назад жив: новее retention=7d, "
+            "old max-семантика неверно удаляла его (effective=25h)")
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        remaining = {r["title"] for r in conn.execute("SELECT title FROM items").fetchall()}
+        conn.close()
+        self.assertIn("ShouldLive", remaining,
+            "Item 20ч назад должен остаться (protected by retention=7d, not window=25h)")
+
+    # ─────────────────────────────────────────────────────────────────
     # get_oldest_unprocessed_fetched_at
     # ─────────────────────────────────────────────────────────────────
 

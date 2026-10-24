@@ -33,7 +33,7 @@ import re
 import time as _time
 from datetime import datetime, timedelta, timezone as tz
 from email.utils import parsedate_to_datetime as _parsedate_to_dt
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from .collector import FeedCollector, FeedResult, NewsItem
 from .dedup import filter_new
@@ -106,6 +106,16 @@ def _coerce_int(value, default: int = 0, context: str = "значение") -> i
             context, value, floored,
         )
     return floored
+
+
+def _local_now() -> datetime:
+    """
+    Returns current UTC time converted to local timezone.
+
+    Extracted to a function so tests can patch it for TZ-independent testing.
+    Windows pytest can't use time.tzset(), so instead we patch this function.
+    """
+    return datetime.now(tz.utc).astimezone()
 
 
 def _normalize_category_min(raw) -> Dict[str, int]:
@@ -437,6 +447,7 @@ def build_cluster_key(
 
 def rebuild_cluster_key(
     llm_location: str, old_cluster_key: Optional[str],
+    title: Optional[str] = None,
 ) -> str:
     """
     Пересобирает cluster_key с LLM-локацией вместо словарной.
@@ -446,8 +457,9 @@ def rebuild_cluster_key(
     и закодирован в old_cluster_key.
 
     Для items без старого cluster_key возвращается ключ с LLM-локацией
-    и nostem (пустой title hash). Для items с пустой LLM-локацией →
-    'other' (cap не применяется — глобальные/непонятные темы).
+    и nostem-per-title hash (все items без stem, но с разными title →
+    разные keys → нет заражения score-propagation между новостями без stem).
+    Для items с пустой LLM-локацией → 'other' (cap не применяется).
 
     Parameters
     ----------
@@ -457,11 +469,23 @@ def rebuild_cluster_key(
     old_cluster_key : str or None
         Cluster_key, вычисленный при ингесте. Части stem и pub_day
         используются повторно.
+    title : str, optional
+        Исходный title item для nostem-per-title hash.
+        Fallback на url обрабатывается вызывающей стороной (_process_batch)
+        до вызова этой функции: ``title=getattr(item,'title',None) or
+        getattr(item,'url',None)``. Если title всё ещё None → md5(b"")
+        (крайний случай, очень редко на практике).
 
     Returns
     -------
     str
         Новый cluster_key: ``normalized_location|stem_or_nostem|pub_day``
+
+    M1-фикс: nostem-per-title hash.
+      Без title все nostem-items получали md5(b"") → ОДИНАКОВЫЙ cluster_key →
+      один cluster → один score-propagation cycle → заражённый score.
+      Теперь: md5(title_or_url)[:12] → разные title = разные keys = разные
+      clusters → каждый item получает свой score-propagation slot.
 
     MAJOR 5-фикс: нормализация локации.
       (a) Промпт LLM запрашивает каноничный формат (english, «City, Country»);
@@ -495,7 +519,16 @@ def rebuild_cluster_key(
     if stem:
         return f"{loc_norm}|{stem}|{pub_day}"
     else:
-        title_hash = hashlib.md5(b"").hexdigest()[:12]
+        # M1: nostem-per-title hash. title_or_url гарантирует уникальность
+        # (разные title → разные hash → разные cluster_key → разные clusters).
+        title_or_url = title if title else ""
+        if not title_or_url:
+            # Крайний fallback: md5 пустой строки даёт детерминированный,
+            # но неуникальный ключ. Один на все items без title и без url.
+            # Это приемлемый краевой случай (очень редкий на практике).
+            title_hash = hashlib.md5(b"").hexdigest()[:12]
+        else:
+            title_hash = hashlib.md5(title_or_url.encode()).hexdigest()[:12]
         return f"{loc_norm}|nostem:{title_hash}|{pub_day}"
 
 
@@ -994,7 +1027,49 @@ class NewsPipeline:
         )
         return len(dup_urls)
 
-    def _cluster_deferred_duplicates(self, items: List[NewsItem]) -> Set[str]:
+    def _check_against_shown(
+        self,
+        candidates: List[NewsItem],
+        recent_shown: List[dict],
+    ) -> Set[str]:
+        """
+        Проверяет пул кандидатов (backfill/guarantee/skipped) против показанных
+        за окно. Один LLM-вызов detect_duplicates(candidates, recent_shown)
+        на весь пул → O(1) LLM-вызовов вместо O(N).
+
+        Returns: set of duplicate URLs.
+        """
+        if not candidates or not recent_shown:
+            return set()
+        llm_filter = getattr(self, "llm_filter", None)
+        if llm_filter is None:
+            return set()
+        # MAJOR-фикс (4c): один батчевый вызов на весь пул (backfill, skipped).
+        # detect_duplicates снят len<2 guard при непустом RECENT.
+        try:
+            dup_idx = llm_filter.detect_duplicates(candidates, recent_shown)
+        except Exception as e:
+            logger.warning(
+                "Дайджест: RECENT-дедуп пула (%d кандидатов) упал: %s — "
+                "пропускаем (fail-open)",
+                len(candidates), e,
+            )
+            return set()
+        dup_urls: Set[str] = set()
+        # При непустом RECENT лидер (i=0) может быть дублем показанного.
+        for i in dup_idx:
+            if isinstance(i, int) and 0 <= i < len(candidates):
+                dup_urls.add(candidates[i].url)
+        if dup_urls:
+            logger.info(
+                "Дайджест: backfill/guarantee RECENT-дедуп отсеял %d из %d",
+                len(dup_urls), len(candidates),
+            )
+        return dup_urls
+
+    def _cluster_deferred_duplicates(
+        self, items: List[NewsItem], window_start_iso: str,
+    ) -> Tuple[Set[str], List[dict]]:
         """
         Семантическая кластеризация deferred-новостей ПЕРЕД дайджестом.
 
@@ -1003,52 +1078,102 @@ class NewsPipeline:
         все, кроме лидера — первого в текущем порядке выдачи
         (наиболее приоритетного). Лидеры остаются в дайджесте.
 
-        Возвращает set URL'ов-дублей. При любой ошибке / отсутствии LLM /
-        выключенном флаге / пике DeepSeek — пустое множество
-        (безопасно: дубли уйдут как есть, ничего не теряется).
+        Кросс-оконный дедуп: для RECENT-контекста берутся новости,
+        УЖЕ показанные в текущем дайджест-окне (state IN ('digested','delivered'),
+        fetched_at >= window_start_iso). Это отсекает перефразированные дубли
+        из предыдущего слота того же окна (утро → вечер). Кандидаты
+        (``deferred``) НЕ попадают в RECENT автоматически (другой state).
+
+        Returns
+        -------
+        Tuple[Set[str], List[dict]]
+            (set of duplicate URLs, list of recent_shown dicts).
+            recent_shown возвращается для повторного использования в
+            backfill/guarantee (Fix 4c: всё в отправленном дайджесте
+            прошло RECENT-дедуп).
+
+        При любой ошибке / отсутствии LLM / выключенном флаге / пике DeepSeek —
+        возвращает (empty set, empty list) — безопасно.
+
+        Args:
+            items: deferred-кандидаты текущего дайджеста.
+            window_start_iso: граница текущего окна (ISO-8601, UTC).
+                Все digested/delivered items с fetched_at >= window_start_iso
+                попадают в RECENT-контекст для LLM-дедупа.
         """
-        if not items or len(items) < 2:
-            return set()
+        if not items:
+            return (set(), [])
+
+        # Кросс-оконный дедуп: собираем показанные за окно (digested + delivered).
+        # Fail-open: ошибка storage → пустой RECENT (не рвём дайджест).
+        # Fetched early so it's available for all early-return paths.
+        try:
+            recent_shown: List[dict] = self.storage.get_shown_for_window(
+                cutoff_iso=window_start_iso,
+                limit=200,
+            )
+        except Exception as e:
+            logger.warning(
+                "Дайджест: get_shown_for_window упала (cutoff=%s): %s — "
+                "используем пустой RECENT-контекст",
+                window_start_iso, e,
+            )
+            recent_shown = []
+
+        # MAJOR-фикс (4a): с RECENT непустым — вызываем detect_duplicates
+        # для одиночного кандидата (может быть дублем показанного).
+        # Без RECENT и <2 кандидатов — early-return (лидеру не с чем быть дублем).
+        if len(items) < 2 and not recent_shown:
+            return (set(), recent_shown)
+
         digest_cfg = self.config.get("digest", {}) or {}
         if not _parse_bool(digest_cfg.get("cluster_duplicates", True)):
-            return set()
+            return (set(), recent_shown)
         # Cost-инвариант: в пик DeepSeek LLM не вызываем (как _run_llm_dedup).
         off_peak_only = getattr(self, "_off_peak_only", False)
         if off_peak_only and not is_llm_allowed_now(off_peak_only):
             logger.info(
                 "Дайджест: кластеризация дублей пропущена (пик DeepSeek, off_peak_only)",
             )
-            return set()
+            return (set(), recent_shown)
         llm_filter = getattr(self, "llm_filter", None)
         if llm_filter is None:
-            return set()
+            return (set(), recent_shown)
+
         try:
-            dup_idx = llm_filter.detect_duplicates(list(items), [])
+            dup_idx = llm_filter.detect_duplicates(list(items), recent_shown)
         except Exception as e:
             logger.warning("Дайджест: кластеризация дублей упала: %s", e)
-            return set()
+            return (set(), recent_shown)
         if not isinstance(dup_idx, (set, frozenset)):
-            return set()
+            return (set(), recent_shown)
         urls: Set[str] = set()
         for i in dup_idx:
-            # Индекс 0 — лидер первой чанки: он не может быть дублем.
-            if i == 0:
+            # MAJOR-фикс (4b): лидер (i=0) НЕ пропускается только когда RECENT
+            # пуст (классический внутри-чанковый дедуп; у лидера нет предшественника).
+            # При непустом RECENT — лидер может быть дублем показанного (и
+            # _parse_dedup_response уже отдаёт его в dup_idx).
+            if i == 0 and not recent_shown:
                 continue
             if isinstance(i, int) and 0 <= i < len(items):
                 urls.add(items[i].url)
         # Инвариант: хотя бы один item (лидер) должен остаться в дайджесте.
-        if len(urls) >= len(items):
+        # Действует ТОЛЬКО при пустом RECENT. Когда RECENT непуст,
+        # ЛЕГИТИМНЫЙ сценарий «все кандидаты — пересказы утренних показанных»
+        # → все {i} дублі → len(urls)==len(items), и отправлять НЕ нужно.
+        # Без этого условия код «спасал» бы все дубли и отправлял их.
+        if not recent_shown and len(urls) >= len(items):
             logger.warning(
                 "Дайджест: кластеризация пометила все %d items дублями — "
                 "игнорируем результат (лидер должен остаться)", len(items),
             )
-            return set()
+            return (set(), recent_shown)
         if urls:
             logger.info(
                 "Дайджест: кластеризация отсеяла %d дублей из %d",
                 len(urls), len(items),
             )
-        return urls
+        return (urls, recent_shown)
 
     def _build_delivery(self, config: dict) -> Delivery:
         token = config.get("telegram", {}).get("token", "") or ""
@@ -1468,6 +1593,11 @@ class NewsPipeline:
                         summary=item.llm_summary or item.summary,
                         reason=item.llm_reason or "",
                         urgent=bool(item.llm_urgent) if item.llm_urgent is not None else False,
+                        # M1: сохраняем llm_title из БД — retry НЕ должен его затирать.
+                        # Без этого: FilterResult.title_en=None → llm_batch_records title_en=None
+                        # → update_llm_results_batch стирал llm_title в NULL
+                        # → следующий рендер fallback на RU-title.
+                        title_en=getattr(item, "llm_title", None),
                     )
                     item._batch_result = res
 
@@ -1492,6 +1622,7 @@ class NewsPipeline:
                         item.llm_score = res.score
                         item.llm_summary = res.summary
                         item.llm_reason = res.reason
+                        item.llm_title = getattr(res, "title_en", None)
                         item._batch_result = res
                         # Пересобираем cluster_key с LLM-локацией.
                         # Res.ok=False: LLM-ошибка → location='', rebuild даст 'other'.
@@ -1499,6 +1630,7 @@ class NewsPipeline:
                         new_key = rebuild_cluster_key(
                             getattr(res, "location", "") or "",  # defensive
                             getattr(item, "cluster_key", None),
+                            title=getattr(item, "title", None) or None,
                         )
                         item.cluster_key = new_key
 
@@ -1721,6 +1853,7 @@ class NewsPipeline:
                     "reason": "",
                     "urgent": False,
                     "cluster_key": getattr(item, "cluster_key", None),
+                    "title_en": getattr(res, "title_en", None),
                 })
             else:
                 to_deliver.append(item)
@@ -1738,6 +1871,7 @@ class NewsPipeline:
                 "reason": res.reason,
                 "urgent": res.urgent,
                 "cluster_key": getattr(item, "cluster_key", None),
+                "title_en": getattr(res, "title_en", None),
             })
         elif r == "digest":
             deferred_urls.append(item.url)
@@ -1748,6 +1882,7 @@ class NewsPipeline:
                 "reason": res.reason,
                 "urgent": res.urgent,
                 "cluster_key": getattr(item, "cluster_key", None),
+                "title_en": getattr(res, "title_en", None),
             })
         else:
             # r == "push"
@@ -1760,6 +1895,7 @@ class NewsPipeline:
                 "reason": res.reason,
                 "urgent": res.urgent,
                 "cluster_key": getattr(item, "cluster_key", None),
+                "title_en": getattr(res, "title_en", None),
             })
 
     def _check_and_mark_failed(self, failed_retry_urls: List[str]) -> None:
@@ -1858,10 +1994,59 @@ class NewsPipeline:
         grace_delta = timedelta(minutes=poll_interval_minutes)
 
         # ── Оконная логика: граница окна ───────────────────────────────────
+        # Задача 1: слотовое окно с якорем.
+        # digest.window_anchor = "HH:MM" (локальное время) — граница окна
+        # привязана к якорю (последний наступивший до digest_started).
+        # Anchor-режим: published-фильтр ВСЕГДА активен; откат к
+        # unprocessed НЕ применяется; граница фиксирована якорем.
+        # Fallback (ключ отсутствует/битый): прежнее поведение.
         now_utc = datetime.now(tz.utc).replace(microsecond=0)
         digest_started_iso = now_utc.isoformat()
+        anchor_raw = digest_cfg.get("window_anchor")
+        anchor_mode = False
+        if anchor_raw and isinstance(anchor_raw, str):
+            try:
+                anchor_parsed = _time.strptime(anchor_raw.strip(), "%H:%M")
+                anchor_hour = anchor_parsed.tm_hour
+                anchor_min = anchor_parsed.tm_min
+                anchor_mode = True
+            except (TypeError, ValueError):
+                logger.warning(
+                    "digest.window_anchor=%r невалидно — использую fallback (meta)",
+                    anchor_raw,
+                )
         raw_boundary = self.storage.get_meta("digest_window_started_at")
-        if not raw_boundary:
+        if anchor_mode:
+            # Anchor-режим: граница = ближайший предшествующий якорь (вчера).
+            # Слот 20:00 (digest_started=20:00 сегодня) → вчера 20:00 (24ч окно).
+            # Слот 08:00 (digest_started=08:00 сегодня) → вчера 20:00 (12ч окно).
+            #
+            # Алгоритм: yesterday_anchor = сегодня 00:00 local - 1 day + anchor_time.
+            # Пример UTC+3, now_local=Oct22 11:00:
+            #   midnight local (Oct22 00:00 UTC+3 = Oct21 21:00 UTC)
+            #   - 1 day → Oct21 00:00 UTC+3 = Oct20 21:00 UTC
+            #   + anchor 20:00 → Oct21 20:00 UTC+3 = Oct21 17:00 UTC.
+            now_local = _local_now().replace(microsecond=0)
+            today_midnight_local = now_local.replace(
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+            yesterday_midnight_local = today_midnight_local - timedelta(days=1)
+            window_start_local = yesterday_midnight_local.replace(
+                hour=anchor_hour, minute=anchor_min, second=0, microsecond=0,
+            )
+            window_start_iso = window_start_local.astimezone(tz.utc).isoformat()
+            if not raw_boundary:
+                logger.info(
+                    "Дайджест (anchor=%s): bootstrap → %s",
+                    anchor_raw, window_start_iso,
+                )
+            else:
+                logger.debug(
+                    "Дайджест (anchor=%s): граница из meta, anchor=%s",
+                    anchor_raw, window_start_iso,
+                )
+        elif not raw_boundary:
+            # Fallback bootstrap
             bootstrap = digest_cfg.get("bootstrap_window_hours", 24)
             try:
                 bootstrap = int(bootstrap)
@@ -1892,8 +2077,18 @@ class NewsPipeline:
             # не «съел» нужные items (SQL LIMIT отрабатывает ДО фильтра).
             # Окончательная обрезка — deferred_items[:max_items] ниже.
             limit=max_items * 2 if (max_items and max_items > 0) else None,
-            since_iso=window_start_iso if raw_boundary is not None else None,
-            max_age_hours=max_age_hours,
+            # Anchor-режим: always use window_start_iso (including bootstrap).
+            # Fallback: only if boundary already set; bootstrap — no SQL filter
+            # (published-фильтр тоже disabled at Python level).
+            since_iso=window_start_iso if (anchor_mode or raw_boundary is not None) else None,
+            # Anchor-режим: max_age_hours НЕ применяется — граница окна
+            # определяется якорем. Слот 20:00 при запуске в 20:05 (scheduler lag)
+            # не должен терять первые минуты окна (bound = yesterday 20:00, не
+            # min(yesterday 20:00, now-24h) = now-24h < yesterday 20:00 → пропуск).
+            # Fallback: прежнее поведение (max_age_hours ограничивает выборку).
+            # Decision: pass None in anchor mode — минимальный diff, storage
+            # already correctly handles None.
+            max_age_hours=max_age_hours if not anchor_mode else None,
         )
         # Кросс-дайджест дедуп: items с published РАНЬШЕ начала окна не
         # попадают в дайджест (late-posted старые новости). Фильтр в Python:
@@ -1907,36 +2102,38 @@ class NewsPipeline:
         deferrable_post_published = list(deferred_items)
         # M6: счётчики стадий
         n_sql = len(deferred_items)
-        n_published = n_sql  # default: published-фильтр не отсеял ничего (bootstrap)
-
-        if raw_boundary is not None:
-            ws_dt = _iso_dt(window_start_iso)
-            if ws_dt is not None:
-                # M2-фикс: правильная нормализация aware→naive через astimezone,
-                # а не .replace(tzinfo=None) (последнее давало ошибку ±offset часов).
-                # Minor 1: если ws_dt naive (legacy-meta без offset), astimezone
-                # трактовала бы его как локальное время → граница съезжает на offset.
-                # Лечим: naive оставляем как есть, aware нормализуем.
-                ws_naive = ws_dt if ws_dt.tzinfo is None else ws_dt.astimezone(tz.utc).replace(tzinfo=None)
-                # M2: граница с учётом грейса (published может быть чуть раньше window_start)
-                ws_grace_naive = ws_naive - grace_delta
-                filtered = []
-                for it in deferrable_post_published:
-                    pub_str = str(it.published or "")
-                    pub_dt = _iso_dt(pub_str) if pub_str else None
-                    # Непарсящийся published сохраняем (не теряем новости).
-                    # M2: aware → UTC → naive; naive уже без тайзоны.
-                    if pub_dt is None:
-                        filtered.append(it)
+        # Задача 1 (п.4): published-фильтр ВСЕГДА активен в anchor-режиме.
+        # Fallback: активен только если граница уже установлена (raw_boundary
+        # is not None); при bootstrap (raw_boundary is None) — published-фильтр
+        # отключён, чтобы items с непарсящимся published не терялись.
+        published_filter_active = anchor_mode or (raw_boundary is not None)
+        ws_dt = _iso_dt(window_start_iso)
+        if published_filter_active and ws_dt is not None:
+            # M2-фикс: правильная нормализация aware→naive через astimezone,
+            # а не .replace(tzinfo=None) (последнее давало ошибку ±offset часов).
+            # Minor 1: если ws_dt naive (legacy-meta без offset), astimezone
+            # трактовала бы его как локальное время → граница съезжает на offset.
+            # Лечим: naive оставляем как есть, aware нормализуем.
+            ws_naive = ws_dt if ws_dt.tzinfo is None else ws_dt.astimezone(tz.utc).replace(tzinfo=None)
+            # M2: граница с учётом грейса (published может быть чуть раньше window_start)
+            ws_grace_naive = ws_naive - grace_delta
+            filtered = []
+            for it in deferrable_post_published:
+                pub_str = str(it.published or "")
+                pub_dt = _iso_dt(pub_str) if pub_str else None
+                # Непарсящийся published сохраняем (не теряем новости).
+                # M2: aware → UTC → naive; naive уже без тайзоны.
+                if pub_dt is None:
+                    filtered.append(it)
+                else:
+                    if pub_dt.tzinfo is not None:
+                        pub_dt_norm = pub_dt.astimezone(tz.utc).replace(tzinfo=None)
                     else:
-                        if pub_dt.tzinfo is not None:
-                            pub_dt_norm = pub_dt.astimezone(tz.utc).replace(tzinfo=None)
-                        else:
-                            pub_dt_norm = pub_dt
-                        if pub_dt_norm >= ws_grace_naive:
-                            filtered.append(it)
-                deferrable_post_published = filtered
-                n_published = len(filtered)
+                        pub_dt_norm = pub_dt
+                    if pub_dt_norm >= ws_grace_naive:
+                        filtered.append(it)
+            deferrable_post_published = filtered
+        n_published = len(deferrable_post_published)
 
         # Minor 2 (NIT 1): обрезаем СРАЗУ после published-фильтра, ДО кластеризации.
         # SQL-запас *2 оставлен (страхует от того, чтобы published-фильтр не «съел»
@@ -1950,9 +2147,10 @@ class NewsPipeline:
         )
         n_top_n = len(deferred_items)
 
+        _n_dropped = len(deferrable_post_published) - n_top_n
         logger.info(
-            "Дайджест: старт — newsbot v%s, deferred=%d",
-            __version__, len(deferred_items),
+            "Дайджест: старт — newsbot v%s, deferred=%d, dropped=%d, total=%d",
+            __version__, len(deferred_items), _n_dropped, n_published,
         )
 
         # M2-фикс: при пустом deferred + on_empty=skip пишем маркер ОКНА,
@@ -1960,16 +2158,28 @@ class NewsPipeline:
         # Оконная логика: пустое окно → сдвигаем границу.
         if not deferred_items and not force:
             if on_empty == "skip":
+                # Minor 1-фикс: dropped-счётчик через count_deferred_before
+                # (единообразно с главной веткой), а не overflow от срезки.
+                _n_dropped = self.storage.count_deferred_before(window_start_iso)
+                logger.info(
+                    "Дайджест: пустое окно (on_empty=skip) — dropped=%d, total=%d",
+                    _n_dropped, n_published,
+                )
                 logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
                 self.storage.set_meta(
                     "last_digest_at",
                     digest_started_iso,
                 )
-                unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-                new_boundary = digest_started_iso
-                udt = _iso_dt(unprocessed) if isinstance(unprocessed, str) else None
-                if udt is not None and udt < now_utc:
-                    new_boundary = unprocessed
+                # Задача 1 (п.5): anchor-режим — граница фиксирована якорем.
+                # Fallback — прежний rollback к unprocessed.
+                if anchor_mode:
+                    new_boundary = window_start_iso
+                else:
+                    unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+                    new_boundary = digest_started_iso
+                    udt = _iso_dt(unprocessed) if isinstance(unprocessed, str) else None
+                    if udt is not None and udt < now_utc:
+                        new_boundary = unprocessed
                 self.storage.set_meta("digest_window_started_at", new_boundary)
                 return 0
             # on_empty=send: обрабатывается дальше (пустое уведомление)
@@ -1977,7 +2187,7 @@ class NewsPipeline:
         # ── Финальный сейф от дублей: семантическая кластеризация deferred ──
         # Новости одного события, накопленные за несколько циклов, не должны
         # уйти в дайджест пачкой. Лидер остаётся, дубли отсеиваются.
-        _dup_urls = self._cluster_deferred_duplicates(deferred_items)
+        _dup_urls, _recent_shown = self._cluster_deferred_duplicates(deferred_items, window_start_iso)
         if _dup_urls:
             deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
         n_dedup = len(deferred_items)
@@ -1989,17 +2199,22 @@ class NewsPipeline:
         # которые были В top-N, но были удалены dedup-ом, НЕ берутся из пула —
         # они уже прошли top-N и не являются «запасными» кандидатами.
         #
-        # Бэкфилл НЕ проходит повторный LLM-дедуп: запасные items прошли
-        # pre-LLM cluster_key caps при сборе и domain-дедуп — достаточно.
-        # Запоминаем, какие items уже были в original top-N (до dedup).
+        # MAJOR-фикс (4c): бэкфилл items проходят RECENT-дедуп перед добавлением
+        # в дайджест (всё попадающее в дайджест должно быть проверено против
+        # показанных). Запасные items прошли pre-LLM cluster_key caps и
+        # domain-дедуп, но не LLM-дедуп против показанных.
+        _backfill_dup_urls: Set[str] = set()
         if deferrable_post_published and max_items and max_items > 0:
             pool_tail = deferrable_post_published[max_items:]
             backfill_added = 0
             existing_urls = {x.url for x in deferred_items}
+            # MAJOR-фикс (4c): фильтруем пул против показанных перед добавлением.
+            # _check_against_shown использует уже загруженный _recent_shown.
+            _backfill_dup_urls = self._check_against_shown(pool_tail, _recent_shown)
             for it in pool_tail:
                 if len(deferred_items) >= max_items:
                     break
-                if it.url not in existing_urls:
+                if it.url not in existing_urls and it.url not in _backfill_dup_urls:
                     deferred_items.append(it)
                     existing_urls.add(it.url)
                     backfill_added += 1
@@ -2007,6 +2222,11 @@ class NewsPipeline:
                 logger.info(
                     "Дайджест: бэкфилл добавил %d items из пула (top-N был неполным)",
                     backfill_added,
+                )
+            elif _backfill_dup_urls:
+                logger.debug(
+                    "Дайджест: бэкфилл пропущен (%d дублей против показанных)",
+                    len(_backfill_dup_urls),
                 )
         n_backfill = len(deferred_items)
 
@@ -2016,18 +2236,52 @@ class NewsPipeline:
         # MAJOR: cap by location/day — строго ПОСЛЕ _category_guarantee.
         # Передвинут в конец, чтобы инвариант «≤max_per_location на (локация, день)»
         # держался железно даже после свапов гарантии.
-        category_pool = None
+        #
+        # Задача 2: добор из skipped. Skipped-items (score < digest_threshold
+        # но >= guarantee_min_score) не попали в deferred, но имеют llm_summary
+        # (скорились) и подходят для гарантии кино. Добавляем их в category_pool
+        # ПОСЛЕ deferred-pool: они — последний резерв.
+        category_pool: List[NewsItem] = []
+        # MAJOR-фикс (4c): items, отклонённые backfill-дедупом, не должны
+        # попадать в guarantee.
+        included_urls = {it.url for it in deferred_items}
+        _all_excluded = included_urls | _dup_urls | _backfill_dup_urls
         if deferrable_post_published:
-            included_urls = {it.url for it in deferred_items}
             category_pool = [
                 it for it in deferrable_post_published
-                if it.url not in included_urls
-                and it.url not in _dup_urls
+                if it.url not in _all_excluded
             ]
-        # Minor 1-фикс (wave 2): нормализация category_min — YAML может отдать
-        # строку ("2"); `str <= int` и `seq[:str]` бросают TypeError ВНЕ
-        # try вокруг _run_digest → дайджест падал бы каждый цикл.
+        # Skipped: порог guarantee_min_score (default 3 из конфига).
+        # Minor 1-фикс: гарантия кино падала при невалидном guarantee_min_score
+        # (строка/список в YAML → ValueError/TypeError). По конвенции проекта —
+        # WARNING + documented default 3.
+        try:
+            guarantee_min_score = int(digest_cfg.get("guarantee_min_score", 3))
+        except (TypeError, ValueError):
+            guarantee_min_score = 3
+            logger.warning(
+                "digest.guarantee_min_score=%r невалидно — использую 3",
+                digest_cfg.get("guarantee_min_score"),
+            )
+        # MAJOR-фикс (4c): skipped-кандидаты из БД тоже должны пройти
+        # RECENT-дедуп. О утренней новости, показанной в утреннем слоте,
+        # может попасть в skipped → вечерний guarantee может добавить её
+        # повторно. Проверяем _recent_shown.
+        # Minor 4-фикс: лимит 50 → 200. Кино может остаться «голодным» при
+        # ограниченном skip-pool. SQL сортирует llm_score DESC — гарантия
+        # возьмёт лучшие cinema-items из большего пула. Альтернатива: фильтр
+        # по cinema-источникам в SQL — сложнее, не обязательно.
         category_min = _normalize_category_min(digest_cfg.get("category_min", {}))
+        if category_min:
+            skipped_candidates = self.storage.get_skipped_items(
+                since_iso=window_start_iso,
+                min_score=guarantee_min_score,
+                limit=200,
+            )
+            _skipped_dup_urls = self._check_against_shown(skipped_candidates, _recent_shown)
+            for it in skipped_candidates:
+                if it.url not in _all_excluded and it.url not in _skipped_dup_urls:
+                    category_pool.append(it)
         # Minor 1-фикс: max_per_location вычисляется ДО блока гарантии —
         # от него зависит квота защиты (Minor 2-фикс). Невалидное значение
         # → documented default (2), а не отключение cap'а.
@@ -2532,19 +2786,29 @@ class NewsPipeline:
                         "Дайджест: не удалось пометить дубли digested: %s", e,
                     )
             # ── Оконная очистка ──────────────────────────────────────────
-            # Граница следующего окна = момент старта этого дайджеста.
-            # Если остались необработанные new/pending, отодвигаем границу
-            # назад к их fetched_at, чтобы они попали в следующее окно.
-            unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-            new_boundary = digest_started_iso
-            if isinstance(unprocessed, str):
-                udt = _iso_dt(unprocessed)
-                if udt is not None and udt < now_utc:
-                    new_boundary = unprocessed
-                    logger.info(
-                        "Дайджест: есть необработанные items с %s — "
-                        "граница окна отодвинута", unprocessed,
-                    )
+            # Задача 1 (п.5): anchor-режим — граница фиксирована якорем.
+            # Fallback — прежний rollback к unprocessed.
+            # Задача 1 (п.7): лог сброшенных deferred-items.
+            dropped_count = self.storage.count_deferred_before(window_start_iso)
+            if dropped_count:
+                logger.warning(
+                    "Дайджест: %d deferred items dropped by window close "
+                    "(fetched_at < %s)",
+                    dropped_count, window_start_iso,
+                )
+            if anchor_mode:
+                new_boundary = window_start_iso
+            else:
+                unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+                new_boundary = digest_started_iso
+                if isinstance(unprocessed, str):
+                    udt = _iso_dt(unprocessed)
+                    if udt is not None and udt < now_utc:
+                        new_boundary = unprocessed
+                        logger.info(
+                            "Дайджест: есть необработанные items с %s — "
+                            "граница окна отодвинута", unprocessed,
+                        )
             try:
                 # Удаляем ровно окно: всё, что собрано ДО window_start_iso.
                 # new/pending защищены на уровне storage.
@@ -2569,13 +2833,23 @@ class NewsPipeline:
                 self.delivery.send_text(empty_msg)
                 logger.info("Дайджест: пустой дайджест отправлен (on_empty=send)")
                 self.storage.set_meta("last_digest_at", now_iso)
-                # Закрываем окно с откатом границы при наличии необработанных.
-                unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-                new_boundary = digest_started_iso
-                if isinstance(unprocessed, str):
-                    udt = _iso_dt(unprocessed)
-                    if udt is not None and udt < now_utc:
-                        new_boundary = unprocessed
+                # Anchor: граница фиксирована. Fallback: rollback к unprocessed.
+                dropped_count = self.storage.count_deferred_before(window_start_iso)
+                if dropped_count:
+                    logger.warning(
+                        "Дайджест: %d deferred items dropped by window close "
+                        "(fetched_at < %s)",
+                        dropped_count, window_start_iso,
+                    )
+                if anchor_mode:
+                    new_boundary = window_start_iso
+                else:
+                    unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
+                    new_boundary = digest_started_iso
+                    if isinstance(unprocessed, str):
+                        udt = _iso_dt(unprocessed)
+                        if udt is not None and udt < now_utc:
+                            new_boundary = unprocessed
                 self.storage.set_meta("digest_window_started_at", new_boundary)
             except Exception as e:
                 logger.warning("Дайджест: пустой дайджест не отправлен: %s", e)
@@ -2673,7 +2947,7 @@ class NewsPipeline:
         if not slots:
             return
 
-        now_local = datetime.now(tz.utc).astimezone()
+        now_local = _local_now()
         last_raw = self.storage.get_meta("last_digest_at")
         last_digest: datetime | None = None
         if last_raw:
