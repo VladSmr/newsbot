@@ -543,7 +543,7 @@ class TestUpdateBatchTitleEn(unittest.TestCase):
                 "reason": "r",
                 "title_en": "Storm Hits Spain",
             }])
-            self.assertEqual(n, 1)
+            self.assertEqual(len(n), 1)  # List[str]: 1 URL
 
             items = s.get_all_by_state("new")
             self.assertEqual(items[0].llm_title, "Storm Hits Spain")
@@ -572,7 +572,7 @@ class TestUpdateBatchTitleEn(unittest.TestCase):
                 "summary": "S2", "reason": "r2",
                 # title_en отсутствует
             }])
-            self.assertEqual(n, 1)
+            self.assertEqual(len(n), 1)  # List[str]: 1 URL
 
             items = s.get_all_by_state("new")
             self.assertEqual(items[0].llm_title, "Storm Hits Spain")

@@ -2143,7 +2143,7 @@ class Storage:
     def update_llm_results_batch(
         self,
         records: List[dict],
-    ) -> int:
+    ) -> List[str]:
         """
         Батчевое сохранение результатов LLM-оценки.
         records — список dict: {url, score, summary, reason, urgent?, cluster_key?, filtered_at?, title_en?}
@@ -2153,19 +2153,30 @@ class Storage:
         Если record НЕ содержит ключ 'title_en' или title_en is None — llm_title НЕ трогается
         (существующее значение в БД сохраняется). Это защищает retry-путь от затирания
         EN-заголовка при синтезе FilterResult без title_en.
-        Возвращает количество обновлённых строк.
+
+        Per-record изоляция: каждый UPDATE выполняется в своей транзакции.
+        Падение одного (DB locked, InterfaceError, …) НЕ затрагивает остальные.
+        Упавший record логируется с url, его llm_score останется NULL,
+        item останется в state=pending и подберётся recovery в следующем цикле.
+
+        Возвращает список URL, для которых UPDATE прошёл успешно.
+        При пустом входе возвращает пустой список.
         """
         if not records:
-            return 0
+            return []
         now_iso = datetime.now(timezone.utc).isoformat()
-        total = 0
-        try:
-            with self._tx() as conn:
-                for rec in records:
-                    cluster_key = rec.get("cluster_key")
-                    urgent = rec.get("urgent")
-                    title_en = rec.get("title_en")  # v15: None → не трогать поле
+        successful_urls: List[str] = []
 
+        for rec in records:
+            url = rec.get("url", "")
+            cluster_key = rec.get("cluster_key")
+            urgent = rec.get("urgent")
+            title_en = rec.get("title_en")
+
+            try:
+                # Per-record transaction: каждый UPDATE изолирован.
+                # Свой with self._tx() на каждый record.
+                with self._tx() as conn:
                     if title_en is not None:
                         # title_en передан → пишем в llm_title
                         sets = "llm_score = ?, llm_summary = ?, llm_reason = ?, filtered_at = ?, llm_title = ?"
@@ -2183,7 +2194,7 @@ class Storage:
                         params = [
                             rec["score"], rec["summary"], rec["reason"],
                             rec.get("filtered_at") or now_iso, title_en,
-                        ] + params_extra + [rec["url"]]
+                        ] + params_extra + [url]
                         cur = conn.execute(
                             f"UPDATE items SET {sets} WHERE url = ?",
                             params,
@@ -2205,16 +2216,20 @@ class Storage:
                         params = [
                             rec["score"], rec["summary"], rec["reason"],
                             rec.get("filtered_at") or now_iso,
-                        ] + params_extra + [rec["url"]]
+                        ] + params_extra + [url]
                         cur = conn.execute(
                             f"UPDATE items SET {sets} WHERE url = ?",
                             params,
                         )
-                    total += cur.rowcount
-            return total
-        except Exception as e:
-            logger.warning("update_llm_results_batch: %s", e)
-            return 0
+                    if cur.rowcount > 0:
+                        successful_urls.append(url)
+            except Exception as e:
+                logger.error(
+                    "update_llm_results_batch: UPDATE для %s упал: %s — "
+                    "record пропущен, item останется pending",
+                    url[:120], e,
+                )
+        return successful_urls
 
     def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
         """

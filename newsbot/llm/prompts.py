@@ -283,6 +283,22 @@ RELEVANCE SCORE SCALE:
 # Это осознанное поведение — см. PROJECT_STATE.md, раздел "Профиль интересов".
 
 # ─────────────────────────────────────────────────────────────────
+# urgent=false examples block (used in both prompts — MAJOR fix)
+# Extracted to a shared constant so that the list of non-urgent
+# topics stays in sync between SYSTEM_PROMPT and BATCH_SYSTEM_PROMPT.
+# The batch path (batch_size=10) is the primary production path;
+# losing these examples meant most frequent category (ordinary
+# night drone reports, sanctions, etc.) was treated as
+# potentially-urgent → push-spam risk.
+# ─────────────────────────────────────────────────────────────────
+
+URGENT_FALSE_EXAMPLES = (
+    "ordinary night drone attacks and their reports, sanctions, releases, "
+    "prices/fuel, courts, politics, forecasts, opinions, "
+    "regional incidents without mass casualties, corporate events"
+)
+
+# ─────────────────────────────────────────────────────────────────
 # System prompt (single-item evaluation)
 # ─────────────────────────────────────────────────────────────────
 
@@ -342,7 +358,7 @@ urgent=true — ONLY for events of world/national scale with immediate catastrop
   • nuclear or radiation incident;
   • other events of similar urgency level.
 
-urgent=false — ALL the rest, including: ordinary night drone attacks and their reports, sanctions, releases, prices/fuel, courts, politics, forecasts, opinions, regional incidents without mass casualties, corporate events, etc.
+urgent=false — ALL the rest, including: """ + URGENT_FALSE_EXAMPLES + """, etc.
 
 ⚠️ When in doubt → false. Better to miss a breaking item in the digest than to spam a push notification.
 
@@ -385,7 +401,10 @@ urgent=true — ONLY for events of world/national scale with immediate catastrop
   • major aviation catastrophe, terrorist attack or technogenic disaster with mass casualties (dozens+ dead);
   • nuclear or radiation incident;
   • other events of similar urgency level.
-urgent=false — ALL the rest. ⚠️ When in doubt → false.
+
+urgent=false — ALL the rest, including: """ + URGENT_FALSE_EXAMPLES + """, etc.
+
+⚠️ When in doubt → false. Better to miss a breaking item in the digest than to spam a push notification.
 
 LANGUAGE RULE (STRICT):
 Each summary MUST be written in English ONLY, regardless of the input news text language. Do NOT write summaries in the item's input language.

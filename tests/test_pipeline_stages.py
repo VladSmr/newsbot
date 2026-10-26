@@ -1134,3 +1134,381 @@ class TestBuildClusterKeyRawTitleHash(unittest.TestCase):
             "France", None, "2026-01-01", title="Same Headline",
         )
         self.assertEqual(key1, key2)
+
+
+# =============================================================================
+# Задача 2 (pipeline M1): дубли на границе max_items
+# =============================================================================
+
+class TestDupOnMaxItemsBoundary(unittest.TestCase):
+    """
+    Задача 2 (M1): событие X в top-N + его пересказ Y в хвосте deferred-пула
+    НЕ должны оба попасть в дайджест. Пересказ Y фильтруется RECENT-контекстом,
+    в который теперь добавлены title/source топ-N items.
+    """
+
+    def test_top_n_item_squelches_tail_duplicate_in_digest(self):
+        """
+        Задача 3 (M1): событие EventHead в top-N, пересказ TailDup в pool_tail.
+        После внутреннего dedup в top-N освобождается слот, TailDup реально
+        доходит до backfill и отсекается _check_against_shown именно потому,
+        что title/source top-N items добавлены в RECENT (_digest_topn_shown).
+
+        Схема (5 items, max_items=4):
+          - deferrable_post_published = [Alpha(10), Bravo(9), EventHead(8),
+            EventDup(7), TailDup(6)]
+          - top-N (4): Alpha, Bravo, EventHead, EventDup
+          - detect_duplicates отсеивает EventDup (внутренний дубль) →
+            deferred=[Alpha, Bravo, EventHead] (3 < max_items)
+          - _digest_topn_shown добавляет Alpha/Bravo/EventHead в RECENT
+          - pool_tail = [TailDup]; fake_check видит EventHead в RECENT →
+            TailDup дубль → _backfill_dup_urls={tail}; слот остаётся свободным
+          - late backfill повторно пропускает TailDup (self._backfill_dup_urls)
+          - digest: Alpha, Bravo, EventHead (3)
+
+        БЕЗ M1-фикса (_digest_topn_shown): RECENT пуст → TailDup не дубль →
+          ранний backfill добавляет TailDup → тест падает (TailDup в digest).
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            for title, url, score in [
+                ("Alpha",     "https://ex.com/a",  10),
+                ("Bravo",     "https://ex.com/b",   9),
+                ("EventHead", "https://ex.com/h",   8),
+                ("EventDup",  "https://ex.com/d",   7),
+                ("TailDup",   "https://ex.com/y",   6),  # pool_tail, дубль EventHead
+            ]:
+                _insert_deferred_item(
+                    db_path, title=title, url=url,
+                    published="2026-01-01 12:00",
+                    fetched_at="2026-01-01T12:00:00+00:00",
+                    score=score,
+                )
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 4, "max_items_per_message": 20,
+                    "cluster_duplicates": True,
+                },
+            )
+
+            # Внутренний dedup top-N: EventDup — дубль EventHead (освобождает слот).
+            fake_filter = MagicMock()
+            def detect_dup_idx(candidates, recent_shown=None):
+                return {i for i, it in enumerate(candidates) if it.title == "EventDup"}
+            fake_filter.detect_duplicates.side_effect = detect_dup_idx
+            p.llm_filter = fake_filter
+
+            # Y дубль EventHead из top-N — но только если EventHead реально
+            # присутствует в RECENT (это и есть проверяемый фикс).
+            check_calls = []
+
+            def fake_check(candidates, recent_shown):
+                check_calls.append([it.title for it in candidates])
+                excluded = set()
+                for it in candidates:
+                    if it.title == "TailDup":
+                        for sh in recent_shown:
+                            if sh.get("title") == "EventHead":
+                                excluded.add(it.url)
+                                break
+                return excluded
+
+            p._check_against_shown = fake_check
+
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            p.run_digest(force=True)
+
+            text = "".join(
+                call_args[0][0]
+                for call_args in delivery.send_text.call_args_list
+            )
+            # TailDup реально дошёл до backfill-проверки (не отсечён top-N).
+            self.assertIn("TailDup", check_calls[0],
+                f"TailDup должен дойти до _check_against_shown, calls={check_calls}")
+
+            self.assertIn("Alpha", text)
+            self.assertIn("Bravo", text)
+            self.assertIn("EventHead", text, "EventHead (top-N) должен быть в digest")
+            self.assertNotIn("EventDup", text, "EventDup отсеян внутренним dedup")
+            self.assertNotIn("TailDup", text,
+                "TailDup из pool_tail НЕ должен быть в digest (дубль EventHead в top-N)")
+            p.storage.close()
+            p.close()
+
+    def test_skipped_rewrite_filtered_by_guarantee_recall(self):
+        """
+        Задача 2б: skipped-пересказ X (добран гарантией кино) не добавляется
+        повторно. Skipped-item с категорией cinema, score ниже deferred threshold
+        (но >= guarantee_min_score). _check_against_shown видит X в top-N.
+
+        NOTE: для простоты тест использует llm_filter без реального LLM.
+        Skipped-items добавляются в пул гарантии через _check_against_shown
+        с RECENT-контекстом, включающим top-N.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2020-01-01T00:00:00+00:00")
+            s.close()
+
+            # Top-N: событие X
+            _insert_deferred_item(
+                db_path, title="CinematicEvent",
+                url="https://ex.com/cinemaevent",
+                published="2026-01-01 12:00",
+                fetched_at="2026-01-01T12:00:00+00:00",
+                score=9,
+            )
+            # Обычный top-2
+            for title, url, score in [
+                ("TechA", "https://ex.com/techa", 8),
+                ("TechB", "https://ex.com/techb", 7),
+            ]:
+                _insert_deferred_item(
+                    db_path, title=title, url=url,
+                    published="2026-01-01 12:00",
+                    fetched_at="2026-01-01T12:00:00+00:00",
+                    score=score,
+                )
+            # Skipped cinema-item: пересказ CinematicEvent (score < threshold,
+            # но >= guarantee_min_score=3). llm_summary есть.
+            from unittest.mock import MagicMock as _MM
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO items
+                (source, url, title, summary, published, fetched_at,
+                 state, state_at, llm_score, llm_summary, tags)
+                VALUES (?, ?, ?, ?, ?, ?, 'skipped', ?, ?, ?, ?)
+                """,
+                (
+                    "Deadline",
+                    "https://ex.com/cinemarewrite",
+                    "CinematicEvent_rewrite",
+                    "Summary",
+                    "2026-01-01 12:00",
+                    "2026-01-01T12:00:00+00:00",
+                    "2026-01-01T12:00:00+00:00",
+                    5,
+                    "Summary: Cinematic rewrite",
+                    '["film","movie"]',
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 3, "max_items_per_message": 20,
+                    "category_min": {"cinema": 1},
+                    "cluster_duplicates": True,
+                },
+            )
+
+            def fake_detect(candidates, recent_shown):
+                # CinematicEvent_rewrite дубль CinematicEvent из top-N
+                for sh in recent_shown:
+                    if sh.get("title") == "CinematicEvent":
+                        return {0}
+                return set()
+            real_filter = getattr(p, "llm_filter", None) or _MM()
+            real_filter.detect_duplicates = _MM(side_effect=fake_detect)
+            p.llm_filter = real_filter
+
+            delivery = _MM()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            text = "".join(
+                call_args[0][0]
+                for call_args in delivery.send_text.call_args_list
+            )
+            # CinematicEvent в digest (top-N лидер)
+            self.assertIn("CinematicEvent", text)
+            # CinematicEvent_rewrite НЕ в digest (filtered as dup via RECENT)
+            self.assertNotIn("CinematicEvent_rewrite", text,
+                "Skipped-дубль не должен попасть через guarantee")
+
+            p.storage.close()
+            p.close()
+
+
+# =============================================================================
+# Задача 3 (pipeline M2): поздний backfill не возвращает отсечённые дубли
+# =============================================================================
+
+class TestLateBackfillNoReclaimedDuplicates(unittest.TestCase):
+    """
+    Задача 3 (M2): поздний backfill не возвращает отсечённые дубли.
+    self._backfill_dup_urls используется для пропуска в позднем backfill.
+    """
+
+    def test_early_backfill_dedup_not_reclaimed_by_late_backfill(self):
+        """
+        Задача 4a (M2): поздний backfill пропускает url из
+        self._backfill_dup_urls, отсечённый ранним backfill.
+
+        Схема (5 items, max_items=4):
+          - deferrable_post_published = [Alpha(10), Bravo(9), Charlie(8),
+            EventDup(7), TailDup(6)]
+          - top-N (4): Alpha, Bravo, Charlie, EventDup
+          - detect_duplicates отсеивает EventDup → deferred=3 (< max_items)
+          - ранний backfill: pool_tail=[TailDup]; fake_check (Charlie в RECENT)
+            → TailDup в _backfill_dup_urls, слот остаётся свободным
+          - поздний backfill: TailDup пропускается именно по
+            self._backfill_dup_urls → digest=[Alpha, Bravo, Charlie] (3)
+
+        БЕЗ M2-фикса (поздний backfill без проверки _backfill_dup_urls):
+          TailDup возвращается → digest=[Alpha, Bravo, Charlie, TailDup] →
+          тест падает (TailDup в digest, count=4 вместо 3).
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta('digest_window_started_at', '2020-01-01T00:00:00+00:00')
+            s.close()
+
+            for title, url, score in [
+                ('Alpha',    'https://ex.com/a', 10),
+                ('Bravo',    'https://ex.com/b',  9),
+                ('Charlie',  'https://ex.com/c',  8),
+                ('EventDup', 'https://ex.com/d',  7),
+                ('TailDup',  'https://ex.com/y',  6),  # pool_tail, дубль Charlie
+            ]:
+                _insert_deferred_item(
+                    db_path, title=title, url=url,
+                    published='2026-01-01 12:00',
+                    fetched_at='2026-01-01T12:00:00+00:00',
+                    score=score)
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    'enabled': True, 'max_items': 4,
+                    'max_items_per_message': 20,
+                    'max_per_location': 10,
+                    'cluster_duplicates': True,
+                },
+            )
+
+            # Внутренний dedup top-N освобождает слот (EventDup — дубль Charlie).
+            fake_filter = MagicMock()
+            def detect_dup_idx(candidates, recent_shown=None):
+                return {i for i, it in enumerate(candidates) if it.title == 'EventDup'}
+            fake_filter.detect_duplicates.side_effect = detect_dup_idx
+            p.llm_filter = fake_filter
+
+            check_calls = []
+
+            def fake_check(candidates, recent_shown):
+                check_calls.append([it.title for it in candidates])
+                excluded = set()
+                for it in candidates:
+                    if it.title == 'TailDup':
+                        for sh in recent_shown:
+                            if sh.get('title') == 'Charlie':
+                                excluded.add(it.url)
+                                break
+                return excluded
+
+            p._check_against_shown = fake_check
+
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            text = ''.join(
+                call_args[0][0]
+                for call_args in delivery.send_text.call_args_list
+            )
+
+            # TailDup реально дошёл до раннего backfill-дедупа.
+            self.assertIn('TailDup', check_calls[0],
+                f"TailDup должен дойти до _check_against_shown, calls={check_calls}")
+
+            for t in ('Alpha', 'Bravo', 'Charlie'):
+                self.assertIn(t, text, f"{t} должен быть в digest")
+            self.assertNotIn('EventDup', text, 'EventDup отсеян внутренним dedup')
+            self.assertNotIn('TailDup', text,
+                'TailDup (в _backfill_dup_urls) НЕ должен попасть в digest')
+            self.assertEqual(count, 3,
+                f'Ожидалось 3 items (слот не должен заполняться дублем), got {count}')
+
+            p.storage.close()
+            p.close()
+
+    def test_late_backfill_works_when_early_backfill_skipped(self):
+        """
+        Задача 4b (edge case): ранний backfill не добавил ничего
+        (deferred == max_items до cap), пул НЕ пуст; после location-cap
+        освобождается слот — поздний backfill его добирает.
+
+        Схема: max_items=5, top-5 = Alpha(10), Bravo(9), Charlie(8), Delta(7),
+        Echo(6); Charlie/Delta/Echo — одна локация France, max_per_location=2.
+        Ранний backfill: len==5==max_items → пропущен (пул [Foxtrot] не тронут).
+        Cap: France оставляет Charlie,Delta → Echo отсечён, len=4.
+        Поздний backfill: Foxtrot (Germany, свободная локация) добавляется →
+        digest=[Alpha,Bravo,Charlie,Delta,Foxtrot] (5), Echo нет.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta('digest_window_started_at', '2020-01-01T00:00:00+00:00')
+            s.close()
+
+            france_key = 'France|stem|2026-01-01'
+            for title, url, score, cluster_key in [
+                ('Alpha',   'https://ex.com/a', 10, None),
+                ('Bravo',   'https://ex.com/b',  9, None),
+                ('Charlie', 'https://ex.com/c',  8, france_key),
+                ('Delta',   'https://ex.com/d',  7, france_key),
+                ('Echo',    'https://ex.com/e',  6, france_key),  # отсечётся cap'ом
+                ('Foxtrot', 'https://ex.com/f',  5, 'Germany|stem|2026-01-01'),
+            ]:
+                _insert_deferred_item(
+                    db_path, title=title, url=url,
+                    published='2026-01-01 12:00',
+                    fetched_at='2026-01-01T12:00:00+00:00',
+                    score=score, cluster_key=cluster_key)
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    'enabled': True, 'max_items': 5, 'max_items_per_message': 20,
+                    'max_per_location': 2,
+                    'cluster_duplicates': False,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            text = ''.join(
+                call_args[0][0]
+                for call_args in delivery.send_text.call_args_list
+            )
+            for t in ('Alpha', 'Bravo', 'Charlie', 'Delta'):
+                self.assertIn(t, text, f"{t} должен быть в digest")
+            self.assertNotIn('Echo', text,
+                'Echo отсечён location-cap (France=2) и не вернулся backfill-ом')
+            # Foxtrot доступен только через поздний backfill (ниже top-5,
+            # пул не тронут ранним backfill'ом — deferred был полон).
+            self.assertIn('Foxtrot', text,
+                'Foxtrot (добавлен поздним backfill) должен попасть в digest')
+            self.assertEqual(count, 5, f'Expected 5 items, got {count}')
+
+            p.storage.close()
+            p.close()
+

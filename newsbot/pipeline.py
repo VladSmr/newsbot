@@ -1522,8 +1522,8 @@ class NewsPipeline:
         self.storage.set_state(urls, "pending")
 
         # ── LLM-оценка (если фильтр активен и score ещё не сохранён) ──
-        skipped_urls: List[str] = []
-        deferred_urls: List[str] = []
+        skipped_urls: Set[str] = set()
+        deferred_urls: Set[str] = set()
         to_deliver: List[NewsItem] = []
         llm_batch_records: List[dict] = []
 
@@ -1674,18 +1674,27 @@ class NewsPipeline:
                                    to_deliver, llm_batch_records)
 
             # сохраняем все llm-результаты батчем (push + deferred + skipped)
+            # Per-record изоляция: возвращается список успешно обновлённых URL.
+            # set_state вызывается ТОЛЬКО для них — сбойные остаются pending.
+            updated_urls: Set[str] = set()
             if llm_batch_records:
-                self.storage.update_llm_results_batch(llm_batch_records)
+                updated_urls = set(self.storage.update_llm_results_batch(llm_batch_records))
 
             # ── фиксируем state и логируем итоговые счётчики (одна INFO-строка) ──
-            n_skipped = len(skipped_urls)
-            n_deferred = len(deferred_urls)
+            n_skipped = len(skipped_urls & updated_urls)
+            n_deferred = len(deferred_urls & updated_urls)
             n_push = len(to_deliver)
 
+            # set_state только для реально обновлённых URL
+            # (провалившийся UPDATE → item в pending, его подберёт recovery)
             if skipped_urls:
-                self.storage.set_state(skipped_urls, "skipped")
+                actually_skipped = list(skipped_urls & updated_urls)
+                if actually_skipped:
+                    self.storage.set_state(actually_skipped, "skipped")
             if deferred_urls:
-                self.storage.set_state(deferred_urls, "deferred")
+                actually_deferred = list(deferred_urls & updated_urls)
+                if actually_deferred:
+                    self.storage.set_state(actually_deferred, "deferred")
 
             mode_tag = " [urgent-only]" if push_urgent_only else ""
             logger.info(
@@ -1821,8 +1830,8 @@ class NewsPipeline:
         push_th: int,
         digest_th: int,
         push_urgent_only: bool,
-        skipped_urls: List[str],
-        deferred_urls: List[str],
+        skipped_urls: Set[str],
+        deferred_urls: Set[str],
         to_deliver: List["NewsItem"],
         llm_batch_records: List[dict],
     ) -> None:
@@ -1845,7 +1854,7 @@ class NewsPipeline:
             # Это защищает от спама пушами: сбой LLM не означает срочность.
             # При push_urgent_only=False — прежнее поведение (push).
             if push_urgent_only:
-                deferred_urls.append(item.url)
+                deferred_urls.add(item.url)
                 llm_batch_records.append({
                     "url": item.url,
                     "score": None,
@@ -1863,7 +1872,7 @@ class NewsPipeline:
         r = route(res.score, push_th, digest_th,
                   urgent=res.urgent, push_urgent_only=push_urgent_only)
         if r == "skip":
-            skipped_urls.append(item.url)
+            skipped_urls.add(item.url)
             llm_batch_records.append({
                 "url": item.url,
                 "score": res.score,
@@ -1874,7 +1883,7 @@ class NewsPipeline:
                 "title_en": getattr(res, "title_en", None),
             })
         elif r == "digest":
-            deferred_urls.append(item.url)
+            deferred_urls.add(item.url)
             llm_batch_records.append({
                 "url": item.url,
                 "score": res.score,
@@ -2192,6 +2201,28 @@ class NewsPipeline:
             deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
         n_dedup = len(deferred_items)
 
+        # Задача 2 (M1): дубли на границе max_items.
+        # _check_against_shown (ранний backfill :2213, skipped :2281) видит только
+        # digested/delivered из _recent_shown (get_shown_for_window).
+        # Но item X в top-N + его пересказ Y в хвосте deferred-пула
+        # НИГДЕ не сравниваются → оба уходят в дайджест.
+        # Фикс: включаем title/source уже отобранных top-N items в RECENT-контекст.
+        # Формат — тот же, что у get_shown_for_window: [{title, source}].
+        # dedup (set) уже отфильтровал лидеров — берём текущий deferred_items
+        # (post-dedup лидеры, самые приоритетные).
+        _digest_topn_shown: List[dict] = [
+            {"title": it.title, "source": it.source}
+            for it in deferred_items
+        ]
+        _seen_keys: Set[tuple] = set()
+        for sh in _recent_shown:
+            _seen_keys.add((sh.get("title", ""), sh.get("source", "")))
+        for sh in _digest_topn_shown:
+            _key = (sh.get("title", ""), sh.get("source", ""))
+            if _key not in _seen_keys:
+                _recent_shown.append(sh)
+                _seen_keys.add(_key)
+
         # ── Задача A: бэкфилл после LLM-дедупа ──────────────────────────────
         # Если в топе оказались дубли — дайджест недобирается (буфер max_items..2*max_items
         # не используется). Добираем из pool_tail: items, изначально БЫВШИХ ЗА
@@ -2203,18 +2234,18 @@ class NewsPipeline:
         # в дайджест (всё попадающее в дайджест должно быть проверено против
         # показанных). Запасные items прошли pre-LLM cluster_key caps и
         # domain-дедуп, но не LLM-дедуп против показанных.
-        _backfill_dup_urls: Set[str] = set()
+        self._backfill_dup_urls: Set[str] = set()
         if deferrable_post_published and max_items and max_items > 0:
             pool_tail = deferrable_post_published[max_items:]
             backfill_added = 0
             existing_urls = {x.url for x in deferred_items}
             # MAJOR-фикс (4c): фильтруем пул против показанных перед добавлением.
             # _check_against_shown использует уже загруженный _recent_shown.
-            _backfill_dup_urls = self._check_against_shown(pool_tail, _recent_shown)
+            self._backfill_dup_urls = self._check_against_shown(pool_tail, _recent_shown)
             for it in pool_tail:
                 if len(deferred_items) >= max_items:
                     break
-                if it.url not in existing_urls and it.url not in _backfill_dup_urls:
+                if it.url not in existing_urls and it.url not in self._backfill_dup_urls:
                     deferred_items.append(it)
                     existing_urls.add(it.url)
                     backfill_added += 1
@@ -2223,10 +2254,10 @@ class NewsPipeline:
                     "Дайджест: бэкфилл добавил %d items из пула (top-N был неполным)",
                     backfill_added,
                 )
-            elif _backfill_dup_urls:
+            elif self._backfill_dup_urls:
                 logger.debug(
                     "Дайджест: бэкфилл пропущен (%d дублей против показанных)",
-                    len(_backfill_dup_urls),
+                    len(self._backfill_dup_urls),
                 )
         n_backfill = len(deferred_items)
 
@@ -2245,7 +2276,7 @@ class NewsPipeline:
         # MAJOR-фикс (4c): items, отклонённые backfill-дедупом, не должны
         # попадать в guarantee.
         included_urls = {it.url for it in deferred_items}
-        _all_excluded = included_urls | _dup_urls | _backfill_dup_urls
+        _all_excluded = included_urls | _dup_urls | self._backfill_dup_urls
         if deferrable_post_published:
             category_pool = [
                 it for it in deferrable_post_published
@@ -2414,12 +2445,20 @@ class NewsPipeline:
                     if _ld is not None:
                         running_counts[_ld] += 1
             backfill_candidates: List[NewsItem] = []
+            # Задача 3 (M2): поздний backfill пропускает url из self._backfill_dup_urls.
+            # self._backfill_dup_urls вычисляется в раннем backfill (:2238),
+            # может быть пустым множеством если ранний backfill не выполнялся
+            # (early return по пустому deferrable_post_published или max_items<=0).
             for it in deferrable_post_published:
                 if it.url in included_urls:
                     continue
                 # M1: пропускаем LLM-дубли (не были в deferred_items после dedup,
                 # но они в deferrable_post_published)
                 if it.url in _dup_urls:
+                    continue
+                # Задача 3 (M2): пропускаем url, отклонённые ранним backfill
+                # как дубли показанных — иначе поздний backfill возвращает их.
+                if it.url in self._backfill_dup_urls:
                     continue
                 # Единый проход: проверка + инкремент сразу, до следующего кандидата.
                 # 'other' или отсутствие cluster_key не ограничивается локацией.

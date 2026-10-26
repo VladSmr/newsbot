@@ -5,6 +5,9 @@ r"""
   Если один и тот же cluster_key (тема+день) за последние 2 часа,
   независимо от source — пропускаем новый item как потенциальный дубль.
   Выполняется ДО fuzzy-дедупа (быстрая отсечка).
+  Числовой guard: stem_hash не содержит цифр (normalize() их вырезает),
+  поэтому совпадение cluster_key дополнительно сверяется по мультимножеству
+  чисел заголовков — «25 bps» и «50 bps» больше не схлопываются в дубль.
 
 Дедуп по двум уровням (оба конфигурируемые):
   Уровень 1 — глобальный точный дедуп по title_hash (без source).
@@ -82,6 +85,22 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
     ≈ 1.2e-2 ≈ 1.2%). При коллизии guard может пропустить нерелевантную
     новость как дубль — осознанный компромисс (широкий stem менее агрессивен,
     чем точный match, и не приводит к потере новостей).
+
+    Числовой guard (фикс потери новостей, различающихся только числами):
+    stem_hash считается от stemmer.normalize(), который ВЫРЕЗАЕТ все цифры
+    (`re.sub(r'\\d+([.,]\\d+)?', ' ')`). Поэтому «Fed raises rates by 25 bps»
+    и «Fed raises rates by 50 bps» дают ОДИН stem_hash → один cluster_key.
+    Без числовой проверки второй item жёстко уходил в state='skipped' (а URL —
+    в постоянный URL-дедуп), т.е. новость терялась безвозвратно. Теперь после
+    SQL-совпадения по cluster_key (LIKE/exact) сверяем мультимножество чисел
+    заголовка нового item с мультимножеством чисел заголовка совпавшей записи
+    (колонка items.title). Дубль ⟺ числа совпали. Следствия:
+      • «25 bps» vs «50 bps» → числа разные → НЕ дубль (идёт в обычный конвейер,
+        дальше решают точный/fuzzy/LLM-дедуп);
+      • точный пересказ с теми же числами → числа совпадают → скип как раньше;
+      • заголовки без чисел → оба мультимножества пустые → поведение прежнее.
+    Формат cluster_key при этом НЕ меняется (числа живут в title, а не в ключе),
+    поэтому старые записи в БД продолжают матчиться и миграция не нужна.
     """
     cluster_key = getattr(item, 'cluster_key', None)
     if not cluster_key:
@@ -89,6 +108,13 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
         conn = storage._connect()
+        # Числа нового item считаем ВНУТРИ try: `title` приходит из внешнего кода
+        # (collector/тесты/плагины) и теоретически может быть не-str. Раньше
+        # исключение здесь обрывало filter_new, сужая fail-open-инвариант модуля
+        # («ошибка дедупа не должна ронять цикл»). Теперь ошибка разбора
+        # логируется WARNING'ом, а guard деградирует до прежнего поведения
+        # (совпадение cluster_key ⇒ дубль, без числовой сверки).
+        item_numbers = _safe_number_multiset(getattr(item, 'title', None))
         if '|' in cluster_key:
             # Новый формат: `loc|stem|day` — сравниваем по суффиксу stem|day.
             # Отрезаем локационный префикс: suffix = "stem|day".
@@ -101,17 +127,33 @@ def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -
             #   → MATCH: 'other|abc12345|2026-10-21', 'moscow|abc12345|2026-10-21'
             #   → NO MATCH: 'other|def99999|2026-10-21', 'moscow|def99999|2026-10-21'
             suffix = cluster_key.split('|', 1)[1]
-            row = conn.execute(
-                "SELECT 1 FROM items WHERE cluster_key LIKE '%' || ? ESCAPE '\\' AND fetched_at>=? LIMIT 1",
+            rows = conn.execute(
+                "SELECT title FROM items WHERE cluster_key LIKE '%' || ? ESCAPE '\\' AND fetched_at>=?",
                 (suffix, cutoff),
-            ).fetchone()
+            )
         else:
             # Старый формат без `|`: точное совпадение.
-            row = conn.execute(
-                "SELECT 1 FROM items WHERE cluster_key=? AND fetched_at>=? LIMIT 1",
+            rows = conn.execute(
+                "SELECT title FROM items WHERE cluster_key=? AND fetched_at>=?",
                 (cluster_key, cutoff),
-            ).fetchone()
-        return row is not None
+            )
+        # Числовой guard: срабатываем на первую запись с тем же мультимножеством
+        # чисел. Ранний выход — обычно первая же строка. Курсор читается
+        # построчно (без материализации всех titles окна в память).
+        # Ключевое: `continue`, а НЕ `return False` на несовпадении чисел —
+        # в окне может быть несколько записей с тем же cluster_key, и совпадение
+        # может оказаться в любой из них.
+        for row in rows:
+            if item_numbers is None:
+                # Числа нового item не разобрались → прежнее поведение guard'а:
+                # cluster_key совпал ⇒ дубль (без числовой сверки).
+                return True
+            cand_numbers = _safe_number_multiset(row["title"])
+            if cand_numbers is None or cand_numbers == item_numbers:
+                # cand_numbers is None: title кандидата не разобрался —
+                # консервативно считаем совпадением (cluster_key уже совпал).
+                return True
+        return False
     except Exception as e:
         logger.warning("Доменный дедуп: ошибка, fail-open: %s", e)
         return False
@@ -265,13 +307,47 @@ _STOP_WORDS = {"the", "and", "for", "that", "this", "with", "from", "were", "was
 
 def _number_multiset(text: str) -> Counter:
     r"""
-    Мультимножество цифровых последовательностей из нормализованного текста.
-    Жёсткий guard: разные мультимножества → НЕ дубль.
-    "\d+(?:[.,]\\d+)?" на нормализованном тексте = просто \d+ (точки/запятые
-    уже удалены normalize), но регекс сохранён для совместимости.
-    Counter: "70 70" и "70" — РАЗНЫЕ мультимножества (2 vs 1).
+    Мультимножество числовых токенов текста. Жёсткий guard: разные
+    мультимножества → НЕ дубль. Counter, а не set: "70 70" и "70" — РАЗНЫЕ
+    мультимножества (2 vs 1).
+
+    Регекс `\d+(?:[.,]\d+)?` чувствителен к тому, ЧТО подано на вход — два
+    call-site с разной семантикой:
+      • fuzzy-дедуп (`_is_fuzzy_similar`) — НОРМАЛИЗОВАННЫЙ текст
+        (`NewsItem.title_normalized()`), где [.,] и прочая пунктуация уже
+        вырезаны, поэтому регекс фактически ловит только `\d+`;
+      • доменный 2h-guard (`_domain_recent_duplicate`) — СЫРОЙ заголовок
+        из `items.title`, поэтому десятичные сохраняются одним токеном
+        («2.5», «2,5») и не путаются с двумя числами «2 5».
+    Семантика намеренно не выравнивается: на сыром тексте guard строже
+    (десятичная дробь — отдельный токен), а строже = безопаснее (меньше
+    ложных склеек; расхождение чисел лишь пропускает item дальше по конвейеру).
     """
     return Counter(_NUMBER_RE.findall(text))
+
+
+def _safe_number_multiset(text) -> Optional[Counter]:
+    """
+    Fail-open обёртка над _number_multiset для данных из внешнего кода.
+
+    Возвращает None, если числа посчитать не удалось (не-str title и т.п.):
+    вызывающий код трактует None как «сверка невозможна» и деградирует до
+    прежнего поведения. Исключение НЕ пробрасывается — иначе filter_new
+    оборвался бы до save_many (потеря новостей в цикле).
+    """
+    if text is None:
+        # NULL/отсутствующий title = пустое множество чисел (как '').
+        return Counter()
+    try:
+        if not isinstance(text, str):
+            text = str(text)
+        return _number_multiset(text)
+    except Exception as e:
+        logger.warning(
+            "Доменный дедуп: не удалось разобрать числа заголовка (type=%s): %s",
+            type(text).__name__, e,
+        )
+        return None
 
 
 def _meaningful_tokens(text: str) -> Set[str]:

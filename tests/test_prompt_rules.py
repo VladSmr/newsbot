@@ -86,6 +86,51 @@ class TestCorroborationCap:
         assert "second independent source" in BATCH_SYSTEM_PROMPT.lower()
 
 
+class TestUrgentBlockParity:
+    """
+    Задача 1 (MAJOR): urgent=false примеры должны присутствовать
+    в ОБОИХ промптах — SYSTEM_PROMPT и BATCH_SYSTEM_PROMPT.
+
+    Основной prod-путь идёт через batch (batch_size=10).
+    Потеря перечня urgent=false в BATCH_SYSTEM_PROMPT приводила к тому,
+    что самая частая категория (ночные сводки БПЛА, санкции и т.д.)
+    трактовалась как potentially-urgent → риск push-спама.
+    """
+
+    def test_urgent_false_examples_in_system_prompt(self):
+        """SYSTEM_PROMPT содержит перечень не-срочных тем (urgent=false)."""
+        assert "ordinary night drone attacks and their reports" in SYSTEM_PROMPT
+        assert "sanctions" in SYSTEM_PROMPT
+        assert "prices/fuel" in SYSTEM_PROMPT
+        assert "regional incidents without mass casualties" in SYSTEM_PROMPT
+
+    def test_urgent_false_examples_in_batch_prompt(self):
+        """BATCH_SYSTEM_PROMPT содержит тот же перечень не-срочных тем."""
+        assert "ordinary night drone attacks and their reports" in BATCH_SYSTEM_PROMPT
+        assert "sanctions" in BATCH_SYSTEM_PROMPT
+        assert "prices/fuel" in BATCH_SYSTEM_PROMPT
+        assert "regional incidents without mass casualties" in BATCH_SYSTEM_PROMPT
+
+    def test_urgent_false_examples_identical_in_both_prompts(self):
+        """Блок URGENT_FALSE_EXAMPLES используется обоими промптами (один текст)."""
+        from newsbot.llm.prompts import URGENT_FALSE_EXAMPLES
+        assert URGENT_FALSE_EXAMPLES in SYSTEM_PROMPT
+        assert URGENT_FALSE_EXAMPLES in BATCH_SYSTEM_PROMPT
+
+    def test_urgent_true_criteria_in_batch_prompt(self):
+        """BATCH_SYSTEM_PROMPT содержит критерии urgent=true."""
+        assert "urgent=true" in BATCH_SYSTEM_PROMPT
+        assert "beginning of war" in BATCH_SYSTEM_PROMPT
+        assert "mobilization" in BATCH_SYSTEM_PROMPT
+        assert "mass casualties" in BATCH_SYSTEM_PROMPT
+        assert "nuclear or radiation" in BATCH_SYSTEM_PROMPT
+
+    def test_urgent_doubt_falls_false_in_batch_prompt(self):
+        """BATCH_SYSTEM_PROMPT: When in doubt → false."""
+        assert "When in doubt" in BATCH_SYSTEM_PROMPT
+        assert "false" in BATCH_SYSTEM_PROMPT
+
+
 class TestFileLoggingHandler:
     """2.1: RotatingFileHandler создаётся корректно."""
 

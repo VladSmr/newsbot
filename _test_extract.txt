@@ -1,0 +1,10 @@
+def test_early_backfill_dedup_not_reclaimed_by_late_backfill(self):
+        """
+        Задача 3: поздний backfill пропускает url из self._backfill_dup_urls.
+
+        Схема:
+          - max_items=4
+          - top-4: A(10), B(9), C(8), D(7)
+          - пул[:4]: E(6), F(5), G(4), H(3)
+          - пул[4:]: I(2), J(1)
+          - max_per_location=3 (France)

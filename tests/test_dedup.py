@@ -1362,6 +1362,371 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
+    # ── Числовой guard доменного дедупа (потеря новостей «25 bps» vs «50 bps») ──
+    # stem_hash считается от normalize(), который вырезает цифры, поэтому
+    # заголовки, различающиеся ТОЛЬКО числами, получают одинаковый cluster_key.
+    # Guard сверяет мультимножество чисел заголовков.
+
+    def test_domain_recent_duplicate_different_numbers_passes(self):
+        """
+        «Fed raises rates by 25 bps» vs «... by 50 bps»: cluster_key совпадает
+        (числа вырезаны из stem), но числа заголовков разные → НЕ дубль.
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            title_old = "Fed raises rates by 25 bps"
+            title_new = "Fed raises rates by 50 bps"
+            stem = stem_hash(title_old)
+            # Предусловие фикса: stem не зависит от чисел → ключи идентичны.
+            self.assertEqual(
+                stem, stem_hash(title_new),
+                "предусловие: normalize() вырезает цифры → stem одинаковый",
+            )
+            key = f"other|{stem}|2026-10-24"
+
+            db_item = _mk_item(
+                title=title_old,
+                source="reuters.com",
+                url="https://reuters.com/bps25",
+                cluster_key=key,
+            )
+            st.save(db_item)
+
+            ingest_item = _mk_item(
+                title=title_new,
+                source="bloomberg.com",
+                url="https://bloomberg.com/bps50",
+                cluster_key=key,
+            )
+            result = _domain_recent_duplicate(ingest_item, st)
+            self.assertFalse(
+                result,
+                "Разные числа (25 vs 50) → это разные факты, guard не должен "
+                "переводить item в skipped (необратимая потеря новости)",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_same_numbers_still_blocks(self):
+        """
+        Пересказ с теми же числами (перестановка слов) → guard блокирует.
+        Валидирует и инвариант stem-хеша: normalize() сортирует слова, поэтому
+        оба заголовка дают один stem/cluster_key.
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            title_old = "Fed raises rates by 25 bps"
+            title_new = "By 25 bps, Fed raises rates"
+            stem = stem_hash(title_old)
+            self.assertEqual(
+                stem, stem_hash(title_new),
+                "предусловие: перестановка слов не меняет stem (normalize sort)",
+            )
+            key = f"other|{stem}|2026-10-24"
+
+            db_item = _mk_item(
+                title=title_old,
+                source="reuters.com",
+                url="https://reuters.com/same25",
+                cluster_key=key,
+            )
+            st.save(db_item)
+
+            # Пересказ: другой source, другой порядок слов, те же числа.
+            ingest_item = _mk_item(
+                title=title_new,
+                source="bloomberg.com",
+                url="https://bloomberg.com/same25",
+                cluster_key=key,
+            )
+            result = _domain_recent_duplicate(ingest_item, st)
+            self.assertTrue(
+                result,
+                "Те же числа → дубль, guard должен блокировать",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_scans_all_candidates_same_cluster_key(self):
+        """
+        Несколько записей с ОДИНАКОВЫМ cluster_key в окне: у первой числа
+        другие, у второй — совпадают → guard обязан вернуть True.
+        Регресс на `continue` вместо `return False` при несовпадении чисел
+        (иначе правильность держалась только на чтении кода).
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            title_new = "Fed raises rates by 25 bps"
+            stem = stem_hash(title_new)
+            self.assertEqual(stem, stem_hash("Fed raises rates by 50 bps"))
+            key = f"other|{stem}|2026-10-24"
+
+            # 1-я строка: те же слова, ДРУГИЕ числа.
+            st.save(_mk_item(
+                title="Fed raises rates by 50 bps",
+                source="reuters.com",
+                url="https://reuters.com/multi50",
+                cluster_key=key,
+            ))
+            # 2-я строка: тот же cluster_key, числа СОВПАДАЮТ.
+            st.save(_mk_item(
+                title=title_new,
+                source="ft.com",
+                url="https://ft.com/multi25",
+                cluster_key=key,
+            ))
+
+            ingest_item = _mk_item(
+                title=title_new,
+                source="bloomberg.com",
+                url="https://bloomberg.com/multi25",
+                cluster_key=key,
+            )
+            self.assertTrue(
+                _domain_recent_duplicate(ingest_item, st),
+                "Совпадение чисел во ВТОРОЙ записи окна должно блокировать item "
+                "(guard сканирует всех кандидатов по cluster_key, а не первого)",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_non_str_title_no_crash(self):
+        """
+        Не-str title из внешнего кода не должен обрывать filter_new (fail-open):
+        guard деградирует, но исключение наружу не уходит.
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            stem = stem_hash("Fed raises rates by 25 bps")
+            key = f"other|{stem}|2026-10-24"
+            st.save(_mk_item(
+                title="Fed raises rates by 25 bps",
+                source="reuters.com",
+                url="https://reuters.com/weird",
+                cluster_key=key,
+            ))
+
+            weird = _mk_item(
+                title="Fed raises rates by 25 bps",
+                source="bloomberg.com",
+                url="https://bloomberg.com/weird",
+                cluster_key=key,
+            )
+            weird.title = None  # грязные данные из внешнего кода
+            result = _domain_recent_duplicate(weird, st)  # не должно бросить
+            self.assertIsInstance(result, bool)
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_counter_not_set(self):
+        """
+        Мультимножество, а не множество: «70 70» vs «70» ({70:2} ≠ {70:1})
+        → НЕ дубль. Заголовки отличаются ТОЛЬКО числами (одинаковый stem),
+        поэтому проверяется именно Counter-семантика.
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            title_old = "Regulator fines bank 70 70 million"
+            title_new = "Regulator fines bank 70 million"
+            stem = stem_hash(title_old)
+            self.assertEqual(
+                stem, stem_hash(title_new),
+                "предусловие: различие только в числах → stem одинаковый",
+            )
+            key = f"other|{stem}|2026-10-24"
+
+            st.save(_mk_item(
+                title=title_old,
+                source="reuters.com",
+                url="https://reuters.com/7070",
+                cluster_key=key,
+            ))
+
+            ingest_item = _mk_item(
+                title=title_new,
+                source="bloomberg.com",
+                url="https://bloomberg.com/70",
+                cluster_key=key,
+            )
+            self.assertFalse(
+                _domain_recent_duplicate(ingest_item, st),
+                "{70: 2} != {70: 1} → разные мультимножества → не дубль "
+                "(set-семантика склеила бы их ошибочно)",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_numbers_multiset_counts_multiplicity(self):
+        """
+        Мультимножество, а не множество: «2 dead in 2 regions» vs «2 dead in 3
+        regions» различаются, а разные кратности одного числа — тоже.
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            title_old = "Storm kills 2 in 2 regions of Japan"
+            stem = stem_hash(title_old)
+            self.assertEqual(stem, stem_hash(title_old), "stem детерминирован")
+            key = f"other|{stem}|2026-10-24"
+            st.save(_mk_item(
+                title=title_old,
+                source="reuters.com",
+                url="https://reuters.com/storm22",
+                cluster_key=key,
+            ))
+
+            ingest_item = _mk_item(
+                title="Storm kills 2 in 3 regions of Japan",
+                source="bloomberg.com",
+                url="https://bloomberg.com/storm23",
+                cluster_key=key,
+            )
+            self.assertFalse(
+                _domain_recent_duplicate(ingest_item, st),
+                "2 vs 3 в мультимножестве чисел → разные факты → не дубль",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_no_numbers_behavior_unchanged(self):
+        """
+        Заголовки без чисел → оба мультимножества пустые → поведение прежнее:
+        suffix-match по stem|day блокирует (в т.ч. при другой локации в БД).
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            title = "ЦБ повысил ключевую ставку"
+            stem = stem_hash(title)
+            self.assertIsNotNone(stem)
+
+            st.save(_mk_item(
+                title=title,
+                source="kommersant.ru",
+                url="https://kommersant.ru/no-nums",
+                cluster_key=f"moscow|{stem}|2026-10-24",
+            ))
+
+            ingest_item = _mk_item(
+                title=title,
+                source="ria.ru",
+                url="https://ria.ru/no-nums",
+                cluster_key=f"other|{stem}|2026-10-24",
+            )
+            self.assertTrue(
+                _domain_recent_duplicate(ingest_item, st),
+                "Без чисел → пустые мультимножества совпадают → дубль как раньше",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_domain_recent_duplicate_numbers_only_in_one_title_passes(self):
+        """Числа есть только в одном заголовке → мультимножества разные → не дубль."""
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+            from newsbot.dedup import _domain_recent_duplicate
+
+            st = Storage(Path(path))
+            title_old = "Fed raises rates"
+            stem = stem_hash(title_old)
+            self.assertEqual(stem, stem_hash("Fed raises rates by 25 bps"))
+            key = f"other|{stem}|2026-10-24"
+            st.save(_mk_item(
+                title=title_old,
+                source="reuters.com",
+                url="https://reuters.com/nonum",
+                cluster_key=key,
+            ))
+
+            ingest_item = _mk_item(
+                title="Fed raises rates by 25 bps",
+                source="bloomberg.com",
+                url="https://bloomberg.com/num25",
+                cluster_key=key,
+            )
+            self.assertFalse(
+                _domain_recent_duplicate(ingest_item, st),
+                "Пустое множество vs {{25}} → разные факты → не дубль",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_filter_new_keeps_item_with_different_numbers(self):
+        """
+        Интеграционно: при ингесте «50 bps» после «25 bps» (≤2ч, тот же день)
+        item НЕ переводится в state='skipped' — проходит в new_items.
+        """
+        path = _tmp_db()
+        try:
+            from newsbot.stemmer import stem_hash
+
+            cfg = {"cross_source": True, "fuzzy": True, "threshold": 0.95,
+                   "token_threshold": 0.8, "window_days": 3}
+            st = Storage(Path(path), dedup_config=cfg)
+
+            title_old = "Fed raises rates by 25 bps"
+            stem = stem_hash(title_old)
+            key = f"other|{stem}|2026-10-24"
+
+            past = _mk_item(
+                title=title_old,
+                source="reuters.com",
+                url="https://reuters.com/fn25",
+                cluster_key=key,
+            )
+            st.save(past)
+            st.set_state([past.url], "delivered")
+
+            current = _mk_item(
+                title="Fed raises rates by 50 bps",
+                source="bloomberg.com",
+                url="https://bloomberg.com/fn50",
+                cluster_key=key,
+            )
+
+            new_items, total, dup = filter_new([current], st, dedup_config=cfg)
+            self.assertEqual(dup, 0, "Другой факт (50 bps) не должен считаться дублем")
+            self.assertEqual(len(new_items), 1, "Item должен пройти дальше по pipeline")
+            self.assertIs(new_items[0], current)
+            st.close()
+        finally:
+            _cleanup_db(path)
+
 
 # =============================================================================
 # LIMIT: кросс-source дедуп не должен усекаться 500 самыми свежими

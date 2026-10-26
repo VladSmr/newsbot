@@ -2,8 +2,12 @@
 Тесты storage.py — покрывают tags-поля и URL-normalization дедуп (v14).
 """
 import json
+import sqlite3
+import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -735,3 +739,236 @@ class TestV14Migration:
         assert "idx_items_url_norm" in indexes, (
             f"Индекс после повторного вызова: {indexes}"
         )
+
+
+class TestUpdateLlmResultsBatchPerRecordIsolation:
+    """
+    Задача 1 (storage MAJOR): per-record изоляция в update_llm_results_batch.
+
+    (a) Один record из 3 падает → 2 обновлены, 1 пропущен,
+        возвращается ['url1', 'url2'].
+    (б) Обычный путь без изменений: все 3 обновлены, возвращается ['url1', 'url2', 'url3'].
+    """
+
+    def _insert_pending(self, conn, url, title="Test", score=None):
+        """Вставляет pending-item в БД."""
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO items
+            (source, url, title, summary, published, fetched_at,
+             state, state_at, llm_score)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            ("TestSrc", url, title, "Summary", "2025-01-01",
+             "2025-01-01T12:00:00+00:00", "2025-01-01T12:00:00+00:00", score),
+        )
+
+    def test_partial_batch_failure_only_successes_returned(self, tmp_db):
+        """
+        Задача 1: 3 records, средний UPDATE бросает OperationalError →
+        1-й и 3-й обновлены в БД, возвращается ['ok1', 'ok3'].
+
+        Per-record изоляция: каждый UPDATE в отдельном with self._tx().
+        Исключение на 2-м record ловится except внутри цикла → цикл
+        продолжается, 3-й record обновляется, 2-й остаётся pending.
+
+        В отличие от прежней версии теста (несуществующий url → rowcount=0,
+        ветка except не исполнялась), здесь ошибку бросает НАСТОЯЩИЙ execute
+        через прокси над sqlite-соединением: LPAD'ится только UPDATE для
+        url='middle', остальные идут в реальную БД. Поэтому проверяется и
+        возвращаемое значение, и фактическое состояние БД.
+
+        Фикс (storage.py:2226-2231): except ловит ошибку UPDATE, не прерывая
+        цикл. БЕЗ фикса: OperationalError из UPDATE propagates наружу →
+        update_llm_results_batch падает, ok3 не обновляется, тест падает
+        (исключение вместо возврата списка).
+        """
+        # Вставляем все 3 записи в БД.
+        conn = tmp_db._connect()
+        for url in ("https://ex.com/ok1", "https://ex.com/middle", "https://ex.com/ok3"):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO items
+                (source, url, title, summary, published, fetched_at, state, state_at, llm_score)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                ("TestSrc", url, "T", "S", "2025-01-01",
+                 "2025-01-01T12:00:00+00:00", "2025-01-01T12:00:00+00:00", None),
+            )
+        conn.commit()
+
+        records = [
+            {"url": "https://ex.com/ok1", "score": 7, "summary": "S1", "reason": "R1"},
+            {"url": "https://ex.com/middle", "score": 8, "summary": "S2", "reason": "R2"},
+            {"url": "https://ex.com/ok3", "score": 9, "summary": "S3", "reason": "R3"},
+        ]
+
+        update_attempts: list = []
+
+        class _FlakyConn:
+            """Прокси над реальным соединением: UPDATE для 'middle' падает."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, params=None):
+                if "UPDATE items SET" in sql:
+                    url = params[-1] if params else None
+                    update_attempts.append(url)
+                    if url == "https://ex.com/middle":
+                        raise sqlite3.OperationalError("database is locked")
+                if params is None:
+                    return self._real.execute(sql)
+                return self._real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        @contextmanager
+        def fake_tx():
+            real = tmp_db._connect()
+            proxy = _FlakyConn(real)
+            real.execute("BEGIN")
+            try:
+                yield proxy
+                real.commit()
+            except Exception:
+                try:
+                    real.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+        with patch.object(tmp_db, "_tx", side_effect=fake_tx):
+            with patch("newsbot.storage.logger") as mock_logger:
+                successful = tmp_db.update_llm_results_batch(records)
+
+        # Все 3 UPDATE были попытаны (2-й упал, но цикл не прервался).
+        assert update_attempts == [
+            "https://ex.com/ok1",
+            "https://ex.com/middle",
+            "https://ex.com/ok3",
+        ], f"UPDATE attempts: {update_attempts}"
+
+        # Контракт: возвращается List[str] успешно обновлённых URL.
+        assert isinstance(successful, list)
+        assert successful == ["https://ex.com/ok1", "https://ex.com/ok3"], (
+            f"Expected ['ok1', 'ok3'], got {successful}"
+        )
+
+        # Исключение залогировано (и именно для middle).
+        assert mock_logger.error.called, "Exception должен быть залогирован"
+        logged = " ".join(str(a) for a in mock_logger.error.call_args[0])
+        assert "middle" in logged or "https://ex.com/middle" in logged, (
+            f"logger.error должен упоминать middle, got: {logged}"
+        )
+
+        # Финальное состояние: ok1 и ok3 обновлены, middle остался pending.
+        for url, expected_score in [("https://ex.com/ok1", 7), ("https://ex.com/ok3", 9)]:
+            row = tmp_db._connect().execute(
+                "SELECT llm_score FROM items WHERE url = ?", (url,)
+            ).fetchone()
+            assert row is not None
+            assert row["llm_score"] == expected_score, (
+                f"{url}: ожидался score {expected_score}, получен {row['llm_score']}"
+            )
+
+        middle_row = tmp_db._connect().execute(
+            "SELECT llm_score FROM items WHERE url = ?", ("https://ex.com/middle",)
+        ).fetchone()
+        assert middle_row is not None
+        assert middle_row["llm_score"] is None, "middle остался pending (не обновлён)"
+
+    def test_full_batch_success_all_urls_returned(self, tmp_db):
+        """
+        Задача 1b: все 3 records обновлены → возвращается список из 3 URL.
+        """
+        conn = tmp_db._connect()
+        for url in ("https://ex.com/a", "https://ex.com/b", "https://ex.com/c"):
+            self._insert_pending(conn, url, score=None)
+        conn.commit()
+        # Не close() — управление соединением у Storage (cached connection)
+
+        records = [
+            {"url": "https://ex.com/a", "score": 7, "summary": "Sa", "reason": "Ra"},
+            {"url": "https://ex.com/b", "score": 8, "summary": "Sb", "reason": "Rb"},
+            {"url": "https://ex.com/c", "score": 9, "summary": "Sc", "reason": "Rc"},
+        ]
+
+        successful = tmp_db.update_llm_results_batch(records)
+
+        assert len(successful) == 3, f"Expected 3, got {successful}"
+        assert set(successful) == {"https://ex.com/a", "https://ex.com/b", "https://ex.com/c"}
+
+        # llm_score записан для всех
+        for url in ("https://ex.com/a", "https://ex.com/b", "https://ex.com/c"):
+            row = tmp_db._connect().execute(
+                "SELECT llm_score FROM items WHERE url = ?", (url,)
+            ).fetchone()
+            assert row is not None and row["llm_score"] is not None
+
+    def test_empty_input_returns_empty_list(self, tmp_db):
+        """Пустой вход → пустой список (не Exception)."""
+        result = tmp_db.update_llm_results_batch([])
+        assert result == [], f"Expected [], got {result}"
+
+    def test_title_en_preserve_none(self, tmp_db):
+        """
+        record без title_en (или title_en=None) НЕ трогает llm_title.
+        """
+        conn = tmp_db._connect()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO items
+            (source, url, title, summary, published, fetched_at,
+             state, state_at, llm_score, llm_title)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            ("Src", "https://ex.com/preserve", "Old Title", "Sum",
+             "2025-01-01", "2025-01-01T12:00:00+00:00",
+             "2025-01-01T12:00:00+00:00", 5, "Old English Title"),
+        )
+        conn.commit()
+        # Не close() — управление соединением у Storage
+
+        records = [
+            {"url": "https://ex.com/preserve",
+             "score": 6, "summary": "New Sum", "reason": "New Reason"},
+            # title_en отсутствует — llm_title не трогать
+        ]
+
+        successful = tmp_db.update_llm_results_batch(records)
+
+        assert len(successful) == 1
+        row = tmp_db._connect().execute(
+            "SELECT llm_score, llm_title FROM items WHERE url = ?",
+            ("https://ex.com/preserve",)
+        ).fetchone()
+        assert row["llm_score"] == 6, "llm_score должен обновиться"
+        assert row["llm_title"] == "Old English Title", (
+            "llm_title должен сохраниться (не затрёт None title_en)"
+        )
+
+    def test_urgent_and_cluster_key_fields(self, tmp_db):
+        """urgent и cluster_key пишутся в свои поля."""
+        conn = tmp_db._connect()
+        self._insert_pending(conn, "https://ex.com/extra")
+        conn.commit()
+        # Не close() — управление соединением у Storage
+
+        records = [{
+            "url": "https://ex.com/extra",
+            "score": 7, "summary": "S", "reason": "R",
+            "urgent": True,
+            "cluster_key": "France|abc|2025-01-01",
+        }]
+
+        successful = tmp_db.update_llm_results_batch(records)
+
+        assert len(successful) == 1
+        row = tmp_db._connect().execute(
+            "SELECT llm_urgent, cluster_key FROM items WHERE url = ?",
+            ("https://ex.com/extra",)
+        ).fetchone()
+        assert row["llm_urgent"] == 1, "llm_urgent должен быть 1"
+        assert row["cluster_key"] == "France|abc|2025-01-01", "cluster_key должен записаться"

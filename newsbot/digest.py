@@ -26,7 +26,7 @@ from .delivery import Delivery, format_time_utc
 # от Telegram 400 «message is too long» → items остается deferred →
 # детерминированный повтор каждое окно. Берём общий helper из telegram.py —
 # единственный источник истины для лимита (не дублируем формулу).
-from .delivery.telegram import _utf16_units, is_valid_http_url
+from .delivery.telegram import _utf16_units, is_valid_http_url, _strip_control_chars
 
 # Тип для кнопок одной новости в дайджесте
 DigestItemButtons = List[dict]  # [{url, target_id}, ...]
@@ -149,18 +149,29 @@ def _render_item_raw(item: NewsItem) -> Tuple[str, str, str, str]:
       (title_raw, source_raw, body_raw, footer_raw)
 
     footer_raw = "{time_str} 🔗" если URL валидный, иначе "{time_str}"
+
+    Task 2-фикс: control-chars (\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029)
+    удаляются из title/source/body ДО html.escape — иначе Telegram 400
+    «can't parse entities» при рендере digest, и страница (до 20 новостей)
+    уходит в deferred навсегда.
     """
-    title_raw = item.llm_title or item.title or "—"
+    # Task 2: удаляем control-chars ДО любой обработки
+    raw_title = (item.llm_title or item.title or "—")
+    title_raw = _strip_control_chars(raw_title)
     # заголовок ограничен до 250 символов
     title_raw = _truncate_raw_summary(title_raw, 250)
 
-    source_raw = item.source or "—"
+    # Task 2: удаляем control-chars из source
+    raw_source = (item.source or "—")
+    source_raw = _strip_control_chars(raw_source)
     # M1-фикс: source ограничивается до 100 символов RAW
     # (чтобы escape не раздул overhead и не сломал бюджет)
     source_raw = _truncate_raw_summary(source_raw, 100)
 
     # body: приоритет llm_summary → summary, до 500 символов
     raw_body = (item.llm_summary or item.summary or "").strip()
+    # Task 2: удаляем control-chars из body
+    raw_body = _strip_control_chars(raw_body)
     raw_body = _truncate_raw_summary(raw_body, 500)
 
     # время

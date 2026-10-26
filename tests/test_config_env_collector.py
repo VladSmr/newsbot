@@ -963,4 +963,176 @@ class TestConfigPollInterval:
         assert cfg["poll_interval_minutes"] == 15
 
 
+# ── Task 1: NameError в logger.warning (feed_url → url) + defense-in-depth ──
+
+
+class TestCollectorInvalidLinkIsolation:
+    """
+    Task 1: entry с невалидной ссылкой (javascript:, ftp:, пустой host)
+    не роняет весь цикл сбора. Фиксим: feed_url → url.
+    """
+
+    def _rss_with_invalid_entry(self, invalid_link: str, valid_link: str = None):
+        """RSS-фид: один entry с invalid_link, один с valid_link."""
+        if valid_link is None:
+            valid_link = "https://example.com/news/1"
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss version="2.0"><channel>'
+            '<item>'
+            f'<title>Bad Link Item</title>'
+            f'<link>{invalid_link}</link>'
+            '<description>A news item with a bad link.</description>'
+            '</item>'
+            '<item>'
+            '<title>Good Link Item</title>'
+            f'<link>{valid_link}</link>'
+            '<description>Normal news item.</description>'
+            '</item>'
+            '</channel></rss>'
+        )
+        return body.encode()
+
+    def _rss_with_multiple_feeds(self, bad_url: str, good_url: str):
+        """RSS-фид для второго источника (good)."""
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<rss version="2.0"><channel>'
+            '<item>'
+            '<title>Good Feed Item</title>'
+            f'<link>{good_url}</link>'
+            '<description>Item from the second feed.</description>'
+            '</item>'
+            '</channel></rss>'
+        )
+        return body.encode()
+
+    def test_invalid_link_javascript_no_nameerror(self):
+        """Entry с javascript: — не падает с NameError, остальные entries обработаны."""
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        body = self._rss_with_invalid_entry("javascript:alert(1)")
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(200, content=body)
+        )
+        client = httpx.Client(transport=transport, follow_redirects=True)
+        collector = FeedCollector([{"name": "test_feed", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            name, result = next(collector.collect())
+            # НЕ NameError → collect завершился
+            assert result.ok is True, f"expected ok=True, got {result.ok}"
+            # Валидный entry обработан
+            good_items = [it for it in result.items if "Good Link" in it.title]
+            assert len(good_items) == 1, (
+                f"Expected 1 good item, got {len(good_items)}. "
+                f"Items: {[it.title for it in result.items]}"
+            )
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_invalid_link_ftp_no_nameerror(self):
+        """Entry с ftp: — не падает, остальные entries обработаны."""
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        body = self._rss_with_invalid_entry("ftp://example.com/file")
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(200, content=body)
+        )
+        client = httpx.Client(transport=transport, follow_redirects=True)
+        collector = FeedCollector([{"name": "ftp_feed", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            name, result = next(collector.collect())
+            assert result.ok is True
+            good_items = [it for it in result.items if "Good Link" in it.title]
+            assert len(good_items) == 1
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_invalid_link_empty_host_no_nameerror(self):
+        """Entry с пустым хостом — не падает, остальные entries обработаны."""
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        body = self._rss_with_invalid_entry("https://")
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(200, content=body)
+        )
+        client = httpx.Client(transport=transport, follow_redirects=True)
+        collector = FeedCollector([{"name": "bad_host_feed", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            name, result = next(collector.collect())
+            assert result.ok is True
+            good_items = [it for it in result.items if "Good Link" in it.title]
+            assert len(good_items) == 1
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_one_bad_feed_does_not_break_collect_cycle(self):
+        """
+        Task 1б: defense-in-depth. Один фид с exception в _fetch_feed
+        не прерывает обработку других фидов.
+        """
+        import httpx
+        from newsbot.collector import FeedCollector, FeedResult
+        from unittest import mock
+
+        # Мокаем _fetch_feed напрямую: bad1/bad2 бросают, good — штатно.
+        def fake_fetch(name, url, lang=None):
+            if name in ("bad_feed_1", "bad_feed_2"):
+                raise RuntimeError("Simulated feed failure")
+            # Штатный результат
+            body = self._rss_with_multiple_feeds(
+                "https://example.com/good1", "https://example.com/good2"
+            )
+            transport = httpx.MockTransport(
+                lambda req: httpx.Response(200, content=body)
+            )
+            client = httpx.Client(transport=transport)
+            tmp_collector = FeedCollector([{"name": name, "url": url}])
+            tmp_collector._client.close()
+            tmp_collector._client = client
+            try:
+                _, result = next(tmp_collector.collect())
+            finally:
+                client.close()
+                tmp_collector._client = httpx.Client(timeout=15)
+            return result
+
+        collector = FeedCollector([
+            {"name": "bad_feed_1", "url": "http://test/bad1"},
+            {"name": "good_feed", "url": "http://test/good"},
+            {"name": "bad_feed_2", "url": "http://test/bad2"},
+        ])
+
+        with mock.patch.object(collector, "_fetch_feed", fake_fetch):
+            results = list(collector.collect())
+
+        # 3 результата: ok=False для bad, ok=True для good
+        assert len(results) == 3, f"Expected 3 results, got {len(results)}"
+        bad1 = next(r for r in results if r[0] == "bad_feed_1")
+        good = next(r for r in results if r[0] == "good_feed")
+        bad2 = next(r for r in results if r[0] == "bad_feed_2")
+
+        assert bad1[1].ok is False, "bad_feed_1 should have ok=False"
+        assert good[1].ok is True, "good_feed should have ok=True"
+        assert len(good[1].items) == 1, f"Expected 1 item, got {len(good[1].items)}"
+        assert bad2[1].ok is False, "bad_feed_2 should have ok=False"
+
+        collector.close()
+
+
 # --

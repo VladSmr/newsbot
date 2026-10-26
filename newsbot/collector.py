@@ -231,7 +231,12 @@ class FeedCollector:
             # lang из конфига фида (Task 2: lang проводка)
             lang = src.get("lang") or None
 
-            result = self._fetch_feed(name, url, lang=lang)
+            # Task 1б: любой exception из _fetch_feed не должен ронять весь цикл
+            try:
+                result = self._fetch_feed(name, url, lang=lang)
+            except Exception as e:
+                logger.warning("[%s] Исключение при сборе фида: %s", name, e)
+                result = FeedResult(ok=False, items=[])
             yield name, result
 
     def _fetch_feed(self, name: str, url: str, lang: Optional[str] = None) -> FeedResult:
@@ -442,7 +447,7 @@ class FeedCollector:
             if not self._validate_url(resolved_link):
                 logger.warning(
                     "[%s] пропущен entry с невалидной ссылкой: %s  (feed: %s)",
-                    name, resolved_link[:200], feed_url,
+                    name, resolved_link[:200], url,
                 )
                 continue
 

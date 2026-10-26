@@ -235,6 +235,7 @@ class TelegramPoller:
 
         # Storage создаётся ЛЕНИВО в poller thread (C1)
         self._storage = None
+        self._storage_initialized = False  # Task 3: флаг успешного создания Storage
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # m2: backoff как атрибут, чтобы _poll мог вызвать _sleep_backoff.
@@ -307,13 +308,35 @@ class TelegramPoller:
             _run_loop НЕ спит и НЕ удваивает backoff
         """
         # C1: создаём Storage в poller thread — своё соединение, не main.
-        try:
-            from newsbot.storage import Storage
-            self._storage = Storage(self._db_path)
-            self._log.debug("Poller Storage created in thread (db=%s)", self._db_path)
-        except Exception as e:
-            self._log.error("Failed to create Storage in poller thread: %s", e)
-            return  # не можем работать без storage
+        # Task 3: retry с backoff вокруг Storage (3-4 попытки, 1-2-4 с),
+        # если main-поток держит write-lock (busy_timeout=5s истёк).
+        _STORAGE_RETRIES = 4
+        _STORAGE_BACKOFF = (1.0, 2.0, 4.0)  # паузы между попытками, с
+        from newsbot.storage import Storage
+        storage_created = False
+        for attempt in range(_STORAGE_RETRIES):
+            try:
+                self._storage = Storage(self._db_path)
+                storage_created = True
+                self._storage_initialized = True  # Task 3: фиксируем успех
+                self._log.debug("Poller Storage created in thread (db=%s)", self._db_path)
+                break
+            except Exception as e:
+                if attempt < _STORAGE_RETRIES - 1:
+                    pause = _STORAGE_BACKOFF[attempt] if attempt < len(_STORAGE_BACKOFF) else _STORAGE_BACKOFF[-1]
+                    self._log.warning(
+                        "Poller Storage создать не удалось (попытка %d/%d): %s — "
+                        "повтор через %.1f с",
+                        attempt + 1, _STORAGE_RETRIES, e, pause,
+                    )
+                    # уважаем shutdown_event в паузе
+                    self._sleep_backoff(pause)
+                else:
+                    self._log.error(
+                        "Poller Storage создать не удалось после %d попыток: %s",
+                        _STORAGE_RETRIES, e,
+                    )
+                    return  # не можем работать без storage
 
         # m2: Storage.close() в finally — гарантированно в poller thread.
         try:
@@ -637,12 +660,13 @@ class TelegramPoller:
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _sleep_backoff(self, seconds: float) -> None:
-        """Спит seconds с проверкой stop_event."""
-        step = 1.0
-        slept = 0.0
-        while slept < seconds and not self._stop_event.is_set():
-            time.sleep(min(step, seconds - slept))
-            slept += step
+        """Спит seconds с проверкой stop_event.
+
+        Использует Event.wait(timeout), который возвращается сразу при set()
+        из другого потока (правильный interrupt). БЕЗ этого: цикл while +
+        time.sleep() блокируется на полное время — stop не уважается.
+        """
+        self._stop_event.wait(timeout=seconds)
 
     def close(self, join_timeout: Optional[float] = None) -> None:
         """

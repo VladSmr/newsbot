@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -194,7 +195,7 @@ class TestStorageLLM:
                 {"url": "https://e.com/b2", "score": 3, "summary": "S2", "reason": "R2"},
             ]
             n = s.update_llm_results_batch(records)
-            assert n == 3
+            assert len(n) == 3  # List[str]: 3 URL'а
 
             items = s.get_all_by_state("new")
             items_map = {i.url: i for i in items}
@@ -464,6 +465,144 @@ class TestPipelineLLMRouting:
         p, cleanup = self._run_pipeline(items, fake_filter=None, mock_delivery=mock_del)
 
         assert len(mock_del.sent) == 2
+        cleanup()
+
+    def test_partial_update_batch_sets_state_only_for_successful_urls(self):
+        """
+        Задача 2: при частичном failure в update_llm_results_batch
+        (pipeline.py:1681-1697) set_state('skipped'/'deferred') вызывается
+        ТОЛЬКО для реально обновлённых URL.
+
+        Сценарий: 5 items — push(8), deferred-ok(6), deferred-fail(6),
+        skipped-ok(3), skipped-fail(3). Настоящий storage.update_llm_results_batch
+        вызывается через реальный код, но UPDATE для двух «fail»-url бросает
+        OperationalError (прокси над sqlite-соединением). Метод возвращает
+        только успешные url.
+
+        Ожидание:
+          — push → delivered;
+          — deferred-ok → deferred, deferred-fail остаётся pending;
+          — skipped-ok → skipped, skipped-fail остаётся pending;
+          — у провалившихся llm_score остаётся NULL (UPDATE откатился).
+
+        Фикс (pipeline.py:1688-1697): updated_urls — множество реально
+        обновлённых URL; set_state вызывается через & с skipped_urls /
+        deferred_urls. БЕЗ фикса: set_state вызывается для всех URL
+        (skipped_urls / deferred_urls целиком) → провалившиеся items
+        получают state='skipped'/'deferred' без записи llm_score.
+        """
+        items = [
+            make_item(url="https://x.com/push", title="Push", summary="S"),
+            make_item(url="https://x.com/digok", title="DigOk", summary="S"),
+            make_item(url="https://x.com/digfail", title="DigFail", summary="S"),
+            make_item(url="https://x.com/skipok", title="SkipOk", summary="S"),
+            make_item(url="https://x.com/skipfail", title="SkipFail", summary="S"),
+        ]
+        score_map = {
+            "x.com/push": 8,      # push
+            "x.com/digok": 6,     # deferred, UPDATE успешен
+            "x.com/digfail": 6,   # deferred, UPDATE падает
+            "x.com/skipok": 3,    # skipped, UPDATE успешен
+            "x.com/skipfail": 3,  # skipped, UPDATE падает
+        }
+        failing_urls = {"https://x.com/digfail", "https://x.com/skipfail"}
+        mock_del = MockDelivery()
+        fake = FakeLLMFilter(score_map)
+
+        cfg = self._make_config(llm_enabled=True, api_key="fake-key")
+        path, cleanup = fresh_db()
+        cfg["database"]["path"] = path
+
+        p = NewsPipeline.__new__(NewsPipeline)
+        p.config = cfg
+        p.sources = []
+        p.storage = Storage(path)
+        p.delivery = mock_del
+        p.llm_filter = fake
+        p._max_per_cycle = 150
+        p._llm_calls_left = 150
+        p._feedback_context = None
+
+        for item in items:
+            if not getattr(item, "cluster_key", None):
+                item.cluster_key = build_cluster_key(
+                    location="",
+                    stem=None,
+                    published=item.published,
+                    title=item.title,
+                )
+            p.storage.save(item)
+
+        # Прокси над реальным соединением: UPDATE для failing_urls падает,
+        # остальные UPDATE идут в БД. update_llm_results_batch — настоящий.
+        attempted_updates: list = []
+
+        class _FlakyConn:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, params=None):
+                if "UPDATE items SET" in sql:
+                    url = params[-1] if params else None
+                    attempted_updates.append(url)
+                    if url in failing_urls:
+                        raise sqlite3.OperationalError("database is locked")
+                if params is None:
+                    return self._real.execute(sql)
+                return self._real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        @contextmanager
+        def fake_tx():
+            real = p.storage._connect()
+            proxy = _FlakyConn(real)
+            real.execute("BEGIN")
+            try:
+                yield proxy
+                real.commit()
+            except Exception:
+                try:
+                    real.execute("ROLLBACK")
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+
+        with mock.patch.object(p.storage, "_tx", side_effect=fake_tx):
+            p._process_batch(items)
+
+        # Все 5 записей были попытаны (провалы не прервали батч).
+        assert set(attempted_updates) == {i.url for i in items}, (
+            f"UPDATE attempts: {attempted_updates}"
+        )
+
+        delivered = {i.url for i in p.storage.get_all_by_state("delivered")}
+        deferred = {i.url for i in p.storage.get_all_by_state("deferred")}
+        skipped = {i.url for i in p.storage.get_all_by_state("skipped")}
+        pending = {i.url for i in p.storage.get_all_by_state("pending")}
+
+        assert delivered == {"https://x.com/push"}
+        assert deferred == {"https://x.com/digok"}, (
+            f"deferred-fail не должен получить state=deferred: {deferred}"
+        )
+        assert skipped == {"https://x.com/skipok"}, (
+            f"skipped-fail не должен получить state=skipped: {skipped}"
+        )
+        assert pending == {"https://x.com/digfail", "https://x.com/skipfail"}, (
+            f"провалившиеся UPDATE должны остаться pending: {pending}"
+        )
+
+        # У провалившихся llm_score не записан (UPDATE откатился).
+        for url in failing_urls:
+            row = p.storage._connect().execute(
+                "SELECT llm_score FROM items WHERE url = ?", (url,)
+            ).fetchone()
+            assert row is not None and row["llm_score"] is None, (
+                f"{url}: llm_score должен остаться NULL, got {row['llm_score']}"
+            )
+
+        p.storage.close()
         cleanup()
 
     def test_mixed_routes(self):
@@ -1081,7 +1220,7 @@ class TestV10PostCheck:
             "url": "https://v10post.com/1",
             "score": 9, "summary": "Test", "reason": "ok", "urgent": True,
         }])
-        assert n == 1
+        assert len(n) == 1
         items = s.get_all_by_state("new")
         assert items[0].llm_urgent is True
         s.close()
@@ -1343,7 +1482,7 @@ class TestStorageUrgent:
                 {"url": "https://u.com/3", "score": 5, "summary": "S3", "reason": "R3", "urgent": True},
             ]
             n = s.update_llm_results_batch(records)
-            assert n == 4
+            assert len(n) == 4  # List[str]: 4 URL'а
 
             # Читаем обратно
             items = {i.url: i for i in s.get_all_by_state("new")}
@@ -1423,7 +1562,7 @@ class TestStorageUrgent:
             "reason": "test",
             "urgent": True,
         }])
-        assert n == 1
+        assert len(n) == 1
 
         items = s.get_all_by_state("new")
         assert len(items) == 1
