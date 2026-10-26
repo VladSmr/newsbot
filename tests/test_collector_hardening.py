@@ -16,7 +16,9 @@ from newsbot.collector import (
     CONNECT_TIMEOUT_CAP,
     FEED_DEADLINE_SEC,
     FeedCollector,
+    MAX_PUBLISHED_CHARS,
     MAX_REDIRECTS,
+    MAX_URL_CHARS,
     MIN_PHASE_TIMEOUT,
     _strip_html,
 )
@@ -647,3 +649,121 @@ class TestTitleCap:
         _, result = next(collector.collect())
         assert len(result.items) == 1
         assert len(result.items[0].title) == MAX_TITLE_CHARS
+
+
+class TestPublishedCap:
+    """published и url капится в collector — защита БД и LLM-контекста."""
+
+    def test_huge_pubdate_capped(self, collector_factory):
+        """Гигантский <pubDate> обрезается до MAX_PUBLISHED_CHARS."""
+        rss = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<rss version="2.0"><channel><title>t</title>'
+            b'<item><title>Item</title>'
+            b'<link>http://x.example/1</link>'
+            b'<pubDate>' + b'X' * 100_000 + b'</pubDate>'
+            b'</item></channel></rss>'
+        )
+        collector = collector_factory(
+            [{"name": "big", "url": "http://big.example/feed"}],
+            lambda method, url, **kwargs: _FakeStream(_FakeResponse([rss])),
+        )
+        _, result = next(collector.collect())
+        assert len(result.items) == 1
+        assert len(result.items[0].published) == MAX_PUBLISHED_CHARS
+
+    def test_normal_pubdate_preserved(self, collector_factory):
+        """Обычный <pubDate> не портится обрезкой."""
+        rss = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<rss version="2.0"><channel><title>t</title>'
+            b'<item><title>Item</title>'
+            b'<link>http://x.example/1</link>'
+            b'<pubDate>Mon, 01 Jan 2024 12:00:00 GMT</pubDate>'
+            b'</item></channel></rss>'
+        )
+        collector = collector_factory(
+            [{"name": "normal", "url": "http://normal.example/feed"}],
+            lambda method, url, **kwargs: _FakeStream(_FakeResponse([rss])),
+        )
+        _, result = next(collector.collect())
+        assert len(result.items) == 1
+        # feedparser парсит RFC 822 → формат "01.01.2024 12:00 UTC"
+        assert "2024" in result.items[0].published
+        assert len(result.items[0].published) < MAX_PUBLISHED_CHARS
+
+    def test_fallback_raw_published_capped(self, collector_factory):
+        """
+        Fallback на сырую строку <published> (когда нет published_parsed)
+        тоже капится — иначе враждебный фид забивает БД мегабайтами.
+        """
+        # Без pubDate-парсинга feedparser создаст published_parsed из строки
+        # только в формате RFC 822; не-RFC-822 строка → published_parsed=None
+        # → срабатывает fallback на str(raw) в _format_pubdate.
+        # Используем updated вместо published — published может парситься.
+        rss = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<rss version="2.0"><channel><title>t</title>'
+            b'<item><title>Item</title>'
+            b'<link>http://x.example/1</link>'
+            b'<updated>' + b'Y' * 10_000 + b'</updated>'
+            b'</item></channel></rss>'
+        )
+        collector = collector_factory(
+            [{"name": "raw", "url": "http://raw.example/feed"}],
+            lambda method, url, **kwargs: _FakeStream(_FakeResponse([rss])),
+        )
+        _, result = next(collector.collect())
+        assert len(result.items) == 1
+        assert len(result.items[0].published) == MAX_PUBLISHED_CHARS
+
+
+class TestUrlCap:
+    """
+    m-3: entry с link_normalized длиннее MAX_URL_CHARS отбрасывается
+    (warning + continue), а не обрезается — обрезка давала мёртвую ссылку
+    и коллизии UNIQUE-индекса.
+    """
+
+    def test_huge_link_rejected(self, collector_factory, caplog):
+        """
+        Гигантский <link> → entry отбрасывается (items пуст),
+        логируется warning с усечённым URL.
+        """
+        import logging
+        rss = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<rss version="2.0"><channel><title>t</title>'
+            b'<item><title>Item</title>'
+            b'<link>http://x.example/' + b'a' * 100_000 + b'</link>'
+            b'</item></channel></rss>'
+        )
+        collector = collector_factory(
+            [{"name": "big", "url": "http://big.example/feed"}],
+            lambda method, url, **kwargs: _FakeStream(_FakeResponse([rss])),
+        )
+        caplog.set_level(logging.WARNING, logger="newsbot.collector")
+        _, result = next(collector.collect())
+        assert len(result.items) == 0, (
+            "entry с link длиннее MAX_URL_CHARS должен отбрасываться"
+        )
+        assert "пропущен entry с link длиннее" in caplog.text
+        assert str(MAX_URL_CHARS) in caplog.text
+
+    def test_normal_url_preserved(self, collector_factory):
+        """Обычный URL не отбрасывается и не портится."""
+        rss = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b'<rss version="2.0"><channel><title>t</title>'
+            b'<item><title>Item</title>'
+            b'<link>http://normal.example/article/123</link>'
+            b'</item></channel></rss>'
+        )
+        collector = collector_factory(
+            [{"name": "normal", "url": "http://normal.example/feed"}],
+            lambda method, url, **kwargs: _FakeStream(_FakeResponse([rss])),
+        )
+        _, result = next(collector.collect())
+        assert len(result.items) == 1
+        assert "normal.example/article/123" in result.items[0].url
+        assert len(result.items[0].url) < MAX_URL_CHARS

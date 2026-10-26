@@ -879,11 +879,12 @@ class TestDigestKeyboard:
             result = td.send_digest("Digest", [{"url": "https://ex.com/1", "target_id": 1}])
         assert result is False
 
-    def test_send_digest_returns_false_without_chat_id(self):
-        """send_digest возвращает False если chat_id пуст."""
+    def test_send_digest_raises_without_chat_id(self):
+        """send_digest поднимает ChatIdNotBoundError если chat_id пуст."""
         td = TelegramDelivery(token="test_token", chat_id="")
-        result = td.send_digest("Digest", [{"url": "https://ex.com/1", "target_id": 1}])
-        assert result is False
+        from newsbot.delivery.telegram import ChatIdNotBoundError
+        with pytest.raises(ChatIdNotBoundError):
+            td.send_digest("Digest", [{"url": "https://ex.com/1", "target_id": 1}])
 
     def test_send_digest_url_field_ignored(self):
         """Поле 'url' в item_buttons игнорируется (URL уже в тексте дайджеста).

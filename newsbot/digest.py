@@ -26,7 +26,10 @@ from .delivery import Delivery, format_time_utc
 # от Telegram 400 «message is too long» → items остается deferred →
 # детерминированный повтор каждое окно. Берём общий helper из telegram.py —
 # единственный источник истины для лимита (не дублируем формулу).
-from .delivery.telegram import _utf16_units, is_valid_http_url, _strip_control_chars
+from .delivery.telegram import (
+    _utf16_units, is_valid_http_url, _strip_control_chars,
+    PermanentDeliveryError,
+)
 
 # Тип для кнопок одной новости в дайджесте
 DigestItemButtons = List[dict]  # [{url, target_id}, ...]
@@ -509,27 +512,43 @@ def _send_digest_with_targets(
     delivery: Delivery,
     groups: List[Tuple[str, List[NewsItem]]],
     item_buttons_per_msg: List[List[dict]],
-) -> Tuple[int, List[str], List[Tuple[str, List[NewsItem]]]]:
+) -> Tuple[int, List[str], List[Tuple[str, List[NewsItem]]], List[str]]:
     """
     Отправляет группы дайджеста через delivery.send_digest.
-    Возвращает (sent_count, sent_urls, sent_groups).
 
-    sent_groups — группы которые реально отправлены
-    (нужно pipeline для логирования / отладки).
+    Returns:
+        Tuple[sent_count, sent_urls, sent_groups, permanent_failed_urls]
+        sent_count: int — число отправленных items
+        sent_urls: List[str] — их URLs
+        sent_groups: List[Tuple[str, List[NewsItem]]] — отправленные группы
+        permanent_failed_urls: List[str] — urls items с PermanentDeliveryError
+                                 (pipeline помечает их → state='failed')
 
     При частичном сбое — отправленные → digested, остаток → deferred
-    (at-least-once: retry в следующем окне).
+    (at-least-once: retry в следующем окне). PermanentDeliveryError
+    (content-level 400 / 413 / 422) выделяется отдельно и НЕ блокирует
+    отправку остальных сообщений батча.
 
     M1-фикс: try/except — ВНУТРИ цикла по сообщениям (как в send_text-ветке).
     Исключение на одном сообщении НЕ обрывает отправку остальных:
     ошибка логируется warning'ом с номером/URL, цикл продолжается.
 
-    N1: send_digest от delivery — возвращает bool (succ/fail).
+    M3-фикс: PermanentDeliveryError от send_digest отлавливается отдельно,
+    urls его items добавляются в permanent_failed_urls → pipeline →
+    set_state('failed'). Транзиентный сбой → items остаются deferred.
+
+    N1: send_digest от delivery — возвращает bool (succ/fail),
+        поднимает PermanentDeliveryError при content-level ошибке.
     N3: лимит 4096 проверен на уровне build_digest_messages;
         консервативно: если текст всё равно >4096 — логируем warning.
     """
+    # M3: импортируем здесь чтобы избежать circular import и ValueError
+    # при запуске тестов напрямую (digest.py импортируется как top-level).
+    from newsbot.delivery.telegram import PermanentDeliveryError
+
     sent_urls: List[str] = []
     sent_groups: List[Tuple[str, List[NewsItem]]] = []
+    permanent_failed_urls: List[str] = []
 
     # Minor-фикс: zip молча обрезает хвост при рассинхроне длин.
     # Логируем рассинхрон и дополняем пустыми кнопками, чтобы
@@ -568,8 +587,20 @@ def _send_digest_with_targets(
 
         # M1-фикс: try/except ВНУТРИ цикла — падение одного сообщения
         # не отменяет отправку остальных.
+        # M3-фикс: PermanentDeliveryError отлавливается отдельно.
         try:
             ok = delivery.send_digest(msg, item_buttons)
+        except PermanentDeliveryError as e:
+            # M3-фикс: content-level ошибка — этот message доставлен НЕ будет.
+            # Его urls → permanent_failed_urls → state='failed'.
+            msg_urls = [item.url for item in group_items]
+            permanent_failed_urls.extend(msg_urls)
+            logger.warning(
+                "Дайджест msg[%d/%d]: PermanentDeliveryError (%s) — "
+                "%d items → failed, остальные сообщения отправляются",
+                i, n_groups, e, len(group_items),
+            )
+            continue
         except Exception as e:
             logger.warning(
                 "Дайджест msg[%d/%d]: исключение при отправке (%s): %s — "
@@ -600,9 +631,9 @@ def _send_digest_with_targets(
 
     if not sent_urls:
         logger.info("Дайджест: ни одно сообщение не доставлено.")
-        return 0, [], []
+        return 0, [], [], permanent_failed_urls
 
-    return len(sent_urls), sent_urls, sent_groups
+    return len(sent_urls), sent_urls, sent_groups, permanent_failed_urls
 
 
 # =============================================================================
@@ -617,7 +648,7 @@ def run_digest(
     item_buttons_per_msg: List[List[dict]] = None,
     groups: List[Tuple[str, List[NewsItem]]] = None,
     failed_urls_in: List[str] = None,
-) -> Tuple[int, List[str], List[str]]:
+) -> Tuple[int, List[str], List[str], List[str]]:
     """
     Выполняет дайджест: собирает deferred → формирует сообщения →
     отправляет → помечает digested.
@@ -628,9 +659,10 @@ def run_digest(
     m2-фикс: если groups передан — использует их напрямую (единый источник
     с pipeline, без пересчёта). Иначе — строит сам (обратная совместимость).
 
-    MAJOR 2-фикс: run_digest возвращает 3-tuple, включая all_failed_urls —
-    urls items, исключённых из отправки (per-item исключение при рендеринге
-    ИЛИ при создании feedback-target). Pipeline помечает их 'failed'.
+    M3-фикс: run_digest возвращает 4-tuple, включая all_failed_urls —
+    urls items, исключённых из отправки (рендеринг + feedback-target
+    + permanent delivery). Pipeline помечает их 'failed'.
+    permanent_failed_urls выделен отдельно для отладки/мониторинга.
 
     Args:
         storage: экземпляр Storage
@@ -647,12 +679,17 @@ def run_digest(
                         (битый feedback-target). Объединяется с build_failed_urls.
 
     Returns:
-        Tuple[int, List[str], List[str]]: (sent_count, sent_urls, all_failed_urls)
+        Tuple[int, List[str], List[str], List[str]]:
+            (sent_count, sent_urls, all_failed_urls, permanent_failed_urls)
+
             sent_count: число отправленных items (помечены digested).
             sent_urls: их URLs.
             all_failed_urls: urls всех items, исключённых из отправки
-                             (рендеринг + feedback-target + build_failed).
+                             (рендеринг + feedback-target + permanent delivery).
                              Pipeline помечает их 'failed'.
+            permanent_failed_urls: urls items с PermanentDeliveryError
+                                   (content-level 400/413/422).
+                                   pipeline помечает их 'failed'.
     """
     # m2: groups может быть передан из pipeline (единый источник).
     # При отсутствии — строим сами (old calls, тесты).
@@ -661,7 +698,8 @@ def run_digest(
         if not items:
             logger.info("Дайджест: нет отложенных новостей.")
             all_failed = list(failed_urls_in) if failed_urls_in else []
-            return 0, [], all_failed
+            # M3-фикс: always 4-tuple
+            return 0, [], all_failed, []
         logger.info("Дайджест: собрано %d отложенных новостей (лимит %d)",
                     len(items), max_items)
         groups, all_included, build_failed_urls = build_digest_messages(
@@ -672,7 +710,9 @@ def run_digest(
         all_included = [item for _, grp in groups for item in grp]
         build_failed_urls = []
 
-    # Собираем все failed_urls: build_failed (рендеринг) + failed_urls_in (feedback)
+    # Собираем all_failed_urls из build_failed + failed_urls_in.
+    # permanent_failed_urls (from send_digest) добавляется ниже,
+    # после вызова _send_digest_with_targets — там где он определён.
     all_failed_urls: List[str] = list(build_failed_urls)
     if failed_urls_in:
         for url in failed_urls_in:
@@ -681,17 +721,25 @@ def run_digest(
 
     if not groups:
         logger.info("Дайджест: нет сообщений для отправки.")
-        return 0, [], all_failed_urls
+        # M3-фикс: always 4-tuple, permanent_failed_urls starts empty here
+        return 0, [], all_failed_urls, []
 
+    # M3: permanent_failed_urls initialised here (from _send_digest_with_targets below)
     logger.info("Дайджест: %d сообщений, %d items", len(groups), len(all_included))
 
     # N1/N3: используем send_digest если кнопки переданы, иначе — send_text
     sent_urls: List[str] = []
+    permanent_failed_urls: List[str] = []   # M3: определён во всех ветках до return
     if item_buttons_per_msg is not None:
-        # send_digest: возвращает 3 значения, берём только 2
-        sent_count, sent_urls, _ = _send_digest_with_targets(
+        # M3-фикс: _send_digest_with_targets возвращает 4-tuple
+        # (sent_count, sent_urls, sent_groups, permanent_failed_urls)
+        sent_count, sent_urls, _, permanent_failed_urls = _send_digest_with_targets(
             delivery, groups, item_buttons_per_msg
         )
+        # M3: объединяем permanent_failed с build_failed/feedback_failed
+        for url in permanent_failed_urls:
+            if url not in all_failed_urls:
+                all_failed_urls.append(url)
     else:
         # Обратная совместимость: send_text (old pipeline / test calls).
         # MAJOR 2-фикс: per-message try/except — исключение на одном сообщении
@@ -707,10 +755,23 @@ def run_digest(
                 )
             try:
                 ok = delivery.send_text(msg)
+            except PermanentDeliveryError as e:
+                # M3-фикс: content-level 400 в send_text-ветке (feedback off).
+                # url этого сообщения → all_failed_urls → pipeline → state='failed'.
+                failed_urls_here = [item.url for item in group_items]
+                for url in failed_urls_here:
+                    if url not in all_failed_urls:
+                        all_failed_urls.append(url)
+                logger.warning(
+                    "Дайджест msg[%d]: PermanentDeliveryError (%s) — "
+                    "%d items → failed, остальные отправляются",
+                    i, e, len(group_items),
+                )
+                continue
             except Exception as e:
                 logger.warning(
                     "Дайджест msg[%d]: исключение при отправке: %s — "
-                    "%d items исключены, остальные отправляются",
+                    "%d items остаются deferred, остальные отправляются",
                     i, e, len(group_items),
                 )
                 continue
@@ -727,7 +788,8 @@ def run_digest(
         sent_count = len(sent_urls)
 
     if not sent_urls:
-        return 0, [], all_failed_urls
+        # M3-фикс: всегда 4-tuple (backwards-compatible — вызывающие unpack 3)
+        return 0, [], all_failed_urls, permanent_failed_urls
 
     try:
         marked = storage.set_digested(sent_urls)
@@ -737,4 +799,4 @@ def run_digest(
         # Данные отправлены, но не помечены → допустимый at-least-once.
         # Следующий дайджест может продублировать, но не потерять.
 
-    return sent_count, sent_urls, all_failed_urls
+    return sent_count, sent_urls, all_failed_urls, permanent_failed_urls

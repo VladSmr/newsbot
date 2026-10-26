@@ -209,10 +209,11 @@ class FeedCollector:
         Админ-контролируемые фиды — риск низкий, но консервативный
         фикс не даёт случайным фидам открыть file:// / ftp:// и т.п.
 
-        ⚠️  Остаточный риск: follow_redirects=True разрешает редиректы,
-            валидный http(s) фид может ответить 30x → private IP / loopback.
-            Фиды админ-контролируемые, риск минимальный. При необходимости
-            отключить редиректы: httpx.Client(follow_redirects=False).
+        ⚠️  Принято как осознанный риск (ADR): список фидов в config.yaml —
+            граница доверия. Приватные/loopback-адреса фидов и редиректы в
+            приватные сети сознательно разрешены; проверяется только схема
+            http/https. При необходимости отключить редиректы:
+            httpx.Client(follow_redirects=False).
         """
         try:
             from urllib.parse import urlparse
@@ -514,6 +515,15 @@ class FeedCollector:
             # в БД и используется при дедупликации (is_duplicate + UNIQUE index).
             link_normalized = normalize_url(resolved_link)
 
+            # m-3: слишком длинный нормализованный URL отбрасывается —
+            # обрезка давала бы мёртвую ссылку и коллизии UNIQUE-индекса.
+            if len(link_normalized) > MAX_URL_CHARS:
+                logger.warning(
+                    "[%s] пропущен entry с link длиннее %d симв.: %s  (feed: %s)",
+                    name, MAX_URL_CHARS, link_normalized[:200], url,
+                )
+                continue
+
             # P2-фикс: ошибка конвертации ОДНОГО entry (кривой _strip_html,
             # не-str term в tags, битый title в extract_location) не должна
             # вылетать из генератора collect() и убивать остальные фиды цикла.
@@ -547,6 +557,18 @@ MAX_SUMMARY = 6000
 # storage.MAX_TITLE_CHARS — держать значения синхронными.
 MAX_TITLE_CHARS = 500
 
+# Максимальная длина url: защита БД/UNIQUE-индекса и LLM-контекста от
+# гигантского <link>. Entry с link_normalized длиннее лимита отбрасывается
+# (warning + continue, как невалидная ссылка) — обрезка давала бы мёртвую
+# ссылку и коллизии UNIQUE-индекса.
+MAX_URL_CHARS = 2048
+
+# Максимальная длина published (строковое представление): валидные форматы
+# дат RSS/Atom занимают ≤ 32 символов ("Mon, 01 Jan 2024 12:00:00 GMT" и т.п.).
+# Лимит 64 — с запасом для нестандартных форматов; fallback на сырую строку
+# из <published>/<updated> капится здесь, а не в LLM/БД.
+MAX_PUBLISHED_CHARS = 64
+
 
 def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Optional[NewsItem]:
     """
@@ -579,6 +601,9 @@ def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Opt
     summary = _strip_html(summary_raw)
 
     published_str = _format_pubdate(entry)
+    # капируем published — строковый fallback может быть гигантским;
+    # url проверяется на длину в _fetch_feed до вызова сюда
+    published_str = published_str[:MAX_PUBLISHED_CHARS]
     pub_parsed = _parse_pubdate_utc(entry)
 
     # Читаем <category> теги из фида
@@ -702,9 +727,10 @@ def _format_pubdate(entry) -> str:
         except Exception:
             pass
 
-    # фоллбэк на сырую строку
+    # фоллбэк на сырую строку (капится — враждебный фид может прислать
+    # мегабайты мусора в <published>/<updated>)
     for attr in ("published", "updated"):
         raw = getattr(entry, attr, None)
         if raw:
-            return str(raw)
+            return str(raw)[:MAX_PUBLISHED_CHARS]
     return "—"

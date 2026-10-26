@@ -1044,6 +1044,15 @@ class NewsPipeline:
         llm_filter = getattr(self, "llm_filter", None)
         if llm_filter is None:
             return set()
+        # MAJOR-фикс (Major #2): Cost-инвариант — в пик DeepSeek LLM не вызываем.
+        # Паттерн идентичен _cluster_deferred_duplicates (pipeline.py:1133-1138).
+        # Покрывает оба пути: запланированный дайджест и /digest из чата.
+        off_peak_only = getattr(self, "_off_peak_only", False)
+        if off_peak_only and not is_llm_allowed_now(off_peak_only):
+            logger.info(
+                "Дайджест: RECENT-дедуп пула пропущен (пик DeepSeek, off_peak_only)",
+            )
+            return set()
         # MAJOR-фикс (4c): один батчевый вызов на весь пул (backfill, skipped).
         # detect_duplicates снят len<2 guard при непустом RECENT.
         try:
@@ -2724,7 +2733,11 @@ class NewsPipeline:
 
         # ── Отправляем через digest (с готовыми groups + buttons) ──
         try:
-            sent_count, sent_urls, digest_failed_urls = _run_digest(
+            # M3-фикс: run_digest возвращает 4-tuple
+            # (sent_count, sent_urls, digest_failed_urls, _permanent_urls).
+            # _permanent_urls НЕ нужны здесь — digest.run_digest уже объединил
+            # их с failed_urls_in в digest_failed_urls.
+            sent_count, sent_urls, digest_failed_urls, _ = _run_digest(
                 storage=self.storage,
                 delivery=self.delivery,
                 groups=groups,
@@ -2771,8 +2784,8 @@ class NewsPipeline:
             try:
                 marked = self.storage.set_state(digest_failed_urls, "failed")
                 logger.info(
-                    "digest: %d/%d items → 'failed' (per-item исключение: "
-                    "рендеринг +/ feedback-target)",
+                    "digest: %d/%d items → 'failed' (рендеринг / "
+                    "feedback-target / permanent delivery)",
                     marked, len(digest_failed_urls),
                 )
             except Exception as e:

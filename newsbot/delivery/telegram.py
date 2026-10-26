@@ -124,6 +124,98 @@ _HTTP_TOO_MANY_REQUESTS = 429
 # 5xx — транзиентные, ретраим наравне с сетевыми
 _RETRYABLE_SERVER_ERRORS = range(500, 600)
 
+# ── Классификация 400: transport-level vs content-level ─────────────────────
+#
+# Transport-level 400 — проблема с chat_id (бот не в чате, опечатка, удалён и
+# т.п.). Признаки: description содержит ключевые слова. Эти ошибки НЕ означают,
+# что контент битый — повтор с тем же text в другой чат сработал бы.
+# → ChatIdNotBoundError (items остаются pending).
+#
+# Content-level 400 — контент отвергается Telegram API (bad entities, too long,
+# invalid button URL и т.п.). Повтор с тем же текстом ВСЕГДА провалится.
+# → PermanentDeliveryError (items → failed, без retry).
+#
+# Незнакомые 400 — консервативно: считаем транспортной ошибкой (транзиентная,
+# items остаются pending), т.к. permanent = безвозвратная потеря новости.
+_TRANSPORT_400_PATTERNS: frozenset = frozenset({
+    # chat_id / peer не существует или бот не имеет к нему доступа
+    "chat not found",
+    "chat_not_found",
+    "peer id invalid",
+    "peer_id_invalid",
+    "user not found",
+    "user_not_found",
+    "chat_id invalid",
+    "chat_id_invalid",
+    "chat_is_invalid",
+    # бот исключён из чата / группы / канала
+    "bot was kicked",
+    "bot was blocked",
+    "bot is not a member",
+    "bot can't init conversation",
+    "bot was removed from",
+    "user is deactivated",
+    "user is blocked",
+    # empty / malformed chat_id
+    "chat_id is empty",
+    "chat_id is required",
+    "field chat_id must be an integer or string",
+    # chat write / admin rights
+    "not enough rights",
+    "chat_write_forbidden",
+    "chat_admin_required",
+    "have no rights to send",
+    # thread / message errors
+    "message thread not found",
+    # group/private различие
+    "chat type is private",
+    "group chat was migrated to a supergroup",
+    "migrate to supergroup id",
+    "supergroup id must be an integer",
+})
+
+# Content-level 400: конкретные паттерны, которые ВСЕГДА означают
+# проблему с контентом, а не с chat_id. Повтор с тем же текстом
+# всегда провалится. Только ЭТИ паттерны вызывают PermanentDeliveryError.
+# Незнакомые 400 → TelegramDeliveryError (transient, консервативно).
+_CONTENT_400_PATTERNS: frozenset = frozenset({
+    "can't parse entities",
+    "can not parse entities",   # вариант формулировки
+    "message is too long",
+    "message_too_long",
+    "button url invalid",
+    "button_url_invalid",
+})
+
+
+def _is_transport_400(description: str) -> bool:
+    """
+    True если 400 вызван проблемой с chat_id, а не с содержимым сообщения.
+
+    description — значение поля ``description`` из ответа Telegram API
+    (может содержать префикс "Bad Request: " — отрезается перед поиском).
+    """
+    # "Bad Request: chat not found" → "chat not found"
+    desc = description.lower()
+    for prefix in ("bad request: ", "bad request", "error: "):
+        if desc.startswith(prefix):
+            desc = desc[len(prefix):]
+            break
+    return any(p in desc for p in _TRANSPORT_400_PATTERNS)
+
+
+def _is_content_400(description: str) -> bool:
+    """
+    True если 400 вызван проблемой с содержимым сообщения, а не с chat_id.
+    Только ЯВНЫЕ content-level паттерны ведут к PermanentDeliveryError.
+    """
+    desc = description.lower()
+    for prefix in ("bad request: ", "bad request", "error: "):
+        if desc.startswith(prefix):
+            desc = desc[len(prefix):]
+            break
+    return any(p in desc for p in _CONTENT_400_PATTERNS)
+
 # ── Исключения ──────────────────────────────────────────────────────────────
 
 class TelegramDeliveryError(Exception):
@@ -344,11 +436,14 @@ class TelegramDelivery:
           — не более max_items_per_message строк (управляется на уровне pipeline)
           — текст ≤ 4096 символов (на уровне build_digest_messages)
 
-        Returns True при успехе, False при ошибке.
+        Returns True при успехе, False при транзиентной ошибке.
+        Raises PermanentDeliveryError при content-level ошибке (напр.
+        400 "can't parse entities", 413 too long, 422). Pipeline помечает url
+        этих items → state='failed'.
         """
         if not self.chat_id:
             logger.warning("send_digest: chat_id не задан")
-            return False
+            raise ChatIdNotBoundError("send_digest: chat_id не задан")
 
         rows = []
         for btn in item_buttons:
@@ -377,7 +472,12 @@ class TelegramDelivery:
         try:
             self._api_call("sendMessage", payload)
             return True
+        except PermanentDeliveryError:
+            # M3-фикс: PermanentDeliveryError поднимается дальше — pipeline
+            # (digest.py → pipeline) помечает url этого сообщения в state='failed'.
+            raise
         except Exception as e:
+            # Транзиентная ошибка → message помечается deferred (retry в сл.окне).
             logger.warning("send_digest: сбой отправки: %s", type(e).__name__)
             return False
 
@@ -400,6 +500,10 @@ class TelegramDelivery:
         try:
             self._api_call("sendMessage", payload)
             return True
+        except PermanentDeliveryError:
+            # M3-фикс: PermanentDeliveryError поднимается дальше —
+            # digest.py send_text-ветка ловит его и кладёт url → all_failed_urls.
+            raise
         except Exception as e:
             # В10: не логируем str(e) — содержит URL с токеном
             logger.warning("send_text: сбой отправки: %s", type(e).__name__)
@@ -840,13 +944,37 @@ class TelegramDelivery:
                     desc = body.get("description", "unknown")
                 except Exception:
                     desc = resp.text[:100] if resp.text else "unknown"
-                # Major #4-фикс: 400/413/422 — permanent (не исправятся при retry).
-                # 429 обрабатывается выше (retry-after). 403 → BotBlockedError.
                 status = resp.status_code
-                if status in (400, 413, 422):
+                # M1-фикс: не все 400 — permanent. Различаем transport-level
+                # (chat_id проблемы → pending) и content-level
+                # (bad entities / too long / invalid button → permanent).
+                if status == 400:
+                    if _is_transport_400(desc):
+                        # Transport-level 400: бот не в чате / удалён / опечатка
+                        # в chat_id. Контент ни при чём — item остаётся pending.
+                        raise ChatIdNotBoundError(
+                            f"HTTP 400 (transport): {desc}"
+                        )
+                    if _is_content_400(desc):
+                        # Content-level 400: контент отвергается Telegram API.
+                        # Повтор с тем же текстом всегда провалится → permanent.
+                        raise PermanentDeliveryError(
+                            f"HTTP 400 (content): {desc}"
+                        )
+                    # m1-фикс: НЕЗНАКОМЫЕ 400 — консервативно transient
+                    # (TelegramDeliveryError, НЕ PermanentDeliveryError).
+                    # permanent = безвозвратная потеря новости; при незнакомой
+                    # ошибке считаем её транспортной и оставляем item pending.
+                    raise TelegramDeliveryError(
+                        f"HTTP 400 (unknown): {desc}"
+                    )
+                # Major #4-фикс: 413/422 — permanent (не исправятся при retry).
+                if status in (413, 422):
                     raise PermanentDeliveryError(
                         f"HTTP {status}: {desc}"
                     )
+                # Прочие 4xx (401, 402, 404, 407 …) — транзиентная ошибка,
+                # item остаётся pending (консервативно: не PermanentDeliveryError).
                 raise TelegramDeliveryError(
                     f"HTTP {status}: {desc}"
                 )

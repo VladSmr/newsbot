@@ -281,7 +281,7 @@ def test_run_digest_marks_digested_on_success():
         delivery = MagicMock()
         delivery.send_text.return_value = True
 
-        count, urls, _failed = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed, _ex = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 1
         assert urls == ["https://ex.com/d1"]
@@ -308,7 +308,7 @@ def test_run_digest_remains_deferred_on_failure():
         delivery = MagicMock()
         delivery.send_text.return_value = False
 
-        count, urls, _failed = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed, _ex = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 0
         assert urls == []
@@ -334,7 +334,7 @@ def test_run_digest_remains_deferred_on_exception():
         delivery = MagicMock()
         delivery.send_text.side_effect = RuntimeError("network error")
 
-        count, urls, _failed = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed, _ex = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 0
 
@@ -352,7 +352,7 @@ def test_run_digest_empty_no_send():
         storage = Storage(db_path)
         delivery = MagicMock()
 
-        count, urls, _failed = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed, _ex = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=20)
         assert count == 0
         assert urls == []
@@ -381,7 +381,7 @@ def test_run_digest_partial_failure_marks_sent_only():
 
         delivery.send_text.side_effect = fake_send
 
-        count, urls, _failed = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed, _ex = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=2)
         # msg1 (items 0,1) → ok, msg2 (items 2,3) → fail, msg3 (item 4) → skip
         assert count == 2
@@ -410,7 +410,7 @@ def test_run_digest_returns_included_urls():
         delivery = MagicMock()
         delivery.send_text.side_effect = [True, False]  # msg1 ok, msg2 fail
 
-        count, urls, _failed = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed, _ex = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=2)
         assert count == 2
         assert set(urls) == {"https://ex.com/item0", "https://ex.com/item1"}
@@ -437,7 +437,7 @@ def test_run_digest_long_items_still_sent():
         delivery = MagicMock()
         delivery.send_text.return_value = True
 
-        count, urls, _failed = run_digest(storage, delivery, max_items=100,
+        count, urls, _failed, _ex = run_digest(storage, delivery, max_items=100,
                                  max_items_per_message=3)
         assert count == 10
         assert len(urls) == 10
@@ -784,7 +784,7 @@ def test_run_digest_with_buttons_calls_send_digest():
         delivery.send_digest.return_value = True
 
         item_buttons = [[{"url": "https://ex.com/btns", "target_id": 7}]]
-        count, urls, _failed = run_digest(
+        count, urls, _failed, _ex = run_digest(
             storage, delivery, max_items=100, max_items_per_message=20,
             item_buttons_per_msg=item_buttons,
         )
@@ -824,7 +824,7 @@ def test_run_digest_buttons_partial_failure():
             [{"url": f"https://ex.com/b{i}", "target_id": i + 1} for i in range(2)],
             [{"url": f"https://ex.com/b{i}", "target_id": i + 1} for i in range(2, 4)],
         ]
-        count, urls, _failed = run_digest(
+        count, urls, _failed, _ex = run_digest(
             storage, delivery, max_items=100, max_items_per_message=2,
             item_buttons_per_msg=item_buttons,
         )
@@ -938,7 +938,7 @@ def test_run_digest_warns_on_oversized_text(caplog):
         item_buttons = [[{"url": "https://ex.com/over", "target_id": 1}]]
 
         with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-            count, urls, _failed = run_digest(
+            count, urls, _failed, _ex = run_digest(
                 storage, delivery, max_items=100, max_items_per_message=1,
                 item_buttons_per_msg=item_buttons,
             )
@@ -998,7 +998,7 @@ def test_run_digest_pathological_url_no_warning(caplog):
         item_buttons = [[{"url": pathological_url, "target_id": 1}]]
 
         with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-            count, urls, _failed = run_digest(
+            count, urls, _failed, _ex = run_digest(
                 storage, delivery, max_items=100, max_items_per_message=1,
                 item_buttons_per_msg=item_buttons,
             )
@@ -1056,7 +1056,7 @@ def test_run_digest_combined_escape_pathology(caplog):
         item_buttons = [[{"url": path_url, "target_id": 1}]]
 
         with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-            count, urls, _failed = run_digest(
+            count, urls, _failed, _ex = run_digest(
                 storage, delivery, max_items=100, max_items_per_message=1,
                 item_buttons_per_msg=item_buttons,
             )
@@ -1212,7 +1212,7 @@ def test_run_digest_continue_on_partial_failure():
             [{"url": f"https://ex.com/i{i}", "target_id": i + 1} for i in range(2, 4)],
             [{"url": f"https://ex.com/i{i}", "target_id": i + 1} for i in range(4, 6)],
         ]
-        count, urls, _failed = run_digest(
+        count, urls, _failed, _ex = run_digest(
             storage, delivery, max_items=100, max_items_per_message=2,
             item_buttons_per_msg=item_buttons,
         )
@@ -1262,7 +1262,7 @@ def test_run_digest_partial_failure_send_text_continue():
         delivery.send_text.side_effect = fake_send_text
 
         # send_text fallback (item_buttons_per_msg=None)
-        count, urls, _failed = run_digest(
+        count, urls, _failed, _ex = run_digest(
             storage, delivery, max_items=100, max_items_per_message=2,
         )
         # msg1 (0,1) + msg3 (4,5) отправлены = 4 items
@@ -1319,6 +1319,232 @@ def test_pipeline_run_digest_creates_feedback_targets(tmp_path):
         for t in targets:
             assert t["kind"] == "digest"
         pipeline.close()
+
+
+# =============================================================================
+# M3-регресс: digest PermanentDeliveryError → items → failed
+# =============================================================================
+
+def test_run_digest_permanent_failure_marks_failed(tmp_path):
+    """
+    M3: send_digest поднимает PermanentDeliveryError (400 can't parse entities) →
+    urls этого сообщения помещаются в all_failed_urls → pipeline → state='failed'.
+    Остальные сообщения доставлены.
+    """
+    from newsbot.delivery.telegram import PermanentDeliveryError, TelegramDeliveryError
+
+    db_path = tmp_path / "test.db"
+    storage = Storage(str(db_path))
+    for i in range(4):
+        item = _mk_item(title=f"Item{i}", url=f"https://ex.com/m3-{i}", llm_score=6)
+        storage.save(item)
+        storage.set_state([f"https://ex.com/m3-{i}"], "deferred")
+
+    delivery = MagicMock()
+    call_count = [0]
+
+    def fake_send(text, buttons):
+        call_count[0] += 1
+        # msg2 поднимает PermanentDeliveryError
+        if call_count[0] == 2:
+            raise PermanentDeliveryError("HTTP 400 (content): can't parse entities")
+        return True
+
+    delivery.send_digest.side_effect = fake_send
+
+    item_buttons = [
+        [{"url": f"https://ex.com/m3-{i}", "target_id": i + 1} for i in range(2)],
+        [{"url": f"https://ex.com/m3-{i}", "target_id": i + 1} for i in range(2, 4)],
+    ]
+
+    count, sent_urls, all_failed, _ex = run_digest(
+        storage, delivery, max_items=100, max_items_per_message=2,
+        item_buttons_per_msg=item_buttons,
+    )
+
+    # msg1 (0,1) отправлены, msg2 (2,3) → permanent failed
+    assert count == 2, f"expected 2, got {count}"
+    assert set(sent_urls) == {"https://ex.com/m3-0", "https://ex.com/m3-1"}
+    # urls msg2 → all_failed
+    assert set(all_failed) == {"https://ex.com/m3-2", "https://ex.com/m3-3"}, (
+        f"expected m3-2,m3-3 in failed, got {all_failed}"
+    )
+
+    rows_digested = storage.get_all_by_state("digested")
+    assert len(rows_digested) == 2, f"expected 2 digested, got {len(rows_digested)}"
+    rows_failed = storage.get_all_by_state("failed")
+    assert len(rows_failed) == 0, (  # failed ставит pipeline, не digest.run_digest
+        f"digest.run_digest не должен сам ставить failed, got {len(rows_failed)}"
+    )
+    storage.close()
+
+
+def test_run_digest_permanent_failure_continues_sending(tmp_path):
+    """
+    M3: PermanentDeliveryError на msg2 НЕ прерывает отправку msg3.
+    Все незатронутые сообщения доставлены.
+    """
+    from newsbot.delivery.telegram import PermanentDeliveryError, TelegramDeliveryError
+
+    db_path = tmp_path / "test.db"
+    storage = Storage(str(db_path))
+    for i in range(6):
+        item = _mk_item(title=f"Item{i}", url=f"https://ex.com/m3c-{i}", llm_score=6)
+        storage.save(item)
+        storage.set_state([f"https://ex.com/m3c-{i}"], "deferred")
+
+    delivery = MagicMock()
+    call_count = [0]
+
+    def fake_send(text, buttons):
+        call_count[0] += 1
+        if call_count[0] == 2:
+            raise PermanentDeliveryError("HTTP 400 (content): can't parse entities")
+        return True
+
+    delivery.send_digest.side_effect = fake_send
+
+    item_buttons = [
+        [{"url": f"https://ex.com/m3c-{i}", "target_id": i + 1} for i in range(2)],
+        [{"url": f"https://ex.com/m3c-{i}", "target_id": i + 1} for i in range(2, 4)],
+        [{"url": f"https://ex.com/m3c-{i}", "target_id": i + 1} for i in range(4, 6)],
+    ]
+
+    count, sent_urls, all_failed, _ex = run_digest(
+        storage, delivery, max_items=100, max_items_per_message=2,
+        item_buttons_per_msg=item_buttons,
+    )
+
+    # msg1 + msg3 отправлены = 4 items; msg2 → failed
+    assert count == 4
+    assert set(sent_urls) == {
+        "https://ex.com/m3c-0", "https://ex.com/m3c-1",
+        "https://ex.com/m3c-4", "https://ex.com/m3c-5",
+    }
+    assert set(all_failed) == {"https://ex.com/m3c-2", "https://ex.com/m3c-3"}
+
+    rows_digested = storage.get_all_by_state("digested")
+    assert len(rows_digested) == 4
+    storage.close()
+
+
+def test_run_digest_permanent_and_transient_both_handled(tmp_path):
+    """
+    M3: msg1 → transient fail (False), msg2 → PermanentDeliveryError,
+    msg3 → success. Ожидание: msg1 deferred, msg2 failed, msg3 digested.
+    """
+    from newsbot.delivery.telegram import PermanentDeliveryError, TelegramDeliveryError
+
+    db_path = tmp_path / "test.db"
+    storage = Storage(str(db_path))
+    for i in range(6):
+        item = _mk_item(title=f"Item{i}", url=f"https://ex.com/m3b-{i}", llm_score=6)
+        storage.save(item)
+        storage.set_state([f"https://ex.com/m3b-{i}"], "deferred")
+
+    delivery = MagicMock()
+    call_count = [0]
+
+    def fake_send(text, buttons):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return False  # transient fail → deferred
+        if call_count[0] == 2:
+            raise PermanentDeliveryError("HTTP 413: message is too long")
+        return True  # msg3 ok
+
+    delivery.send_digest.side_effect = fake_send
+
+    item_buttons = [
+        [{"url": f"https://ex.com/m3b-{i}", "target_id": i + 1} for i in range(2)],
+        [{"url": f"https://ex.com/m3b-{i}", "target_id": i + 1} for i in range(2, 4)],
+        [{"url": f"https://ex.com/m3b-{i}", "target_id": i + 1} for i in range(4, 6)],
+    ]
+
+    count, sent_urls, all_failed, _ex = run_digest(
+        storage, delivery, max_items=100, max_items_per_message=2,
+        item_buttons_per_msg=item_buttons,
+    )
+
+    # msg1 deferred (not in sent/failed), msg2 failed, msg3 ok
+    assert count == 2  # only msg3 items
+    assert set(sent_urls) == {"https://ex.com/m3b-4", "https://ex.com/m3b-5"}
+    # msg1 items → deferred, msg2 items → all_failed
+    assert set(all_failed) == {"https://ex.com/m3b-2", "https://ex.com/m3b-3"}
+
+    rows_digested = storage.get_all_by_state("digested")
+    assert len(rows_digested) == 2
+    # run_digest не вызывает set_state для deferred/failed — это работа pipeline.
+    # Оставшиеся 4 items (msg1 deferred + msg2 failed из БД) — всё ещё deferred.
+    rows_deferred = storage.get_all_by_state("deferred")
+    assert len(rows_deferred) == 4, f"expected 4 deferred (msg1+msg2), got {len(rows_deferred)}"
+    storage.close()
+
+
+def test_pipeline_run_digest_permanent_failed_set_state(tmp_path):
+    """
+    M3: pipeline.run_digest получает permanent_failed_urls от run_digest
+    и вызывает set_state(urls, 'failed'). Проверяем что items реально
+    получают state='failed' в БД.
+
+    NOTE: нужен feedback.digest_enabled=True (send_digest path),
+    потому что с False → send_text → нет кнопок → PermanentDeliveryError
+    не применим. Также мокаем get_or_create_feedback_target_from_item
+    (иначе pipeline падает при создании feedback-таргетов в БД).
+    """
+    from newsbot.pipeline import NewsPipeline
+    from newsbot.delivery.telegram import PermanentDeliveryError
+    from unittest.mock import patch, MagicMock
+
+    db_path = tmp_path / "test.db"
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "test", "chat_id": "123"},
+        "llm": {"enabled": False},
+        # digest_enabled=True → pipeline вызывает send_digest (кнопки + feedback)
+        "feedback": {"enabled": True, "digest_enabled": True},
+        # max_items_per_message=2: 4 items → 2 groups, чтобы msg1(2items)+msg2(2items)
+        "digest": {"max_items_per_message": 2},
+    }
+
+    pipeline = NewsPipeline(config)
+    storage = pipeline.storage
+
+    for i in range(4):
+        item = _mk_item(title=f"Pipe{i}", url=f"https://ex.com/p{i}", llm_score=5)
+        storage.save(item)
+        storage.set_state([f"https://ex.com/p{i}"], "deferred")
+
+    call_count = [0]
+
+    def fake_send_digest(text, item_buttons):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return True   # msg1 ok
+        if call_count[0] == 2:
+            raise PermanentDeliveryError("HTTP 400 (content): can't parse entities")
+        return True  # msg3+ ok (не должно достигаться при 2 группах)
+
+    # Мокаем: (1) feedback-target creation, (2) send_digest
+    # feedback_target создаётся через self.storage.get_or_create_feedback_target_from_item
+    with patch.object(pipeline.storage, "get_or_create_feedback_target_from_item",
+                      return_value=MagicMock(id=200)):
+        with patch.object(pipeline.delivery, "send_digest",
+                          side_effect=fake_send_digest):
+            count = pipeline.run_digest(force=True)
+
+    # msg1 (items 0,1) отправлены
+    assert count == 2, f"expected 2, got {count}"
+
+    # msg2 (items 2,3) → permanent failed (pipeline вызывает set_state)
+    rows_failed = storage.get_all_by_state("failed")
+    failed_urls = {r.url for r in rows_failed}
+    assert failed_urls == {"https://ex.com/p2", "https://ex.com/p3"}, (
+        f"expected p2,p3 failed, got {failed_urls}"
+    )
+
+    pipeline.close()
 
 
 def test_pipeline_run_digest_idempotent_targets(tmp_path):

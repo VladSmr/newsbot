@@ -32,6 +32,8 @@ from newsbot.delivery.telegram import (
     SEND_PACING_SEC,
     TelegramDelivery,
     TelegramDeliveryError,
+    PermanentDeliveryError,
+    ChatIdNotBoundError,
 )
 
 
@@ -922,3 +924,168 @@ class TestSplitTextUtf16Limit:
         for r in result:
             assert _utf16_units(r["text"]) <= 4096
             assert not _broken_entities(r["text"])
+
+
+# ══════════════════════════════════════════════════════════════════
+# M1-регресс: 400 chat_id vs content — классификация ошибок
+# ══════════════════════════════════════════════════════════════════
+
+class Test400Classification:
+    """M1: 400 различаются на transport-level (chat_id) и content-level."""
+
+    @staticmethod
+    def _mock_resp_400(description: str):
+        r = MagicMock()
+        r.status_code = 400
+        r.is_success = False
+        r.json.return_value = {"ok": False, "description": description}
+        return r
+
+    def test_400_chat_not_found_is_transport(self):
+        """
+        400 'Bad Request: chat not found' → ChatIdNotBoundError (НЕ permanent).
+        Item остаётся pending, retry сохраняется.
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: chat not found"
+                          )):
+            with pytest.raises(ChatIdNotBoundError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+    def test_400_peer_id_invalid_is_transport(self):
+        """400 'Bad Request: PEER_ID_INVALID' → ChatIdNotBoundError."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: PEER_ID_INVALID"
+                          )):
+            with pytest.raises(ChatIdNotBoundError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+    def test_400_bot_kicked_is_transport(self):
+        """400 'Bad Request: bot was kicked from the group chat' → ChatIdNotBoundError."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: bot was kicked from the group chat"
+                          )):
+            with pytest.raises(ChatIdNotBoundError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+    def test_400_chat_id_empty_is_transport(self):
+        """400 'Bad Request: chat_id is empty' → ChatIdNotBoundError."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: chat_id is empty"
+                          )):
+            with pytest.raises(ChatIdNotBoundError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+    def test_400_cant_parse_entities_is_content_permanent(self):
+        """
+        400 'Bad Request: can't parse entities' → PermanentDeliveryError.
+        Item навсегда теряется (без retry), помечается failed.
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: can't parse entities"
+                          )):
+            with pytest.raises(PermanentDeliveryError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+    def test_400_message_too_long_is_content_permanent(self):
+        """400 'Bad Request: message is too long' → PermanentDeliveryError."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: message is too long"
+                          )):
+            with pytest.raises(PermanentDeliveryError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+    def test_400_button_url_invalid_is_content_permanent(self):
+        """400 'Bad Request: BUTTON_URL_INVALID' → PermanentDeliveryError."""
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: BUTTON_URL_INVALID"
+                          )):
+            with pytest.raises(PermanentDeliveryError):
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+
+    def test_400_unknown_is_transient_not_permanent(self):
+        """
+        Незнакомый 400 → TelegramDeliveryError (консервативно: НЕ permanent).
+        permanent = безвозвратная потеря новости — при незнакомой ошибке
+        считаем транзиентной, item остаётся pending.
+        Проверяем ТОЧНЫЙ тип (не подкласс), чтобы исключить PermanentDeliveryError.
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        with patch.object(td._http, "post",
+                          return_value=self._mock_resp_400(
+                              "Bad Request: some weird vendor-specific error"
+                          )):
+            with pytest.raises(TelegramDeliveryError) as ei:
+                td._api_call("sendMessage", {"chat_id": "123", "text": "hi"})
+            # Точный тип: не PermanentDeliveryError (и не ChatIdNotBoundError)
+            assert type(ei.value) is TelegramDeliveryError
+
+    def test_transport_400_chat_not_found_batch_continues(self):
+        """
+        400 'chat not found' в середине батча → ChatIdNotBoundError поднимается,
+        отправленные остаются delivered, неотправленные — pending (retry).
+        НЕ permanent, item не теряется навсегда.
+        """
+        td = TelegramDelivery(token="tok", chat_id="123")
+        items = [_make_item(i) for i in range(3)]
+        calls = [MagicMock(), self._mock_resp_400("Bad Request: chat not found")]
+        with patch.object(td._http, "post", side_effect=calls):
+            with pytest.raises(ChatIdNotBoundError):
+                td.send_batch(items)
+        # Item 0 отправлен успешно (is_success=True → ok), item 1 → ChatIdNotBoundError
+
+    def test_is_transport_400_helper(self):
+        from newsbot.delivery.telegram import _is_transport_400
+        # Transport-level паттерны
+        assert _is_transport_400("Bad Request: chat not found")
+        assert _is_transport_400("chat not found")
+        assert _is_transport_400("chat_not_found")      # underscore-вариант
+        assert _is_transport_400("PEER_ID_INVALID")
+        assert _is_transport_400("bot was kicked from the supergroup")
+        assert _is_transport_400("bot was blocked by the user")
+        assert _is_transport_400("chat_id is empty")
+        assert _is_transport_400("not enough rights to send a message")
+        assert _is_transport_400("chat_write_forbidden")
+        assert _is_transport_400("message thread not found")
+        assert _is_transport_400("User is deactivated")
+        assert _is_transport_400("user_not_found")       # underscore
+        # Content-level паттерны — НЕ transport
+        assert not _is_transport_400("can't parse entities")
+        assert not _is_transport_400("Bad Request: message is too long")
+        assert not _is_transport_400("BUTTON_URL_INVALID")
+        assert not _is_transport_400("Too many messages")
+        # Незнакомый текст — консервативно False (не transport)
+        assert not _is_transport_400("vendor specific weird error code")
+        assert not _is_transport_400("")
+
+    def test_is_content_400_helper(self):
+        """_is_content_400: только явные content-level паттерны → True."""
+        from newsbot.delivery.telegram import _is_content_400
+        # Content-level паттерны
+        assert _is_content_400("can't parse entities")
+        assert _is_content_400("Bad Request: can not parse entities")
+        assert _is_content_400("message is too long")
+        assert _is_content_400("Bad Request: message_too_long")
+        assert _is_content_400("BUTTON_URL_INVALID")
+        assert _is_content_400("Bad Request: button url invalid")
+        # Транспортные — НЕ content
+        assert not _is_content_400("chat not found")
+        assert not _is_content_400("Bad Request: peer id invalid")
+        assert not _is_content_400("bot was kicked")
+        # Незнакомый текст — консервативно False
+        assert not _is_content_400("some unknown vendor error")
+        assert not _is_content_400("")

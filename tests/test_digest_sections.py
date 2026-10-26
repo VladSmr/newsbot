@@ -571,7 +571,7 @@ def test_send_digest_warning_uses_utf16_units(caplog):
     delivery.send_digest.return_value = True
 
     with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-        sent_count, _, _ = _send_digest_with_targets(
+        sent_count, _, _, _ = _send_digest_with_targets(
             delivery, [(msg, [])], [[]]
         )
 

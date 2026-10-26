@@ -596,7 +596,7 @@ def test_send_digest_mismatch_logs_warning(tmp_path, caplog):
     )
     # Простой случай: buttons длиннее groups
     with caplog.at_level(logging.WARNING, logger="newsbot.digest"):
-        count, urls, _failed = run_digest(
+        count, urls, _all_failed, _permanent_failed = run_digest(
             storage, delivery, max_items=100, max_items_per_message=20,
             item_buttons_per_msg=item_buttons,
             groups=groups,

@@ -198,7 +198,7 @@ class TestPerMessageIsolation(unittest.TestCase):
             ]
             buttons = [[{"target_id": i + 1}] for i in range(3)]
 
-            count, sent_urls, failed = run_digest(
+            count, sent_urls, all_failed, permanent_failed = run_digest(
                 storage, delivery, max_items=10, max_items_per_message=1,
                 item_buttons_per_msg=buttons, groups=groups,
             )
@@ -217,7 +217,7 @@ class TestPerMessageIsolation(unittest.TestCase):
                 urls[1],
                 {x.url for x in storage.get_all_by_state("deferred")},
             )
-            self.assertEqual(failed, [])
+            self.assertEqual(all_failed, [])
             storage.close()
 
 

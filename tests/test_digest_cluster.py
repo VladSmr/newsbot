@@ -629,5 +629,167 @@ class TestRunDigestClusterIntegration(unittest.TestCase):
             p.close()
 
 
+# =============================================================================
+# Major #2 regression: off-peak gate в _check_against_shown
+# =============================================================================
+
+class TestOffpeakGateInCheckAgainstShown(unittest.TestCase):
+    """
+    Регрессионные тесты: _check_against_shown соблюдает off-peak гейт
+    (pipeline.py:1050-1055, Major #2 fix).
+
+    Покрывает оба пути:
+      — запланированный дайджест (_run_delivery_side_effects → run_digest)
+      — /digest из чата (run_digest вызывается напрямую)
+    Оба проходят через _check_against_shown через пул backfill и skipped.
+    """
+
+    def _mk_pipeline_unit(self, llm_filter, off_peak_only: bool = False):
+        """Создаёт pipeline через __new__ для unit-теста _check_against_shown."""
+        p = NewsPipeline.__new__(NewsPipeline)
+        p.config = {}
+        p.sources = []
+        p.storage = MagicMock()
+        p.delivery = MagicMock()
+        p.llm_filter = llm_filter
+        p._off_peak_only = off_peak_only
+        return p
+
+    def _mk_candidates(self, n=3):
+        return [_mk_item(url=f"https://cand.com/{i}", title=f"Candidate {i}") for i in range(n)]
+
+    def _mk_recent_shown(self, n=2):
+        return [{"title": f"Shown {i}", "source": "Src"} for i in range(n)]
+
+    def test_peak_off_peak_only_true_detect_duplicates_not_called(self):
+        """
+        (a) off_peak_only=True + сейчас пик → detect_duplicates НЕ вызывается,
+        _check_against_shown возвращает пустое множество (fail-open).
+        """
+        mock_filter = MagicMock()
+        mock_filter.detect_duplicates.return_value = {0, 1}  # если бы вызвался
+
+        p = self._mk_pipeline_unit(mock_filter, off_peak_only=True)
+        candidates = self._mk_candidates(3)
+        recent = self._mk_recent_shown(2)
+
+        with patch("newsbot.pipeline.is_llm_allowed_now", return_value=False):
+            result = p._check_against_shown(candidates, recent)
+
+        # Fail-open: пустой набор
+        self.assertEqual(result, set())
+        # LLM НЕ вызван
+        mock_filter.detect_duplicates.assert_not_called()
+
+    def test_off_peak_allowed_detect_duplicates_called(self):
+        """
+        (b) off_peak_only=True + off-peak → detect_duplicates вызывается,
+        поведение штатное.
+        """
+        mock_filter = MagicMock()
+        mock_filter.detect_duplicates.return_value = {0}  # первый кандидат — дубль
+
+        p = self._mk_pipeline_unit(mock_filter, off_peak_only=True)
+        candidates = self._mk_candidates(3)
+        recent = self._mk_recent_shown(2)
+
+        with patch("newsbot.pipeline.is_llm_allowed_now", return_value=True):
+            result = p._check_against_shown(candidates, recent)
+
+        # detect_duplicates вызван, вернул {0} → кандидат 0 дубль
+        mock_filter.detect_duplicates.assert_called_once_with(candidates, recent)
+        self.assertEqual(result, {"https://cand.com/0"})
+
+    def test_off_peak_only_false_detect_duplicates_called_in_peak(self):
+        """
+        (c) off_peak_only=False (гейт выключен юзером) → detect_duplicates
+        вызывается даже в пик.
+        """
+        mock_filter = MagicMock()
+        mock_filter.detect_duplicates.return_value = {1}
+
+        p = self._mk_pipeline_unit(mock_filter, off_peak_only=False)
+        candidates = self._mk_candidates(3)
+        recent = self._mk_recent_shown(2)
+
+        # off_peak_only=False → is_llm_allowed_now игнорируется
+        with patch("newsbot.pipeline.is_llm_allowed_now", return_value=False):
+            result = p._check_against_shown(candidates, recent)
+
+        # LLM вызван несмотря на «пик» (off_peak_only=False)
+        mock_filter.detect_duplicates.assert_called_once()
+        self.assertEqual(result, {"https://cand.com/1"})
+
+    def test_empty_candidates_returns_early(self):
+        """Пустой candidates → early-return ДО проверки off-peak (независимо от флага)."""
+        mock_filter = MagicMock()
+        p = self._mk_pipeline_unit(mock_filter, off_peak_only=True)
+        recent = self._mk_recent_shown(2)
+
+        # Не падаем, не вызываем is_llm_allowed_now
+        result = p._check_against_shown([], recent)
+        self.assertEqual(result, set())
+        mock_filter.detect_duplicates.assert_not_called()
+
+    def test_empty_recent_returns_early(self):
+        """Пустой recent_shown → early-return ДО проверки off-peak."""
+        mock_filter = MagicMock()
+        p = self._mk_pipeline_unit(mock_filter, off_peak_only=True)
+        candidates = self._mk_candidates(3)
+
+        result = p._check_against_shown(candidates, [])
+        self.assertEqual(result, set())
+        mock_filter.detect_duplicates.assert_not_called()
+
+    def test_no_llm_filter_returns_early(self):
+        """llm_filter=None → early-return ДО проверки off-peak."""
+        p = self._mk_pipeline_unit(None, off_peak_only=True)
+        candidates = self._mk_candidates(3)
+        recent = self._mk_recent_shown(2)
+
+        result = p._check_against_shown(candidates, recent)
+        self.assertEqual(result, set())
+
+    def test_integration_run_digest_with_peak_guard_backfill(self):
+        """
+        Интеграция: run_digest(force=True) в пик с off_peak_only=True.
+        Backfill pool проходит _check_against_shown, detect_duplicates
+        не вызывается → дайджест завершается успешно (fail-open).
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            # deferred — уйдёт в digest
+            s.save(_mk_item(title="Deferred1", url="https://ex.com/d1", llm_score=6))
+            s.set_state(["https://ex.com/d1"], "deferred")
+            # backfill-кандидаты — лежат в БД как new
+            for i in range(2, 5):
+                s.save(_mk_item(title=f"Backfill{i}", url=f"https://ex.com/b{i}", llm_score=6))
+                s.set_state([f"https://ex.com/b{i}"], "new")
+            s.close()
+
+            mock_filter = MagicMock()
+            # detect_duplicates вызываться НЕ должен
+            mock_filter.detect_duplicates.return_value = set()
+
+            p = _mk_pipeline_integration(db_path, llm_filter=mock_filter)
+            # Симулируем off-peak=только, сейчас пик
+            p._off_peak_only = True
+
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            with patch("newsbot.pipeline.is_llm_allowed_now", return_value=False):
+                count = p.run_digest(force=True)
+
+            # Дайджест отработал (fail-open: deferred item отправлен)
+            self.assertGreaterEqual(count, 1)
+            # detect_duplicates НЕ вызван ни разу
+            mock_filter.detect_duplicates.assert_not_called()
+
+            p.storage.close()
+            p.close()
+
+
 if __name__ == "__main__":
     unittest.main()
