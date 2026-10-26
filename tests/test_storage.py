@@ -334,7 +334,7 @@ class TestV14Migration:
         storage2 = Storage(db_path=db_path)
         conn3 = storage2._connect()
         version = conn3.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 15, f"user_version должен быть 15, got {version}"
+        assert version == 16, f"user_version должен быть 16, got {version}"
 
         # Проверяем: нет NULL в url_norm
         nulls = conn3.execute(
@@ -546,7 +546,7 @@ class TestV14Migration:
         conn4.close()
         storage2.close()
 
-        assert version == 15, f"user_version должен быть 15, got {version}"
+        assert version == 16, f"user_version должен быть 16, got {version}"
         assert "idx_items_url_norm" in indexes, (
             f"idx_items_url_norm должен существовать: {indexes}"
         )
@@ -676,7 +676,7 @@ class TestV14Migration:
         conn4.close()
         storage2.close()
 
-        assert version == 15, f"user_version должен быть 15, got {version}"
+        assert version == 16, f"user_version должен быть 16, got {version}"
         assert "idx_items_url_norm" in indexes, (
             f"idx_items_url_norm должен существовать: {indexes}"
         )
@@ -734,10 +734,113 @@ class TestV14Migration:
         conn2.close()
         storage2.close()
 
-        assert v1 == 15, f"Первая миграция: user_version={v1}"
-        assert v2 == 15, f"Повторный вызов: user_version={v2}"
+        assert v1 == 16, f"Первая миграция: user_version={v1}"
+        assert v2 == 16, f"Повторный вызов: user_version={v2}"
         assert "idx_items_url_norm" in indexes, (
             f"Индекс после повторного вызова: {indexes}"
+        )
+
+
+class TestV16Migration:
+    """Major#10: миграция v16 добавляет индекс idx_items_fetched_at."""
+
+    def test_v16_index_fetched_at_created(self, tmp_path):
+        """
+        После миграции v16 (SCHEMA_VERSION=16) индекс idx_items_fetched_at
+        существует на свежей БД. Идемпотентность: повторный вызов не падает.
+        """
+        db_path = tmp_path / "v16_test.db"
+
+        # Создаём v15 БД и подменяем user_version
+        storage = Storage(db_path=db_path)
+        conn = storage._connect()
+        conn.execute("PRAGMA user_version = 15")
+        conn.commit()
+        storage.close()
+
+        # Миграция v15→v16
+        storage2 = Storage(db_path=db_path)
+        conn2 = storage2._connect()
+        version = conn2.execute("PRAGMA user_version").fetchone()[0]
+        indexes = {
+            r[0] for r in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        conn2.close()
+        storage2.close()
+
+        assert version == 16, f"user_version должен быть 16, got {version}"
+        assert "idx_items_fetched_at" in indexes, (
+            f"idx_items_fetched_at должен существовать: {indexes}"
+        )
+
+    def test_v16_migration_from_old_db(self, tmp_path):
+        """
+        Миграция с очень старой версии: индекс idx_items_fetched_at создаётся.
+        """
+        db_path = tmp_path / "old_test.db"
+
+        # Создаём БД через sqlite3 напрямую (без Storage)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA user_version = 0")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                url TEXT NOT NULL,
+                url_norm TEXT,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                published TEXT,
+                tags TEXT,
+                cluster_key TEXT,
+                lang TEXT,
+                fetched_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'new',
+                state_at TEXT NOT NULL,
+                llm_score INTEGER,
+                llm_summary TEXT,
+                llm_reason TEXT,
+                llm_urgent INTEGER,
+                llm_title TEXT,
+                filtered_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS seen_titles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title_hash TEXT NOT NULL,
+                source TEXT,
+                fetched_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                title_normalized TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_items_url ON items(url);
+        """)
+        now = "2025-10-01T00:00:00"
+        conn.execute(
+            "INSERT INTO items (source, url, title, summary, published, "
+            "fetched_at, state, state_at) VALUES (?, ?, ?, ?, ?, ?, 'new', ?)",
+            ("S1", "https://ex.com/1", "T1", "X", "2025-10-01", now, now),
+        )
+        conn.commit()
+        conn.close()
+
+        # Миграция
+        storage = Storage(db_path=db_path)
+        conn2 = storage._connect()
+        version = conn2.execute("PRAGMA user_version").fetchone()[0]
+        indexes = {
+            r[0] for r in conn2.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        conn2.close()
+        storage.close()
+
+        assert version == 16, f"user_version={version}"
+        assert "idx_items_fetched_at" in indexes, (
+            f"idx_items_fetched_at должен существовать после полной миграции: {indexes}"
         )
 
 

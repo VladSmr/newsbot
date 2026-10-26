@@ -97,7 +97,7 @@ class Storage:
     Идемпотентность: user_version выставляется ПОСЛЕ успешной миграции.
     """
 
-    SCHEMA_VERSION = 15
+    SCHEMA_VERSION = 16
     STATES = ("new", "pending", "delivered", "skipped", "deferred", "failed", "digested")
     DEFAULT_RETENTION_DAYS = 1
     DEFAULT_RETRY_THRESHOLD_SECONDS = 60
@@ -443,6 +443,10 @@ class Storage:
             # (cluster_key, fetched_at) — SELECT WHERE cluster_key=? для кластеризации.
             "CREATE INDEX IF NOT EXISTS idx_items_source_fetched ON items(source, fetched_at)",
             "CREATE INDEX IF NOT EXISTS idx_items_cluster_key_fetched ON items(cluster_key, fetched_at)",
+            # Major#10: индекс по fetched_at для prefetch-кеша _domain_recent_duplicate.
+            # Range-сканы по fetched_at >= cutoff требуют индекс, где fetched_at первый.
+            # Идемпотентно: CREATE INDEX IF NOT EXISTS.
+            "CREATE INDEX IF NOT EXISTS idx_items_fetched_at ON items(fetched_at)",
         ):
             try:
                 conn.execute(stmt)
@@ -1229,6 +1233,25 @@ class Storage:
                     if "duplicate column" not in str(e).lower():
                         raise
                     logger.info("v15: колонка llm_title уже существует (конкурентный процесс)")
+
+        # (м) v16: idx_items_fetched_at для prefetch-кеша _domain_recent_duplicate.
+        # Идемпотентно: IF NOT EXISTS + OperationalError.
+        # Для свежих БД индекс создаётся из _create_indexes ДО миграции
+        # (внутри той же транзакции — items уже существует на этом этапе).
+        # На свежей БД в рамках _migrate таблица items уже есть к этому моменту.
+        # На LEGACY БД (user_version < 16) — items точно существует.
+        # Оборачиваем в проверку существования: если items ещё не создана
+        # (edge case при кастомной схеме), CREATE INDEX упадёт с OperationalError
+        # "no such table: items" и будет безмолвно проглочен — перестраховка.
+        if "items" in existing_tables:
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_items_fetched_at "
+                    "ON items(fetched_at)"
+                )
+                logger.info("Миграция v16: создан индекс idx_items_fetched_at")
+            except sqlite3.OperationalError:
+                pass  # уже существует или конкурентный процесс
 
         conn.commit()
 
@@ -2845,6 +2868,57 @@ class Storage:
             params,
         ).fetchall()
         return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def get_recent_for_dedup(self, hours: int = 2) -> dict:
+        """
+        Major#10-фикс: prefetch всех (cluster_key, title) за 2-часового окна
+        одним запросом. Вызывается ОДИН раз за вызов filter_new, результат
+        кэшируется в dedup._prefetch_cache → O(N) вместо O(N) запросов.
+
+        Индекс idx_items_fetched_at ускоряет range-сканы fetched_at >= cutoff
+        (v16 миграция / _create_indexes).
+
+        Returns:
+            dict: ключ — суффикс cluster_key ('stem|day') для нового формата
+            или полный ключ для старого (без '|'); значение — (title, fetched_at).
+            Позволяет O(1) lookup по cluster_keySuffix в dedup.py.
+
+        NOTE: возвращает ВСЕ items за окно (не только 'delivered'), потому что
+        _domain_recent_duplicate — это быстрый guard ДО fuzzy-дедупа, который
+        должен отсекать и только что сохранённые items. Старые записи (не новые
+        в этом цикле) не попадают в prefetch (filter_new обрабатывает items
+        до save, а не после).
+        """
+        conn = self._connect()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        rows = conn.execute(
+            """
+            SELECT cluster_key, title, fetched_at
+            FROM items
+            WHERE fetched_at >= ?
+              AND cluster_key IS NOT NULL
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        result: dict[str, list[tuple]] = {}
+        for row in rows:
+            ck = row["cluster_key"]
+            if ck is None:
+                continue
+            if "|" in ck:
+                # Новый формат: 'loc|stem|day' → ключ = 'stem|day' (суффикс)
+                suffix = ck.split("|", 1)[1]
+            else:
+                # Старый формат: полный ключ для точного совпадения
+                suffix = ck
+            # Собираем ВСЕ candidates с одинаковым суффиксом — они могут
+            # иметь разные числа в title. Guard считает дублем при совпадении
+            # ХОТЯ БЫ С ОДНИМ из candidate (OR semantics).
+            result.setdefault(suffix, []).append(
+                (row["title"], row["fetched_at"])
+            )
+        return result
 
     def get_recent_titles(
         self,

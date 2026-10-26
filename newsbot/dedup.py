@@ -9,6 +9,13 @@ r"""
   поэтому совпадение cluster_key дополнительно сверяется по мультимножеству
   чисел заголовков — «25 bps» и «50 bps» больше не схлопываются в дубль.
 
+  Major#10-фикс: prefetch-оптимизация. Раньше каждый item делал свой SQL-запрос
+  с LIKE '%' || suffix, что вызывало полнотабличный скан на каждый item
+  (LIKE с leading wildcard не использует индекс idx_items_cluster_key_fetched).
+  Теперь: ОДИН раз за вызов filter_new префетчим все (cluster_key, title)
+  за 2-часового окна одним запросом (индекс idx_items_fetched_at v16),
+  результат — Python-dict для O(1) lookup. Сложность: O(N) запросов → O(1).
+
 Дедуп по двум уровням (оба конфигурируемые):
   Уровень 1 — глобальный точный дедуп по title_hash (без source).
     Активируется: dedup.cross_source=true (дефолт True).
@@ -41,7 +48,7 @@ import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .collector import NewsItem
 from .storage import Storage, MIN_TITLE_LEN
@@ -54,109 +61,68 @@ logger = logging.getLogger("newsbot.dedup")
 
 
 
-def _domain_recent_duplicate(item: NewsItem, storage: Storage, hours: int = 2) -> bool:
+def _domain_recent_duplicate(
+    item: NewsItem,
+    prefetch: Optional[Dict[str, Tuple[str, str]]],
+) -> bool:
     """
     Быстрый дедуп по cluster_key: если ОДИН cluster_key (тема+день)
-    уже был за последние hours — блокируем. Разные темы от одного
+    уже был за последние 2 часа — блокируем. Разные темы от одного
     источника НЕ блокируются.
 
-    M2-фикс: сравниваем по суффиксу stem|day (без локационного префикса).
-    При ингесте item получает stub-ключ `other|stem|day` (loc=other, stub),
-    после скоринга pipeline._process_batch пересобирает ключ с LLM-локацией
-    → `moscow|stem|day` (loc=moscow, пересобранный).
-    При прямом сравнении `other|abc|day` != `moscow|abc|day` → guard не срабатывает.
-    Инвариант guard: ловит «та же тема + тот же день», независимо от того,
-    пересобран ли ключ в БД. Сравнение по суффиксу `%|stem|day` обеспечивает
-    этот инвариант — prefix (location) игнорируется.
+    Major#10-фикс (prefetch-паттерн): принимает prefetch-dict вместо
+    обращения к БД напрямую. Prefetch выполняется ОДИН раз за вызов
+    filter_new через storage.get_recent_for_dedup(): один SQL-запрос
+    загружает все (cluster_key_suffix, title) за 2-часового окна, затем
+    O(1) lookup per item вместо N SQL-запросов (каждый с LIKE-сканом).
 
-    Fallback на exact match: для старых ключей без `|` (например `cb_rate_2024`)
-    суффикс неприменим, используем точное совпадение.
+    M2-фикс (сохранён): сравниваем по суффиксу stem|day (без локационного
+    префикса). Инвариант guard: ловит «та же тема + тот же день»,
+    независимо от пересобранного ключа в БД.
 
-    NOTE: суффиксный LIKE с leading wildcard = full scan по cluster_key.
-    Вызывается один раз на item в filter_new; при ~10k items/день и 2h-окне
-    сканируется ~800 строк — приемлемо. Дополнительный фильтр по pub_day
-    в SQL не применяется (pub_day извлекается из cluster_key через Python-
-    split, а не из отдельного столбца; без отдельного индекса по pub_day
-    дополнительный фильтр не даёт выигрыша, только усложняет запрос).
+    NOTE: prefetch=None трактуется как «нет данных» → fail-open (не дубль).
+    Это защищает filter_new от падения, если prefetch-получение данных
+    не удалось (ошибка БД и т.п.).
 
-    NOTE: 32-битный stem_hash (8 hex). При ~10k заголовков/день вероятность
-    коллизии ≈ 10^-5 (birthday paradox: ~N^2/2^32 ≈ 10^8/4*10^9 ≈ 2.5e-2,
-    но stem_hash = md5[:8] = 32 бита, поэтому P ≈ N^2/2^(32+1) ≈ 10^8/8.6e9
-    ≈ 1.2e-2 ≈ 1.2%). При коллизии guard может пропустить нерелевантную
-    новость как дубль — осознанный компромисс (широкий stem менее агрессивен,
-    чем точный match, и не приводит к потере новостей).
-
-    Числовой guard (фикс потери новостей, различающихся только числами):
-    stem_hash считается от stemmer.normalize(), который ВЫРЕЗАЕТ все цифры
-    (`re.sub(r'\\d+([.,]\\d+)?', ' ')`). Поэтому «Fed raises rates by 25 bps»
-    и «Fed raises rates by 50 bps» дают ОДИН stem_hash → один cluster_key.
-    Без числовой проверки второй item жёстко уходил в state='skipped' (а URL —
-    в постоянный URL-дедуп), т.е. новость терялась безвозвратно. Теперь после
-    SQL-совпадения по cluster_key (LIKE/exact) сверяем мультимножество чисел
-    заголовка нового item с мультимножеством чисел заголовка совпавшей записи
-    (колонка items.title). Дубль ⟺ числа совпали. Следствия:
-      • «25 bps» vs «50 bps» → числа разные → НЕ дубль (идёт в обычный конвейер,
-        дальше решают точный/fuzzy/LLM-дедуп);
-      • точный пересказ с теми же числами → числа совпадают → скип как раньше;
-      • заголовки без чисел → оба мультимножества пустые → поведение прежнее.
-    Формат cluster_key при этом НЕ меняется (числа живут в title, а не в ключе),
-    поэтому старые записи в БД продолжают матчиться и миграция не нужна.
+    Числовой guard (сохранён): «25 bps» vs «50 bps» — разные числа →
+    НЕ дубль (идёт дальше по конвейеру).
     """
     cluster_key = getattr(item, 'cluster_key', None)
     if not cluster_key:
         return False
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-    try:
-        conn = storage._connect()
-        # Числа нового item считаем ВНУТРИ try: `title` приходит из внешнего кода
-        # (collector/тесты/плагины) и теоретически может быть не-str. Раньше
-        # исключение здесь обрывало filter_new, сужая fail-open-инвариант модуля
-        # («ошибка дедупа не должна ронять цикл»). Теперь ошибка разбора
-        # логируется WARNING'ом, а guard деградирует до прежнего поведения
-        # (совпадение cluster_key ⇒ дубль, без числовой сверки).
-        item_numbers = _safe_number_multiset(getattr(item, 'title', None))
-        if '|' in cluster_key:
-            # Новый формат: `loc|stem|day` — сравниваем по суффиксу stem|day.
-            # Отрезаем локационный префикс: suffix = "stem|day".
-            # Паттерн `'%' || ? ESCAPE '\'` = suffix match (LIKE с leading wildcard).
-            # ESCAPE '\' защищает от метасимволов %/_ в stem (теоретически,
-            # md5-hex не содержит их, но защита обязательна).
-            # Пример: cluster_key='other|abc12345|2026-10-21'
-            #   → suffix='abc12345|2026-10-21'
-            #   → паттерн '%abc12345|2026-10-21'
-            #   → MATCH: 'other|abc12345|2026-10-21', 'moscow|abc12345|2026-10-21'
-            #   → NO MATCH: 'other|def99999|2026-10-21', 'moscow|def99999|2026-10-21'
-            suffix = cluster_key.split('|', 1)[1]
-            rows = conn.execute(
-                "SELECT title FROM items WHERE cluster_key LIKE '%' || ? ESCAPE '\\' AND fetched_at>=?",
-                (suffix, cutoff),
-            )
-        else:
-            # Старый формат без `|`: точное совпадение.
-            rows = conn.execute(
-                "SELECT title FROM items WHERE cluster_key=? AND fetched_at>=?",
-                (cluster_key, cutoff),
-            )
-        # Числовой guard: срабатываем на первую запись с тем же мультимножеством
-        # чисел. Ранний выход — обычно первая же строка. Курсор читается
-        # построчно (без материализации всех titles окна в память).
-        # Ключевое: `continue`, а НЕ `return False` на несовпадении чисел —
-        # в окне может быть несколько записей с тем же cluster_key, и совпадение
-        # может оказаться в любой из них.
-        for row in rows:
-            if item_numbers is None:
-                # Числа нового item не разобрались → прежнее поведение guard'а:
-                # cluster_key совпал ⇒ дубль (без числовой сверки).
-                return True
-            cand_numbers = _safe_number_multiset(row["title"])
-            if cand_numbers is None or cand_numbers == item_numbers:
-                # cand_numbers is None: title кандидата не разобрался —
-                # консервативно считаем совпадением (cluster_key уже совпал).
-                return True
+    if prefetch is None:
+        # Fail-open: prefetch недоступен → пропускаем (не дубль).
         return False
-    except Exception as e:
-        logger.warning("Доменный дедуп: ошибка, fail-open: %s", e)
+
+    # Числа нового item: fail-open при ошибке разбора.
+    item_numbers = _safe_number_multiset(getattr(item, 'title', None))
+
+    # Определяем lookup-ключ в prefetch-dict:
+    # новый формат 'loc|stem|day' → суффикс 'stem|day';
+    # старый формат 'cb_rate_2024' → полный ключ.
+    if '|' in cluster_key:
+        lookup_key = cluster_key.split('|', 1)[1]
+    else:
+        lookup_key = cluster_key
+
+    candidates = prefetch.get(lookup_key)
+    if candidates is None or not candidates:
         return False
+
+    if item_numbers is None:
+        # Числа нового item не разобрались → прежнее поведение:
+        # cluster_key совпал ⇒ дубль (без числовой сверки).
+        return True
+
+    # Хотя бы один candidate совпадает по числам → дубль (OR semantics).
+    # Например: два item с одинаковым суффиксом 'stem123|day', но разными
+    # числами (70 000 vs 80 000). Если новый item с числом 70000 —
+    # совпадает с первым кандидатом → дубль; с 90000 — не совпадает ни с одним.
+    for cand_title, _ in candidates:
+        cand_numbers = _safe_number_multiset(cand_title)
+        if cand_numbers is None or cand_numbers == item_numbers:
+            return True
+    return False
 
 
 # ─── Защищённый разбор dedup.* из конфига ─────────────────────────────────────
@@ -617,6 +583,17 @@ def filter_new(
                     if max_seen_titles and len(rows) >= max_seen_titles:
                         _recent_limit_hit = True
 
+    # Major#10-фикс: prefetch всех cluster_key для _domain_recent_duplicate.
+    # ОДИН запрос вместо N. Ошибка → prefetch=None → fail-open guard (не дубль).
+    _prefetch_cache: Optional[Dict[str, Tuple[str, str]]] = None
+    try:
+        _prefetch_cache = storage.get_recent_for_dedup(hours=2)
+    except Exception as e:
+        logger.warning(
+            "Prefetch для доменного дедупа не удался: %s. "
+            "Доменный guard пропускает все items (fail-open).", e,
+        )
+
     for item in items:
         # (a) точный URL в БД
         if storage.is_duplicate(item):
@@ -666,7 +643,8 @@ def filter_new(
             continue
 
         # ── Быстрый доменный дедуп: тот же cluster_key за последние 2 часа ──
-        if _domain_recent_duplicate(item, storage):
+        # Major#10: prefetch-кеш вместо per-item SQL-запроса.
+        if _domain_recent_duplicate(item, _prefetch_cache):
             storage.save_skipped(item)
             dup_count += 1
             logger.debug(

@@ -9,6 +9,7 @@ m3 — HTML-сущности разэкранируются (html.unescape): tit
 """
 import time
 
+import feedparser
 import pytest
 
 from newsbot.collector import (
@@ -477,6 +478,154 @@ class TestEntryIsolation:
         assert item is not None
         assert item.tags is not None
         assert "123" in item.tags
+
+
+class TestParseDeadline:
+    """
+    Major (волна 4): feedparser.parse() выполняется в потоке ThreadPoolExecutor
+    с таймаутом = остаток бюджета FEED_DEADLINE_SEC. Враждебный/гигантский XML,
+    зависающий в CPU-разборе, не блокирует цикл сбора.
+
+    Критическое требование: shutdown(wait=False) в finally — возврат из
+    _fetch_feed происходит сразу после истечения future.result(timeout=...),
+    а НЕ после завершения зависшего потока. Это проверяется wall-clock ассертом
+    (elapsed < parse_timeout + margin). Тесты используют РЕАЛЬНОЕ зависание
+    (time.sleep), а не бросок TimeoutError — это покрывает настоящий путь
+    «зависший поток + expired timeout + executor.shutdown(wait=False)».
+    """
+
+    def test_real_hang_returns_immediately_with_wallclock_assert(
+        self, monkeypatch, collector_factory,
+    ):
+        """
+        feedparser.parse() реально зависает (time.sleep > parse_timeout).
+        Возврат из _fetch_feed должен произойти НЕ позже parse_timeout + margin,
+        и фид → ok=False.
+
+        Ключевой ассерт: elapsed < parse_timeout + 0.3 с.
+        Если бы executor.shutdown(wait=True) (старый баг-паттерн с with-блоком),
+        elapsed был бы ≥ sleep_time >> parse_timeout — тест бы провалился.
+        """
+        real_parse = feedparser.parse
+
+        # Зависаем на 5 с — parse_timeout будет ~0.1–0.2 с (FEED_DEADLINE_SEC
+        # сильно уменьшен), так что sleep >> parse_timeout на порядок.
+        HANG_DURATION = 5.0
+
+        def hanging_parse(raw):
+            # реальный hang — не бросок TimeoutError
+            time.sleep(HANG_DURATION)
+            return real_parse(raw)
+
+        monkeypatch.setattr(feedparser, "parse", hanging_parse)
+        # FEED_DEADLINE_SEC=0.25 с → parse_timeout ≈ 0.1–0.2 с
+        # (часть бюджета уходит на HTTP-фазу через monkeypatch)
+        monkeypatch.setattr("newsbot.collector.FEED_DEADLINE_SEC", 0.25)
+
+        collector = collector_factory(
+            [{"name": "adversarial", "url": "http://adv.example/feed"}],
+            lambda method, url, **kwargs: _FakeStream(_FakeResponse([_RSS_FAST])),
+        )
+
+        started = time.monotonic()
+        _, result = next(collector.collect())
+        elapsed = time.monotonic() - started
+
+        # parse_timeout ≈ 0.1 с (budget 0.25 - http overhead); даём 0.4 с margin
+        assert result.ok is False, "зависший parse должен давать ok=False"
+        assert result.items == []
+        # Главный ассерт: elapsed << sleep (5 с). Если бы shutdown(wait=True),
+        # elapsed был бы ~5 с и тест бы упал. margin 0.4 с выбран с запасом
+        # для CI-шумности (не flakе).
+        assert elapsed < HANG_DURATION / 10, (
+            f"возврат должен произойти ДО завершения зависшего потока: "
+            f"elapsed={elapsed:.2f} с, hang={HANG_DURATION} с — "
+            f"похоже на shutdown(wait=True) или with-блок вместо явного shutdown"
+        )
+
+    def test_real_hang_continues_cycle(self, monkeypatch, collector_factory):
+        """
+        Зависший parse первого фида → ok=False; второй фид обрабатывается.
+        Контент-aware мок: большой body (>10 KB) → зависание;
+        маленький body → реальный feedparser.parse.
+        """
+        real_parse = feedparser.parse
+        parse_calls = []
+
+        def selective_parse(raw):
+            parse_calls.append(raw)
+            if len(raw) > 10000:
+                # Реальное зависание на 2 с — parse_timeout << 2 с,
+                # возврат произойдёт сразу, цикл не заблокируется.
+                time.sleep(2.0)
+                return real_parse(raw)
+            return real_parse(raw)
+
+        monkeypatch.setattr(feedparser, "parse", selective_parse)
+        monkeypatch.setattr("newsbot.collector.FEED_DEADLINE_SEC", 0.25)
+
+        slow_rss = _RSS_FAST + b"X" * 50000   # > 10 KB → зависнет
+        fast_rss = _RSS_FAST                    # → real parse, успех
+
+        feeds = {
+            "http://slow.example/feed": slow_rss,
+            "http://fast.example/feed": fast_rss,
+        }
+
+        def stream_factory(method, url, **kwargs):
+            return _FakeStream(_FakeResponse([feeds[url]]))
+
+        collector = collector_factory(
+            [
+                {"name": "slow", "url": "http://slow.example/feed"},
+                {"name": "fast", "url": "http://fast.example/feed"},
+            ],
+            stream_factory,
+        )
+
+        started = time.monotonic()
+        results = list(collector.collect())
+        total_elapsed = time.monotonic() - started
+
+        assert len(results) == 2
+        assert results[0][0] == "slow"
+        assert results[0][1].ok is False, "slow-фид должен упасть по parse timeout"
+        assert results[1][0] == "fast"
+        assert results[1][1].ok is True, "fast-фид должен обработаться успешно"
+        assert len(results[1][1].items) == 1
+        assert len(parse_calls) == 2, "parse должен быть вызван для обоих фидов"
+        # Цикл должен пройти быстро: sleep(2 с) от зависшего parse
+        # не должна суммироваться. Если бы был shutdown(wait=True),
+        # total_elapsed был бы ~2 с и тест бы упал.
+        assert total_elapsed < 1.0, (
+            f"цикл занял {total_elapsed:.2f} с — похоже, "
+            f"shutdown(wait=True) заблокировал ожидание зависшего потока"
+        )
+
+    def test_normal_parse_still_works(self, monkeypatch, collector_factory):
+        """
+        Нормальный parse (без зависания) работает как прежде.
+        """
+        real_parse = feedparser.parse
+        call_times = []
+
+        def tracked_parse(raw):
+            call_times.append(time.monotonic())
+            return real_parse(raw)
+
+        monkeypatch.setattr(feedparser, "parse", tracked_parse)
+        # FEED_DEADLINE_SEC не трогаем — стандартный бюджет
+
+        collector = collector_factory(
+            [{"name": "fast", "url": "http://fast.example/feed"}],
+            lambda method, url, **kwargs: _FakeStream(_FakeResponse([_RSS_FAST])),
+        )
+
+        _, result = next(collector.collect())
+
+        assert result.ok is True
+        assert len(result.items) == 1
+        assert call_times  # parse был вызван
 
 
 class TestTitleCap:

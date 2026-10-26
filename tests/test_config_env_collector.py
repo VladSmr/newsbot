@@ -742,6 +742,90 @@ class TestConfigHardening:
         assert DEFAULT_CONFIG["dedup"]["max_seen_titles"] == 2000
 
 
+class TestConfigPricingCacheHit:
+    """Major #12-фикс: pricing.*.cache_hit присутствует и валидируется."""
+
+    def test_pricing_cache_hit_in_defaults(self):
+        """DEFAULT_CONFIG содержит cache_hit в pricing."""
+        from newsbot.config import DEFAULT_CONFIG
+
+        flash_pricing = DEFAULT_CONFIG["llm"]["pricing"].get("deepseek-flash", {})
+        assert "cache_hit" in flash_pricing, (
+            f"cache_hit должен быть в pricing.deepseek-flash: {flash_pricing}"
+        )
+        assert flash_pricing["cache_hit"] == 0.003, (
+            f"cache_hit deepseek-flash = 0.003: got {flash_pricing['cache_hit']}"
+        )
+
+    def test_cache_hit_from_yaml_loaded(self, tmp_path):
+        """pricing.cache_hit загружается из YAML."""
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "llm:\n"
+            "  pricing:\n"
+            "    my-model:\n"
+            "      input: 0.10\n"
+            "      output: 0.40\n"
+            "      cache_hit: 0.002\n",
+            encoding="utf-8",
+        )
+        cfg = load_config(str(cfg_file))
+        pricing = cfg["llm"]["pricing"]["my-model"]
+        assert pricing["cache_hit"] == 0.002, f"cache_hit должен быть 0.002: {pricing}"
+
+    def test_invalid_cache_hit_falls_back_to_default(self, tmp_path, caplog):
+        """cache_hit: "bad" → warning + дефолт."""
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "llm:\n"
+            "  pricing:\n"
+            "    deepseek-flash:\n"
+            "      input: 0.15\n"
+            "      output: 0.60\n"
+            "      cache_hit: not-a-number\n",
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        pricing = cfg["llm"]["pricing"]["deepseek-flash"]
+        assert pricing["cache_hit"] == 0.003, (
+            f"cache_hit должен fallback в 0.003: {pricing}"
+        )
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "cache_hit" in messages or "cache" in messages, (
+            f"Expected warning about cache_hit, got: {messages}"
+        )
+
+    def test_negative_cache_hit_falls_back(self, tmp_path, caplog):
+        """cache_hit: -0.001 → warning + дефолт."""
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "llm:\n"
+            "  pricing:\n"
+            "    deepseek-flash:\n"
+            "      cache_hit: -0.001\n",
+            encoding="utf-8",
+        )
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        pricing = cfg["llm"]["pricing"]["deepseek-flash"]
+        assert pricing["cache_hit"] == 0.003, (
+            f"negative cache_hit должен fallback в 0.003: {pricing}"
+        )
+
+
 # ── P2: llm-числа — ±inf и отрицательные не проходят ─────────────────────────
 
 

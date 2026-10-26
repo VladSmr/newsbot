@@ -115,7 +115,7 @@ class TestLangStorage:
             ).fetchall()}
             assert "lang" in cols2, "миграция v14 не добавила items.lang"
             version = s2._connect().execute("PRAGMA user_version").fetchone()[0]
-            assert int(version) == Storage.SCHEMA_VERSION == 15
+            assert int(version) == Storage.SCHEMA_VERSION == 16
 
             items = s2.get_all_by_state("new")
             assert len(items) == 1
@@ -854,7 +854,7 @@ class TestNumericFieldValidation:
         assert all(r.ok for r in results)
         assert len(client.calls) == 1
 
-    def test_negative_max_retries_clamped_to_zero(self, caplog):
+    def test_negative_max_retries_clamped_to_one(self, caplog):
         with caplog.at_level(logging.WARNING):
             flt = LLMFilter({
                 "enabled": True,
@@ -865,7 +865,7 @@ class TestNumericFieldValidation:
                 "daily_cost_limit": 0,
             })
         try:
-            assert flt.client.max_retries == 0
+            assert flt.client.max_retries == 1
         finally:
             flt.client.close()
         assert _warnings(caplog.records, "max_retries")
@@ -974,7 +974,7 @@ class TestNonFiniteNumericFields:
                 storage=tmp_storage,
             )
         assert "m" not in flt._pricing
-        assert flt._pricing["ok"] == {"input": 1.0, "output": 2.0}
+        assert flt._pricing["ok"] == {"input": 1.0, "output": 2.0, "cache_hit": 0.0}
         assert _warnings(caplog.records, "pricing")
 
         # NaN не должен просочиться в дневной счётчик meta

@@ -121,8 +121,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # NOTE: структура flat {input, output} — peak/off-peak не поддерживается cost-guard'ом filter.py.
         # deepseek-v4-pro: цена не верифицирована (прайс-картинка покрывает только Flash).
         "pricing": {
-            "deepseek-flash": {"input": 0.15, "output": 0.60},
-            "deepseek-v4-pro": {"input": 0.50, "output": 2.00},  # placeholder: не верифицировано
+            "deepseek-flash": {"input": 0.15, "output": 0.60, "cache_hit": 0.003},
+            "deepseek-v4-pro": {"input": 0.50, "output": 2.00, "cache_hit": 0.003},  # placeholder: не верифицировано
         },
         "daily_cost_limit": 0.50,  # USD per day; 0 = disabled
     },
@@ -363,6 +363,50 @@ def _validate_llm_numeric_fields(cfg: Dict[str, Any]) -> None:
             # Нормализуем к числу (например "9" → 9), чтобы потребители
             # конфига получали уже валидный тип.
             container[key] = converted
+
+    # Major #12-фикс: валидация pricing.*.cache_hit (dynamic model keys).
+    # Цены cache_hit не в spec выше, т.к. ключи моделей динамические.
+    pricing_cfg = llm_cfg.get("pricing")
+    if isinstance(pricing_cfg, dict):
+        defaults_pricing = DEFAULT_CONFIG["llm"].get("pricing", {})
+        for model_name, prices in list(pricing_cfg.items()):
+            if not isinstance(prices, dict):
+                logger.warning(
+                    "llm.pricing[%r] должен быть словарём {input, output, cache_hit}, "
+                    "получено %s — запись пропущена",
+                    model_name, type(prices).__name__,
+                )
+                del pricing_cfg[model_name]
+                continue
+            model_defaults = defaults_pricing.get(model_name, {})
+            for price_key in ("input", "output", "cache_hit"):
+                if price_key not in prices:
+                    # Не выставляем дефолт, просто пропускаем
+                    continue
+                raw = prices[price_key]
+                default_val = model_defaults.get(price_key, 0.0)
+                converted_val = None
+                if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+                    try:
+                        converted_val = float(raw)
+                        if not math.isfinite(converted_val):
+                            converted_val = None
+                    except (TypeError, ValueError, OverflowError):
+                        converted_val = None
+                if converted_val is None:
+                    logger.warning(
+                        "llm.pricing[%r].%s=%r — ожидалось число, "
+                        "используется дефолт %r",
+                        model_name, price_key, raw, default_val,
+                    )
+                    prices[price_key] = default_val
+                elif converted_val < 0:
+                    logger.warning(
+                        "llm.pricing[%r].%s=%r — отрицательная цена, "
+                        "используется дефолт %r",
+                        model_name, price_key, raw, default_val,
+                    )
+                    prices[price_key] = default_val
 
 
 # ── telegram.poll_timeout ─────────────────────────────────────────────────────

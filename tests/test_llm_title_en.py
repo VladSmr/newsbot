@@ -389,7 +389,7 @@ class TestV15Migration(unittest.TestCase):
             s2 = Storage(db_path=db_path)
             conn3 = s2._connect()
             version = conn3.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 15)
+            self.assertEqual(version, 16)
 
             cols = {r[1] for r in conn3.execute("PRAGMA table_info(items)").fetchall()}
             self.assertIn("llm_title", cols)
@@ -471,13 +471,13 @@ class TestV15Migration(unittest.TestCase):
             # Первая миграция (v14→v15)
             s2 = Storage(db_path=db_path)
             v1 = s2._connect().execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(v1, 15)
+            self.assertEqual(v1, 16)
             s2.close()
 
             # Повторный старт (уже v15)
             s3 = Storage(db_path=db_path)
             v2 = s3._connect().execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(v2, 15)
+            self.assertEqual(v2, 16)
 
             # Данные на месте, llm_title = NULL
             items = s3.get_all_by_state("new")

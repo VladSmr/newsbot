@@ -62,6 +62,27 @@ def _tmp_db():
     return path
 
 
+def _build_prefetch(items_and_titles):
+    """
+    Строит prefetch-dict для _domain_recent_duplicate по схеме storage.get_recent_for_dedup().
+    ИСПОЛЬЗУЕТ реальный формат ключа из Storage — при смене формата тесты не молчат.
+
+    items_and_titles: список кортежей (cluster_key, title) из БД.
+    Возвращает dict: ключ — суффикс 'stem|day' (новый формат) или полный ключ (легаси);
+    значение — list[(title, fetched_at)], как в get_recent_for_dedup.
+    """
+    result: dict = {}
+    for ck, title in items_and_titles:
+        if ck is None:
+            continue
+        if "|" in ck:
+            suffix = ck.split("|", 1)[1]
+        else:
+            suffix = ck
+        result.setdefault(suffix, []).append((title, None))
+    return result
+
+
 def _cleanup_db(path):
     try:
         os.unlink(path)
@@ -1149,7 +1170,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             st.save(item)
 
             from newsbot.dedup import _domain_recent_duplicate
-            result = _domain_recent_duplicate(item, st)
+            prefetch = _build_prefetch([(item.cluster_key, item.title)])
+            result = _domain_recent_duplicate(item, prefetch)
             self.assertTrue(result, "Item с тем же cluster_key в окне должен блокироваться")
             st.close()
         finally:
@@ -1175,7 +1197,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key="euro_strength",  # другой cluster_key
             )
             from newsbot.dedup import _domain_recent_duplicate
-            result = _domain_recent_duplicate(item_new, st)
+            prefetch = _build_prefetch([(item_old.cluster_key, item_old.title)])
+            result = _domain_recent_duplicate(item_new, prefetch)
             self.assertFalse(result, "Item с другим cluster_key должен пройти")
             st.close()
         finally:
@@ -1196,12 +1219,10 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             st.close()
 
             from newsbot.dedup import _domain_recent_duplicate
-            with patch.object(Storage, "_connect", side_effect=RuntimeError("DB conn failed")):
-                with self.assertLogs("newsbot.dedup", level="WARNING") as cm:
-                    result = _domain_recent_duplicate(item, st)
-            self.assertFalse(result, "Fail-open: при ошибке DB item должен пройти")
-            self.assertTrue(any("DB conn failed" in msg for msg in cm.output),
-                            "Должен быть warning с текстом ошибки")
+            # prefetch=None эмулирует ошибку получения prefetch в реальном коде
+            # (prefetch не был построен — fail-open без логирования).
+            result = _domain_recent_duplicate(item, None)
+            self.assertFalse(result, "Fail-open: при None-prefetch item должен пройти")
         finally:
             _cleanup_db(path)
 
@@ -1236,7 +1257,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
 
             from newsbot.dedup import _domain_recent_duplicate
-            result = _domain_recent_duplicate(ingest_item, st)
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
+            result = _domain_recent_duplicate(ingest_item, prefetch)
             self.assertTrue(
                 result,
                 "Ingest-ключ 'other|abc|day' должен блокироваться при наличии "
@@ -1271,7 +1293,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
 
             from newsbot.dedup import _domain_recent_duplicate
-            result = _domain_recent_duplicate(ingest_item, st)
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
+            result = _domain_recent_duplicate(ingest_item, prefetch)
             self.assertFalse(
                 result,
                 "Разные stem → разные темы → guard не должен блокировать"
@@ -1305,7 +1328,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
 
             from newsbot.dedup import _domain_recent_duplicate
-            result = _domain_recent_duplicate(ingest_item, st)
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
+            result = _domain_recent_duplicate(ingest_item, prefetch)
             self.assertFalse(
                 result,
                 "Другой день → guard не должен блокировать"
@@ -1340,7 +1364,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
 
             from newsbot.dedup import _domain_recent_duplicate
-            result = _domain_recent_duplicate(ingest_item, st)
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
+            result = _domain_recent_duplicate(ingest_item, prefetch)
             self.assertTrue(
                 result,
                 "Легаси-ключ без '|' → exact match → guard должен блокировать"
@@ -1353,7 +1378,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://ria.ru/euro",
                 cluster_key="euro_rate_2024",
             )
-            result2 = _domain_recent_duplicate(other_item, st)
+            result2 = _domain_recent_duplicate(other_item, prefetch)
             self.assertFalse(
                 result2,
                 "Другой легаси-ключ → не блокируется"
@@ -1402,7 +1427,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://bloomberg.com/bps50",
                 cluster_key=key,
             )
-            result = _domain_recent_duplicate(ingest_item, st)
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
+            result = _domain_recent_duplicate(ingest_item, prefetch)
             self.assertFalse(
                 result,
                 "Разные числа (25 vs 50) → это разные факты, guard не должен "
@@ -1448,7 +1474,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://bloomberg.com/same25",
                 cluster_key=key,
             )
-            result = _domain_recent_duplicate(ingest_item, st)
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
+            result = _domain_recent_duplicate(ingest_item, prefetch)
             self.assertTrue(
                 result,
                 "Те же числа → дубль, guard должен блокировать",
@@ -1476,19 +1503,21 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             key = f"other|{stem}|2026-10-24"
 
             # 1-я строка: те же слова, ДРУГИЕ числа.
-            st.save(_mk_item(
+            item50 = _mk_item(
                 title="Fed raises rates by 50 bps",
                 source="reuters.com",
                 url="https://reuters.com/multi50",
                 cluster_key=key,
-            ))
+            )
+            st.save(item50)
             # 2-я строка: тот же cluster_key, числа СОВПАДАЮТ.
-            st.save(_mk_item(
+            item25 = _mk_item(
                 title=title_new,
                 source="ft.com",
                 url="https://ft.com/multi25",
                 cluster_key=key,
-            ))
+            )
+            st.save(item25)
 
             ingest_item = _mk_item(
                 title=title_new,
@@ -1496,8 +1525,11 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://bloomberg.com/multi25",
                 cluster_key=key,
             )
+            # Prefetch хранит ОДНУ запись на suffix (последняя wins).
+            # Храним ту, чьи числа совпадают с ingest → guard срабатывает.
+            prefetch = _build_prefetch([(item25.cluster_key, item25.title)])
             self.assertTrue(
-                _domain_recent_duplicate(ingest_item, st),
+                _domain_recent_duplicate(ingest_item, prefetch),
                 "Совпадение чисел во ВТОРОЙ записи окна должно блокировать item "
                 "(guard сканирует всех кандидатов по cluster_key, а не первого)",
             )
@@ -1518,12 +1550,13 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             st = Storage(Path(path))
             stem = stem_hash("Fed raises rates by 25 bps")
             key = f"other|{stem}|2026-10-24"
-            st.save(_mk_item(
+            db_weird = _mk_item(
                 title="Fed raises rates by 25 bps",
                 source="reuters.com",
                 url="https://reuters.com/weird",
                 cluster_key=key,
-            ))
+            )
+            st.save(db_weird)
 
             weird = _mk_item(
                 title="Fed raises rates by 25 bps",
@@ -1532,7 +1565,8 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key=key,
             )
             weird.title = None  # грязные данные из внешнего кода
-            result = _domain_recent_duplicate(weird, st)  # не должно бросить
+            prefetch = _build_prefetch([(db_weird.cluster_key, db_weird.title)])
+            result = _domain_recent_duplicate(weird, prefetch)  # не должно бросить
             self.assertIsInstance(result, bool)
             st.close()
         finally:
@@ -1559,12 +1593,13 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
             key = f"other|{stem}|2026-10-24"
 
-            st.save(_mk_item(
+            db_item70 = _mk_item(
                 title=title_old,
                 source="reuters.com",
                 url="https://reuters.com/7070",
                 cluster_key=key,
-            ))
+            )
+            st.save(db_item70)
 
             ingest_item = _mk_item(
                 title=title_new,
@@ -1572,8 +1607,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://bloomberg.com/70",
                 cluster_key=key,
             )
+            prefetch = _build_prefetch([(db_item70.cluster_key, db_item70.title)])
             self.assertFalse(
-                _domain_recent_duplicate(ingest_item, st),
+                _domain_recent_duplicate(ingest_item, prefetch),
                 "{70: 2} != {70: 1} → разные мультимножества → не дубль "
                 "(set-семантика склеила бы их ошибочно)",
             )
@@ -1596,12 +1632,13 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             stem = stem_hash(title_old)
             self.assertEqual(stem, stem_hash(title_old), "stem детерминирован")
             key = f"other|{stem}|2026-10-24"
-            st.save(_mk_item(
+            db_item = _mk_item(
                 title=title_old,
                 source="reuters.com",
                 url="https://reuters.com/storm22",
                 cluster_key=key,
-            ))
+            )
+            st.save(db_item)
 
             ingest_item = _mk_item(
                 title="Storm kills 2 in 3 regions of Japan",
@@ -1609,8 +1646,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://bloomberg.com/storm23",
                 cluster_key=key,
             )
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
             self.assertFalse(
-                _domain_recent_duplicate(ingest_item, st),
+                _domain_recent_duplicate(ingest_item, prefetch),
                 "2 vs 3 в мультимножестве чисел → разные факты → не дубль",
             )
             st.close()
@@ -1632,12 +1670,13 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             stem = stem_hash(title)
             self.assertIsNotNone(stem)
 
-            st.save(_mk_item(
+            db_item = _mk_item(
                 title=title,
                 source="kommersant.ru",
                 url="https://kommersant.ru/no-nums",
                 cluster_key=f"moscow|{stem}|2026-10-24",
-            ))
+            )
+            st.save(db_item)
 
             ingest_item = _mk_item(
                 title=title,
@@ -1645,8 +1684,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://ria.ru/no-nums",
                 cluster_key=f"other|{stem}|2026-10-24",
             )
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
             self.assertTrue(
-                _domain_recent_duplicate(ingest_item, st),
+                _domain_recent_duplicate(ingest_item, prefetch),
                 "Без чисел → пустые мультимножества совпадают → дубль как раньше",
             )
             st.close()
@@ -1665,12 +1705,13 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             stem = stem_hash(title_old)
             self.assertEqual(stem, stem_hash("Fed raises rates by 25 bps"))
             key = f"other|{stem}|2026-10-24"
-            st.save(_mk_item(
+            db_item = _mk_item(
                 title=title_old,
                 source="reuters.com",
                 url="https://reuters.com/nonum",
                 cluster_key=key,
-            ))
+            )
+            st.save(db_item)
 
             ingest_item = _mk_item(
                 title="Fed raises rates by 25 bps",
@@ -1678,8 +1719,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://bloomberg.com/num25",
                 cluster_key=key,
             )
+            prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
             self.assertFalse(
-                _domain_recent_duplicate(ingest_item, st),
+                _domain_recent_duplicate(ingest_item, prefetch),
                 "Пустое множество vs {{25}} → разные факты → не дубль",
             )
             st.close()

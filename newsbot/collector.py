@@ -8,6 +8,7 @@
   - пустые entry без link пропускаются
 """
 import calendar
+import concurrent.futures
 import html as _html
 import json
 import logging
@@ -25,11 +26,26 @@ from .urlnorm import normalize_url
 logger = logging.getLogger("newsbot.collector")
 
 # ─── Лимиты ──────────────────────────────────────────────────────────────────
-# Wall-clock (точнее — monotonic) deadline на ОДИН фид целиком:
-# HTTP-фаза (подключение + чтение тела) И конвертация entries.
+# Wall-clock (monotonic) deadline на ОДИН фид целиком:
+# HTTP-фаза (подключение + чтение тела) И feedparser.parse() (CPU-bound
+# разбор произвольного XML/HTML). Таймаут parse вычисляется как остаток
+# бюджета: deadline_remaining = FEED_DEADLINE_SEC - elapsed_after_http.
 # Ставится ДО self._client.stream() — иначе медленный сервер, отдающий
 # по байту, держит iter_bytes() неограниченно долго (per-operation
 # httpx-таймаут сбрасывается на каждом чанке).
+#
+# ⚠️  Остаточный риск: поток, зависший в feedparser.parse(), нельзя
+#     принудительно убить извне (Thread.join() с таймаутом не прерывает
+#     нативный C-код парсера). Поток НЕ является daemon-потоком —
+#     ThreadPoolExecutor в Python 3.8+ не создаёт daemon-потоки, и
+#     интерпретатор ждёт их при shutdown. shutdown(wait=False) разрывает
+#     цикл немедленно, но зависший поток остаётся жить до завершения
+#     процесса (live Python thread с нативным парсером внутри).
+#
+#     Частота утечки = число реальных таймаутов parse за жизнь процесса.
+#     На каждый таймаут — ровно 1 поток, изолирован (не делит память
+#     с основным потоком значимо, GIL не держат). Это приемлемый
+#     остаточный риск: фид уже помечен ok=False, цикл сбора продолжается.
 FEED_DEADLINE_SEC = 30
 MAX_ITEMS_PER_FEED = 50  # защита от кривого фида
 
@@ -394,11 +410,53 @@ class FeedCollector:
             return FeedResult(ok=False, items=[])
 
         # ── Парсинг: raw (bytes) — автодекодировка XML по XML Declaration ──
+        # feedparser.parse() — CPU-bound, потенциально неограничен по времени
+        # для гигантского или adversarial XML (до MAX_FEED_BYTES = 10 MB).
+        # Заворачиваем в ThreadPoolExecutor(max_workers=1) с timeout на result().
+        #
+        # ⚠️  Почему НЕ with-блок: ThreadPoolExecutor.__exit__ вызывает
+        #     shutdown(wait=True) — он БЛОКИРУЕТСЯ, ожидая завершения рабочего
+        #     потока. При реальном зависании feedparser.parse() (нативный C-код)
+        #     future.result(timeout=...) истекает, но __exit__ всё равно ждёт
+        #     поток до бесконечности → таймаут = no-op.
+        #
+        #     Правильный паттерн: явный shutdown(wait=False) в finally.
+        #     В Python 3.9+ используем cancel_futures=True (отменяет висящие
+        #     futures при shutdown). Для Python 3.8 — без cancel_futures
+        #     (параметр не существует, игнорируем TypeError).
+        #
+        # ⚠️  Остаточный риск: зависший поток живёт до конца процесса
+        #     (не daemon, Python 3.8+ джойнит при exit). Это приемлемо:
+        #     ok=False возвращается сразу, цикл сбора не блокируется,
+        #     утечка = 1 поток на таймаут за жизнь процесса.
+        import sys as _sys
+        parse_timeout = max(0.1, deadline - time.monotonic())
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            parsed = feedparser.parse(raw)
+            future = executor.submit(feedparser.parse, raw)
+            try:
+                parsed = future.result(timeout=parse_timeout)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "[%s] feedparser.parse() превысил остаток бюджета "
+                    "(%.1f с из %d с) — фид пропущен: %s",
+                    name, parse_timeout, FEED_DEADLINE_SEC, url,
+                )
+                return FeedResult(ok=False, items=[])
         except Exception as e:
             logger.warning("[%s] feedparser ошибка парсинга: %s", name, e)
             return FeedResult(ok=False, items=[])
+        finally:
+            # Python 3.9+: cancel_futures отменяет висящие futures при shutdown.
+            # Python 3.8: параметр не существует — игнорируем TypeError.
+            try:
+                if _sys.version_info >= (3, 9):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    executor.shutdown(wait=False)
+            except TypeError:
+                # Python < 3.9, cancel_futures не поддерживается
+                executor.shutdown(wait=False)
 
         if parsed.bozo and not parsed.entries:
             logger.warning("[%s] Фид битый (bozo), entries пуст", name)

@@ -107,26 +107,44 @@ class UsageStats:
     # Цены из конфига (USD за 1M токенов)
     _input_price: float = 0.0
     _output_price: float = 0.0
+    _input_cache_hit_price: float = 0.0  # цена cache-hit (DeepSeek off-peak: $0.003/M)
 
-    def set_prices(self, input_price: float, output_price: float) -> None:
+    def set_prices(self, input_price: float, output_price: float,
+                   input_cache_hit_price: float = 0.0) -> None:
         """Устанавливает цены модели (USD за 1M токенов)."""
         self._input_price = input_price
         self._output_price = output_price
+        self._input_cache_hit_price = input_cache_hit_price
 
     @property
     def total_cost_usd(self) -> float:
         """
         Вычисляет общую стоимость всех вызовов в USD.
-        Формула: (prompt_tokens * input + completion_tokens * output) / 1_000_000
-        Кэшированные токены не вычитаются (cached токены стоят дешевле,
-        но модель считает их по полной в prompt_tokens).
-        Для учёта кэшированных токенов используйте реальные цены DeepSeek
-        с дисконтом на cached (input * 0.1).
+
+        Major #12-фикс: стоимость = cache_hit_tokens * price_cache_hit
+                             + cache_miss_tokens * price_input
+                             + completion_tokens * price_output
+        Все делится на 1_000_000.
+
+        При отсутствии split'а hit/miss (prompt_cache_hit_tokens == 0 и
+        prompt_cache_miss_tokens == 0) — fallback на старую формулу
+        (все prompt_tokens по цене input, без разделения).
         """
-        cost = (
-            self.prompt_tokens * self._input_price
-            + self.completion_tokens * self._output_price
-        ) / 1_000_000
+        if (self.prompt_cache_hit_tokens == 0
+                and self.prompt_cache_miss_tokens == 0):
+            # Fallback: нет split'а hit/miss → вся сумма по цене cache_miss
+            # (старое поведение — завышает стоимость, но сохраняет контракт).
+            cost = (
+                self.prompt_tokens * self._input_price
+                + self.completion_tokens * self._output_price
+            ) / 1_000_000
+        else:
+            # Новый расчёт: раздельный учёт hit и miss.
+            cost = (
+                self.prompt_cache_hit_tokens * self._input_cache_hit_price
+                + self.prompt_cache_miss_tokens * self._input_price
+                + self.completion_tokens * self._output_price
+            ) / 1_000_000
         return cost
 
     def add_response(self, data: Dict[str, Any]) -> None:
@@ -237,11 +255,22 @@ class DeepSeekClient:
         max_tokens: int = 4096,
         input_price: float = 0.0,
         output_price: float = 0.0,
+        input_cache_hit_price: float = 0.0,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        # Major #13-фикс: max_retries=0 и отрицательные нормализуются в 1 попытку.
+        # Явный warning, чтобы оператор понимал, что конфиг изменён.
+        if max_retries <= 0:
+            logger.warning(
+                "max_retries=%d — трактуется как 1 попытка. "
+                "LLM будет вызван ровно один раз (до первой ошибки). "
+                "Если нужны повторы — задайте max_retries: 1 или больше.",
+                max_retries,
+            )
+            max_retries = 1
         self.max_retries = max_retries
         self.temperature = temperature
         # max_tokens: лимит на completion. Батч (≤10 items, ~100-200 токенов/item)
@@ -254,8 +283,8 @@ class DeepSeekClient:
         # один HTTP-клиент на весь жизненный цикл — переиспользуем соединения
         self._http = httpx.Client(timeout=self.timeout, trust_env=True)  # подхватывает HTTP_PROXY / HTTPS_PROXY из окружения (Docker)
         self.usage_stats = UsageStats(model=model)
-        # Устанавливаем цены для расчёта стоимости
-        self.usage_stats.set_prices(input_price, output_price)
+        # Устанавливаем цены для расчёта стоимости (включая cache-hit)
+        self.usage_stats.set_prices(input_price, output_price, input_cache_hit_price)
 
     def close(self) -> None:
         """Закрывает HTTP-клиент. Идемпотентен."""
@@ -305,7 +334,7 @@ class DeepSeekClient:
         # после успешного ответа невозможен (return выходит из функции).
         _json_retry_done = False
 
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, max(1, self.max_retries) + 1):
             try:
                 response = self._post("/chat/completions", payload)
                 data: Any = response.json()
@@ -489,11 +518,8 @@ class DeepSeekClient:
                 time.sleep(backoff)
 
         # все попытки исчерпаны
-        if last_exc is None:
-            # max_retries == 0 — цикл не прошёл ни разу
-            raise LLMError(
-                f"LLM-вызов не выполнен: max_retries={self.max_retries} (цикл пропущен)"
-            )
+        # (ветка last_exc is None больше невозможна — max_retries <= 0
+        # нормализуется в 1 попытку выше по коду; self.max_retries >= 1)
         exc_desc = (
             f"таймаут ({type(last_exc).__name__})"
             if isinstance(last_exc, httpx.TimeoutException)

@@ -196,7 +196,7 @@ class LLMFilter:
             for model_name, prices in pricing_conf.items():
                 if not isinstance(prices, dict):
                     logger.warning(
-                        "llm.pricing[%r] должен быть словарём {input, output}, "
+                        "llm.pricing[%r] должен быть словарём {input, output, cache_hit}, "
                         "получено %s — запись пропущена",
                         model_name, type(prices).__name__,
                     )
@@ -204,27 +204,34 @@ class LLMFilter:
                 try:
                     in_price = float(prices.get("input", 0) or 0)
                     out_price = float(prices.get("output", 0) or 0)
+                    cache_hit_price = float(prices.get("cache_hit", 0) or 0)
                 except (TypeError, ValueError):
                     logger.warning(
-                        "llm.pricing[%r] содержит нечисловые цены (%r/%r) — "
-                        "запись пропущена",
+                        "llm.pricing[%r] содержит нечисловые цены "
+                        "(input=%r, output=%r, cache_hit=%r) — запись пропущена",
                         model_name, prices.get("input"), prices.get("output"),
+                        prices.get("cache_hit"),
                     )
                     continue
                 # Minor-фикс: NaN/inf-цена (YAML `.nan`) давала cost=nan →
                 # персистентный meta "nan" → cost-guard блокировал ВСЕ вызовы
                 # до смены дня. Такая запись бесполезна для расчёта — пропускаем
                 # её (модель останется без цен → сработает _warn_if_cost_guard_blind).
-                if not math.isfinite(in_price) or not math.isfinite(out_price):
+                # Добавлен cache_hit: при NaN стоимость cache-hit тоже станет nan.
+                if not (math.isfinite(in_price) and math.isfinite(out_price)
+                        and math.isfinite(cache_hit_price)):
                     logger.warning(
-                        "llm.pricing[%r] содержит не конечные цены (%r/%r) — "
-                        "запись пропущена (расход по модели не считается)",
+                        "llm.pricing[%r] содержит не конечные цены "
+                        "(input=%r, output=%r, cache_hit=%r) — запись пропущена "
+                        "(расход по модели не считается)",
                         model_name, prices.get("input"), prices.get("output"),
+                        prices.get("cache_hit"),
                     )
                     continue
                 self._pricing[model_name] = {
                     "input": in_price,
                     "output": out_price,
+                    "cache_hit": cache_hit_price,
                 }
         self._daily_cost_limit = self._parse_float_field(
             config_llm, "daily_cost_limit", 0.0
@@ -262,6 +269,7 @@ class LLMFilter:
                 max_tokens=self._parse_int_field(config_llm, "max_tokens", 4096),
                 input_price=prices.get("input", 0),
                 output_price=prices.get("output", 0),
+                input_cache_hit_price=prices.get("cache_hit", 0),
             )
 
         # Major 1-фикс: cost-guard активен, но цены модели неизвестны →
@@ -870,7 +878,11 @@ class LLMFilter:
 
     def _usage_totals(self) -> tuple:
         """
-        Возвращает (prompt_tokens, completion_tokens) из usage_stats клиента.
+        Возвращает (prompt_tokens, completion_tokens, cache_hit, cache_miss)
+        из usage_stats клиента.
+
+        Major #12-фикс: возвращаем split cache_hit/cache_miss, чтобы
+        _accumulate_daily_cost мог считать стоимость по двум ценам.
 
         Используется для вычисления дельты usage одного вызова:
         клиент аккумулирует usage ДО raise (в т.ч. finish_reason=length),
@@ -878,40 +890,58 @@ class LLMFilter:
         """
         stats = getattr(self._client, "usage_stats", None)
         if stats is None:
-            return (0, 0)
+            return (0, 0, 0, 0)
         try:
             return (
                 int(getattr(stats, "prompt_tokens", 0) or 0),
                 int(getattr(stats, "completion_tokens", 0) or 0),
+                int(getattr(stats, "prompt_cache_hit_tokens", 0) or 0),
+                int(getattr(stats, "prompt_cache_miss_tokens", 0) or 0),
             )
         except (TypeError, ValueError):
-            return (0, 0)
+            return (0, 0, 0, 0)
 
     def _record_usage(self, before: tuple) -> None:
         """Аккумулирует дневной расход по дельте usage с момента ``before``."""
         if not self._storage:
             return
         after = self._usage_totals()
+        # before = (prompt, completion, cache_hit, cache_miss)
+        # after = (prompt, completion, cache_hit, cache_miss)
         # usage_stats может быть сброшен между циклами → отрицательная дельта:
         # в этом случае считаем, что накоплено всё текущее значение.
         prompt_delta = after[0] - before[0]
         completion_delta = after[1] - before[1]
+        cache_hit_delta = after[2] - before[2]
+        cache_miss_delta = after[3] - before[3]
         if prompt_delta < 0:
             prompt_delta = after[0]
+            cache_hit_delta = after[2]
+            cache_miss_delta = after[3]
         if completion_delta < 0:
             completion_delta = after[1]
         if prompt_delta == 0 and completion_delta == 0:
             return
-        self._accumulate_daily_cost(prompt_delta, completion_delta)
+        self._accumulate_daily_cost(prompt_delta, completion_delta,
+                                     cache_hit_delta, cache_miss_delta)
 
     def _accumulate_daily_cost(
         self,
         prompt_tokens: int,
         completion_tokens: int,
+        cache_hit_tokens: int = 0,
+        cache_miss_tokens: int = 0,
     ) -> None:
         """
         Аккумулирует стоимость вызова в дневной счётчик.
         Цена берётся из _pricing по модели.
+
+        Major #12-фикс: стоимость = hit * price_hit + miss * price_input
+        + completion * price_output. При отсутствии split'а
+        (cache_hit_tokens == 0 AND cache_miss_tokens == 0) — fallback
+        на старую формулу (все prompt по цене input, завышая стоимость).
+        Это сохраняет обратную совместимость: старые модели без поддержки
+        cache-hit просто получают завышенную оценку (консервативный подход).
 
         M11-fix: fail-open при ошибках storage.
         — При ошибке чтения текущего cost (get_meta или float()) → выход БЕЗ
@@ -931,15 +961,28 @@ class LLMFilter:
         prices = self._pricing.get(self.model, {})
         input_price = prices.get("input", 0)   # USD per 1M tokens
         output_price = prices.get("output", 0)  # USD per 1M tokens
+        cache_hit_price = prices.get("cache_hit", 0)  # USD per 1M tokens
 
-        # Fallback: если модель не описана в pricing, берём цены,
-        # переданные в клиент при создании (input_price/output_price).
+        # Fallback: если модель не описана в pricing, берём цены
+        # из клиента (input_price/output_price/input_cache_hit_price).
         if not input_price and not output_price:
             stats = getattr(self._client, "usage_stats", None)
             input_price = float(getattr(stats, "_input_price", 0) or 0)
             output_price = float(getattr(stats, "_output_price", 0) or 0)
+            cache_hit_price = float(getattr(stats, "_input_cache_hit_price", 0) or 0)
 
-        cost = (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
+        # Major #12-фикс: раздельный расчёт hit/miss.
+        # Если нет split'а — fallback на старую формулу (консервативно завышает).
+        if cache_hit_tokens == 0 and cache_miss_tokens == 0:
+            # Fallback: все prompt_tokens считаем по цене input (завышено, но
+            # безопасно — консервативная оценка, не пропускаем дорогие вызовы).
+            cost = (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
+        else:
+            cost = (
+                cache_hit_tokens * cache_hit_price
+                + cache_miss_tokens * input_price
+                + completion_tokens * output_price
+            ) / 1_000_000
 
         # M11-fix: fail-open на чтение + isfinite после float()
         try:

@@ -255,16 +255,18 @@ llm:
   # Раскомментируйте и заполните только для override; иначе используется код.
   # system_prompt: ""
   # Pricing: USD per 1M tokens (DeepSeek-V4.1-Flash, verified from official price page, effective 10.09.2026)
-  # Структура: {input, output} — flat (peak/off-peak не поддерживается cost-guard'ом filter.py).
+  # Major #12: структура расширена — {input, output, cache_hit}.
+  # Стоимость считается как: hit*cache_hit + miss*input + completion*output.
+  # При отсутствии split'а hit/miss в ответе API — fallback на старую формулу
+  # (все prompt_tokens по цене input — завышает стоимость, но сохраняет контракт).
+  # NOTE: peak/off-peak не поддерживается (cost-guard использует off-peak цены).
   # Верифицированные данные для DeepSeek-V4.1-Flash:
   #   Off-Peak: cache_hit=$0.003, cache_miss=$0.15, output=$0.60
   #   Peak:     cache_hit=$0.006, cache_miss=$0.30, output=$1.20
-  # NOTE: cost-guard (_accumulate_daily_cost) использует {input, output} без разделения
-  # peak/off-peak, поэтому ниже — off-peak цены (они же фактически рабочие при off-peak).
-  # deepseek-v4-pro: прайс-картинка покрывает только Flash — цена не верифицирована.
+  # deepseek-v4-pro: cache_hit не верифицирована (прайс-картинка покрывает только Flash).
   pricing:
-    deepseek-flash:  {input: 0.15, output: 0.60}
-    deepseek-v4-pro: {input: 0.50, output: 2.00}   # v4-pro: не верифицировано, прайс-картинка покрывает только Flash
+    deepseek-flash:  {input: 0.15, output: 0.60, cache_hit: 0.003}
+    deepseek-v4-pro: {input: 0.50, output: 2.00, cache_hit: 0.003}   # placeholder: не верифицировано
   # Daily cost limit per model (USD per UTC day); 0 = disabled
   # Items exceeding the limit remain pending and retry in the next cycle
   daily_cost_limit: 0.50
