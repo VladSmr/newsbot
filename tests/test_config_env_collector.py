@@ -1220,3 +1220,576 @@ class TestCollectorInvalidLinkIsolation:
 
 
 # --
+# ── Major-1: broken <link> (ValueError from urljoin) — entire feed NOT lost ──
+
+
+class TestCollectorBrokenLinkIsolation:
+    """
+    Major-1-фикс: urljoin на битом <link> бросает ValueError из urlsplit.
+    Раньше: исключение вылетало из _fetch_feed в collect(), терялся весь фид.
+    Теперь: try/except начинается ПЕРЕД urljoin, ValueError ловится,
+    entry пропускается с warning, остальные entries обрабатываются.
+    """
+
+    def test_broken_urljoin_does_not_lose_entire_feed(self, caplog):
+        """Фид из 3 entries, у одного битый <link> → 2 собраны, warning есть."""
+        import logging
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        # RSS: entry1 (ok), entry2 (broken link → ValueError in urljoin),
+        # entry3 (ok).  Broken link: urljoin("http://feed/", "http://[::1")
+        # → ValueError: netloc incorrectly formatted with IP literal.
+        body = (
+            b'<?xml version="1.0"?><rss version="2.0"><channel>'
+            b'<item><title>Item OK 1</title><link>http://example.com/news/1</link></item>'
+            b'<item><title>Item BROKEN</title><link>http://[::1</link></item>'
+            b'<item><title>Item OK 2</title><link>http://example.com/news/2</link></item>'
+            b'</channel></rss>'
+        )
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(200, content=body)
+        )
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "test", "url": "http://feed/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            with caplog.at_level(logging.WARNING, logger="newsbot.collector"):
+                _, result = next(collector.collect())
+
+            # Фид обработан, не потерян
+            assert result.ok is True, f"expected ok=True, got {result.ok}"
+            # 2 из 3 entries собраны
+            assert len(result.items) == 2, (
+                f"Expected 2 items (broken skipped), got {len(result.items)}: "
+                f"{[it.title for it in result.items]}"
+            )
+            titles = {it.title for it in result.items}
+            assert "Item OK 1" in titles
+            assert "Item OK 2" in titles
+            # Warning о пропущенном entry
+            assert any("пропущен entry" in r.getMessage() for r in caplog.records), (
+                f"Expected warning about skipped entry, got: "
+                f"{[r.getMessage() for r in caplog.records]}"
+            )
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_broken_link_urljoin_valueerror_caught(self):
+        """ValueError из urljoin именно ловится (не вылетает из collect())."""
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        # urljoin("http://feed/", "http://[::1") → ValueError: netloc incorrectly
+        # formatted with IP literal (Python 3.8).
+        body = (
+            b'<?xml version="1.0"?><rss version="2.0"><channel>'
+            b'<item><title>Only This</title><link>http://[::1</link></item>'
+            b'</channel></rss>'
+        )
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(200, content=body)
+        )
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "broken", "url": "http://feed/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            # НЕ исключение — collect() вернул результат
+            assert result.ok is True, "broken link feed should return ok=True"
+            assert result.items == [], "broken entry should be skipped, items empty"
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+
+# ── Minor-1: retry logic — timeout + 502/503/504 ───────────────────────────────
+
+
+class TestCollectorRetry:
+    """
+    Minor-1-фикс: один retry с backoff для идемпотентного GET.
+    Retry только на таймаутах и 502/503/504, бюджет не превышает
+    FEED_DEADLINE_SEC. НЕ retry'ятся: 404, 403, 500, etc.
+    """
+
+    def test_timeout_then_retry_succeeds(self):
+        """Таймаут первого запроса → retry → успех."""
+        import httpx
+        import time
+        from newsbot.collector import FeedCollector
+
+        body = (
+            b'<?xml version="1.0"?><rss version="2.0"><channel>'
+            b'<item><title>Retry Success</title>'
+            b'<link>http://example.com/news/1</link></item>'
+            b'</channel></rss>'
+        )
+
+        attempts = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            attempts.append(time.time())
+            if len(attempts) == 1:
+                # Первый запрос — имитируем таймаут
+                raise httpx.TimeoutException("simulated timeout")
+            return httpx.Response(200, content=body)
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "retry_feed", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is True, f"expected ok=True after retry, got {result.ok}"
+            assert len(result.items) == 1
+            assert len(attempts) == 2, f"Expected 2 attempts, got {len(attempts)}"
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_502_then_retry_succeeds(self):
+        """502 на первом запросе → retry → успех."""
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        body = (
+            b'<?xml version="1.0"?><rss version="2.0"><channel>'
+            b'<item><title>Retry 502</title>'
+            b'<link>http://example.com/news/1</link></item>'
+            b'</channel></rss>'
+        )
+
+        attempt_count = [0]
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            attempt_count[0] += 1
+            if attempt_count[0] == 1:
+                return httpx.Response(502, content=b"Bad Gateway")
+            return httpx.Response(200, content=body)
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "retry_502", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is True, f"expected ok=True after 502-retry, got {result.ok}"
+            assert attempt_count[0] == 2
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_404_not_retried(self):
+        """404 — не retry'ится, сразу ok=False."""
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        attempt_count = [0]
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            attempt_count[0] += 1
+            return httpx.Response(404, content=b"Not Found")
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "not_found", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is False, f"expected ok=False for 404, got {result.ok}"
+            assert attempt_count[0] == 1, "404 should NOT be retried"
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_retry_exhausted_timeout_returns_ok_false(self):
+        """Оба таймаута неуспешны → ok=False."""
+        import httpx
+        from newsbot.collector import FeedCollector
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            raise httpx.TimeoutException("always timeout")
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "timeout_feed", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is False
+            assert result.items == []
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+
+# ── Minor-3: tags caps ([:50], each [:64]) ────────────────────────────────────
+
+
+class TestCollectorTagsCap:
+    """Minor-3-фикс: tags_list[:50], каждый term[:64]."""
+
+    def test_tags_capped_to_50(self):
+        """Более 50 тегов — обрезаются до 50."""
+        import httpx
+        import json
+        from newsbot.collector import FeedCollector
+
+        items = "".join(
+            f"<category>term_{i}</category>"
+            for i in range(60)
+        )
+        body = (
+            f'<?xml version="1.0"?><rss version="2.0"><channel>'
+            f'<item><title>Tag Test</title>'
+            f'<link>http://example.com/news/1</link>'
+            f'{items}'
+            f'</item></channel></rss>'
+        ).encode()
+
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(200, content=body)
+        )
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "tags_test", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is True
+            assert len(result.items) == 1
+            tags = json.loads(result.items[0].tags)
+            assert len(tags) == 50, f"Expected 50 tags, got {len(tags)}"
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+    def test_each_tag_capped_to_64(self):
+        """Каждый тег длиннее 64 симв. — обрезается."""
+        import httpx
+        import json
+        from newsbot.collector import FeedCollector
+
+        long_tag = "X" * 100
+        body = (
+            f'<?xml version="1.0"?><rss version="2.0"><channel>'
+            f'<item><title>Long Tag Test</title>'
+            f'<link>http://example.com/news/1</link>'
+            f'<category>{long_tag}</category>'
+            f'</item></channel></rss>'
+        ).encode()
+
+        transport = httpx.MockTransport(
+            lambda req: httpx.Response(200, content=body)
+        )
+        client = httpx.Client(transport=transport)
+        collector = FeedCollector([{"name": "long_tag_test", "url": "http://test/rss"}])
+        collector._client.close()
+        collector._client = client
+
+        try:
+            _, result = next(collector.collect())
+            assert result.ok is True
+            assert len(result.items) == 1
+            tags = json.loads(result.items[0].tags)
+            assert len(tags) == 1
+            assert len(tags[0]) == 64, f"Expected 64 chars, got {len(tags[0])}"
+            assert tags[0] == "X" * 64
+        finally:
+            client.close()
+            collector._client = httpx.Client(timeout=15)
+
+
+# ── Major-2: database.retry_threshold_sec string coercion ────────────────────
+
+
+class TestConfigDatabaseRetryThreshold:
+    """Major-2-фикс: retry_threshold_sec как строка "60" → приводится к int."""
+
+    def test_retry_threshold_string_coerced(self, tmp_path):
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text('database:\n  retry_threshold_sec: "60"\n', encoding="utf-8")
+
+        cfg = load_config(str(cfg_file))
+        assert cfg["database"]["retry_threshold_sec"] == 60
+        assert isinstance(cfg["database"]["retry_threshold_sec"], int)
+
+    def test_retry_threshold_abc_falls_back(self, tmp_path, caplog):
+        import logging
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("database:\n  retry_threshold_sec: abc\n", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["database"]["retry_threshold_sec"] == 60
+        assert any("retry_threshold_sec" in r.getMessage() for r in caplog.records)
+
+    def test_database_numeric_fields_coerced(self, tmp_path):
+        """max_retries, recovery_new_limit, window_days, max_per_location — int."""
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "database:\n"
+            "  max_retries: '5'\n"
+            "  recovery_new_limit: '300'\n"
+            "dedup:\n"
+            "  window_days: '2'\n"
+            "  max_seen_titles: '1000'\n"
+            "  llm_recent_limit: '15'\n"
+            "digest:\n"
+            "  max_per_location: '3'\n",
+            encoding="utf-8",
+        )
+
+        cfg = load_config(str(cfg_file))
+        assert isinstance(cfg["database"]["max_retries"], int)
+        assert isinstance(cfg["database"]["recovery_new_limit"], int)
+        assert isinstance(cfg["dedup"]["window_days"], int)
+        assert isinstance(cfg["dedup"]["max_seen_titles"], int)
+        assert isinstance(cfg["dedup"]["llm_recent_limit"], int)
+        assert isinstance(cfg["digest"]["max_per_location"], int)
+        assert cfg["database"]["max_retries"] == 5
+        assert cfg["dedup"]["window_days"] == 2
+
+
+# ── Major-3: logging.level validation ─────────────────────────────────────────
+
+
+class TestSetupLoggingLevelValidation:
+    """Major-3-фикс: level: null/int/INF0 → warning + INFO, не AttributeError."""
+
+    def test_level_null_no_crash_with_warning(self, tmp_path, capsys):
+        """level: null → warning + INFO (не AttributeError)."""
+        import logging
+        from newsbot.log import setup_logging
+
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            # Не падаем с AttributeError
+            setup_logging({"level": None})
+            # Уровень установлен в INFO (дефолт)
+            assert root.level == logging.INFO
+            # Warning записан в stderr
+            captured = capsys.readouterr().err
+            assert "level" in captured.lower() or "INFO" in captured
+        finally:
+            for h in root.handlers[:]:
+                root.removeHandler(h)
+            root.handlers = saved_handlers
+
+    def test_level_int_no_crash_with_warning(self, tmp_path, capsys):
+        """level: 123 (int) → warning + INFO."""
+        import logging
+        from newsbot.log import setup_logging
+
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            setup_logging({"level": 123})
+            assert root.level == logging.INFO
+            captured = capsys.readouterr().err
+            assert "level" in captured.lower() or "INFO" in captured
+        finally:
+            for h in root.handlers[:]:
+                root.removeHandler(h)
+            root.handlers = saved_handlers
+
+    def test_level_typo_inf0_with_warning(self, tmp_path, capsys):
+        """level: "INF0" (опечатка) → warning + INFO (не тихий fallback)."""
+        import logging
+        from newsbot.log import setup_logging
+
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            setup_logging({"level": "INF0"})
+            assert root.level == logging.INFO
+            captured = capsys.readouterr().err
+            assert "INF0" in captured, f"Expected warning about INF0 in stderr: {captured}"
+        finally:
+            for h in root.handlers[:]:
+                root.removeHandler(h)
+            root.handlers = saved_handlers
+
+    def test_level_debug_lowercase_works(self, tmp_path):
+        """level: "debug" (нижний регистр) → DEBUG."""
+        import logging
+        from newsbot.log import setup_logging
+
+        root = logging.getLogger()
+        saved_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            setup_logging({"level": "debug"})
+            assert root.level == logging.DEBUG
+        finally:
+            for h in root.handlers[:]:
+                root.removeHandler(h)
+            root.handlers = saved_handlers
+
+
+# ── Minor-4: userinfo in URL sanitization ─────────────────────────────────────
+
+
+class TestSanitizerUserinfo:
+    """Minor-4-фикс: userinfo (scheme://user:pass@host) маскируется."""
+
+    def test_userinfo_in_url_masked(self):
+        """scheme://user:pass@host → scheme://***@host."""
+        from newsbot.log import _sanitize
+
+        result = _sanitize("URL: http://admin:secret123@example.com/api")
+        assert "admin" not in result
+        assert "secret123" not in result
+        assert "***" in result
+        assert "example.com" in result
+
+    def test_userinfo_without_port_masked(self):
+        """<URL_WITH_CREDS_5> → http://***@host."""
+        from newsbot.log import _sanitize
+
+        result = _sanitize("Feed: https://bot111:Tok22222222@example.com/rss")
+        assert "bot111" not in result
+        assert "Tok22222222" not in result
+        assert "***" in result
+
+    def test_telegram_token_still_masked(self):
+        """Telegram-токен вырезается (регресс-тест)."""
+        from newsbot.log import _sanitize
+
+        token = "bot123456:ABCDefgh1234567890abcdefgh"
+        result = _sanitize(f"Token: {token}")
+        assert "ABCDefgh1234567890abcdefgh" not in result
+        assert "***REDACTED***" in result
+
+    def test_deepseek_key_still_masked(self):
+        """DeepSeek-api-key вырезается (регресс-тест)."""
+        from newsbot.log import _sanitize
+
+        key = "sk-" + "a" * 30
+        result = _sanitize(f"Key: {key}")
+        assert key not in result
+        assert "***REDACTED***" in result
+
+
+# ── Minor-7: atomic env write ─────────────────────────────────────────────────
+
+
+class TestEnvAtomicWrite:
+    """Minor-7-фикс: _write_env пишет в .env.tmp + os.replace()."""
+
+    def test_write_env_creates_file(self, tmp_path):
+        import newsbot.env
+
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = tmp_path / ".env"
+
+        try:
+            newsbot.env._write_env("TEST_KEY", "test_value")
+            content = (tmp_path / ".env").read_text(encoding="utf-8")
+            assert "TEST_KEY=test_value" in content
+            assert (tmp_path / ".env.tmp").exists() is False, ".env.tmp should not remain"
+        finally:
+            newsbot.env._ENV_PATH = None
+            newsbot.env._cache = None
+
+    def test_write_env_overwrites_existing_key(self, tmp_path):
+        import newsbot.env
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("EXISTING=old_value\n", encoding="utf-8")
+
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = env_file
+
+        try:
+            newsbot.env._write_env("EXISTING", "new_value")
+            content = env_file.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            matching = [l for l in lines if l.startswith("EXISTING=")]
+            assert len(matching) == 1, f"Expected 1 EXISTING line, got {matching}"
+            assert "new_value" in matching[0]
+            assert "old_value" not in content
+        finally:
+            newsbot.env._ENV_PATH = None
+            newsbot.env._cache = None
+
+    def test_tmp_file_cleaned_up(self, tmp_path):
+        """После успешной записи .env.tmp не остаётся."""
+        import newsbot.env
+
+        newsbot.env._set_env_project_root(tmp_path)
+        newsbot.env._cache = None
+        newsbot.env._ENV_PATH = tmp_path / ".env"
+
+        try:
+            newsbot.env._write_env("CLEANUP", "check")
+            assert not (tmp_path / ".env.tmp").exists()
+        finally:
+            newsbot.env._ENV_PATH = None
+            newsbot.env._cache = None
+
+
+# ── Minor-8: naive datetime → ValueError ──────────────────────────────────────
+
+
+class TestOffpeakNaiveDatetime:
+    """Minor-8-фикс: naive datetime → ValueError (явный, не молчаливый)."""
+
+    def test_is_deepseek_peak_raises_on_naive(self):
+        """is_deepseek_peak с naive datetime → ValueError."""
+        from datetime import datetime
+        from newsbot.offpeak import is_deepseek_peak
+
+        naive_dt = datetime(2026, 1, 5, 7, 30, 0)  # пн 07:30 без tz
+        with pytest.raises(ValueError, match="tz-aware"):
+            is_deepseek_peak(naive_dt)
+
+    def test_is_llm_allowed_raises_on_naive(self):
+        """is_llm_allowed_now с naive datetime → ValueError."""
+        from datetime import datetime
+        from newsbot.offpeak import is_llm_allowed_now
+
+        naive_dt = datetime(2026, 1, 5, 12, 0, 0)  # пн 12:00 без tz
+        with pytest.raises(ValueError, match="tz-aware"):
+            is_llm_allowed_now(off_peak_only=True, now_utc=naive_dt)
+
+    def test_tz_aware_still_works(self):
+        """tz-aware datetime — работает как прежде (регресс-тест)."""
+        from datetime import datetime, timezone
+        from newsbot.offpeak import is_deepseek_peak
+
+        # Пн 01:30 UTC → пик
+        peak_dt = datetime(2026, 1, 5, 1, 30, 0, tzinfo=timezone.utc)
+        assert is_deepseek_peak(peak_dt) is True
+
+        # Пн 13:00 UTC → off-peak
+        offpeak_dt = datetime(2026, 1, 5, 13, 0, 0, tzinfo=timezone.utc)
+        assert is_deepseek_peak(offpeak_dt) is False

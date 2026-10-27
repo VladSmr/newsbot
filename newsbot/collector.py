@@ -335,55 +335,114 @@ class FeedCollector:
                 # операция, сетевого бюджета не тратит
                 pool=connect_timeout,
             )
-            with self._client.stream("GET", url, timeout=request_timeout) as resp:
-                # Явная проверка deadline ПОСЛЕ установки соединения:
-                # редирект-цепочка могла съесть бюджет ещё до тела ответа.
-                if time.monotonic() > deadline:
-                    logger.warning(
-                        "[%s] FEED_DEADLINE_SEC=%d превышен при установке "
-                        "соединения (редиректы) — фид пропущен: %s",
-                        name, FEED_DEADLINE_SEC, url,
-                    )
-                    return FeedResult(ok=False, items=[])
-                resp.raise_for_status()
-                cl_str = resp.headers.get("content-length", "")
-                try:
-                    cl = int(cl_str)
-                    if cl > MAX_FEED_BYTES * 3:
-                        # Даже сжимаемый фид в 30 MB — подозрительно, отказ без итераций.
-                        logger.warning("[%s] Content-Length %d >> limit %d, пропускаем",
-                                       name, cl, MAX_FEED_BYTES)
-                        return FeedResult(ok=False, items=[])
-                except (ValueError, TypeError):
-                    pass  # Content-Length нет или невалиден
 
-                # Читаем поток, считая РАСПАКОВАННЫЕ байты (httpx декодирует автоматически).
-                # resp.iter_bytes() — декодированные куски; bytearray растёт по распакованному размеру.
-                buf = bytearray()
-                for chunk in resp.iter_bytes(chunk_size=65536):
-                    buf.extend(chunk)
-                    if len(buf) > MAX_FEED_BYTES:
-                        logger.warning("[%s] Feed too large (%d bytes): %s",
-                                       name, len(buf), url)
-                        return FeedResult(ok=False, items=[])
-                    # M1: проверка deadline ВНУТРИ чтения — обрывает
-                    # медленный сервер (иначе iter_bytes() бесконечен).
-                    if time.monotonic() > deadline:
-                        logger.warning(
-                            "[%s] FEED_DEADLINE_SEC=%d превышен при чтении тела "
-                            "(%d байт получено) — фид пропущен: %s",
-                            name, FEED_DEADLINE_SEC, len(buf), url,
+            # Minor-фикс: один retry с backoff для идемпотентного GET.
+            # Retry только на таймаутах и 502/503/504 — прочие HTTP-ошибки
+            # (404, 403, 500) не retry'ятся (фид не существует или сервер
+            # не готов). Retry-бюджет не превышает остаток FEED_DEADLINE_SEC.
+            raw = None
+            retry_reason = None
+            for attempt in range(2):  # 0 = first, 1 = retry
+                try:
+                    with self._client.stream("GET", url, timeout=request_timeout) as resp:
+                        # Явная проверка deadline ПОСЛЕ установки соединения:
+                        # редирект-цепочка могла съесть бюджет ещё до тела ответа.
+                        if time.monotonic() > deadline:
+                            logger.warning(
+                                "[%s] FEED_DEADLINE_SEC=%d превышен при установке "
+                                "соединения (редиректы) — фид пропущен: %s",
+                                name, FEED_DEADLINE_SEC, url,
+                            )
+                            return FeedResult(ok=False, items=[])
+                        resp.raise_for_status()
+                        cl_str = resp.headers.get("content-length", "")
+                        try:
+                            cl = int(cl_str)
+                            if cl > MAX_FEED_BYTES * 3:
+                                # Даже сжимаемый фид в 30 MB — подозрительно, отказ без итераций.
+                                logger.warning("[%s] Content-Length %d >> limit %d, пропускаем",
+                                               name, cl, MAX_FEED_BYTES)
+                                return FeedResult(ok=False, items=[])
+                        except (ValueError, TypeError):
+                            pass  # Content-Length нет или невалиден
+
+                        # Читаем поток, считая РАСПАКОВАННЫЕ байты (httpx декодирует автоматически).
+                        # resp.iter_bytes() — декодированные куски; bytearray растёт по распакованному размеру.
+                        buf = bytearray()
+                        for chunk in resp.iter_bytes(chunk_size=65536):
+                            buf.extend(chunk)
+                            if len(buf) > MAX_FEED_BYTES:
+                                logger.warning("[%s] Feed too large (%d bytes): %s",
+                                               name, len(buf), url)
+                                return FeedResult(ok=False, items=[])
+                            # M1: проверка deadline ВНУТРИ чтения — обрывает
+                            # медленный сервер (иначе iter_bytes() бесконечен).
+                            if time.monotonic() > deadline:
+                                logger.warning(
+                                    "[%s] FEED_DEADLINE_SEC=%d превышен при чтении тела "
+                                    "(%d байт получено) — фид пропущен: %s",
+                                    name, FEED_DEADLINE_SEC, len(buf), url,
+                                )
+                                return FeedResult(ok=False, items=[])
+                        # M1: страховка после stream (медленное закрытие/финализация).
+                        if time.monotonic() > deadline:
+                            logger.warning(
+                                "[%s] FEED_DEADLINE_SEC=%d превышен после чтения тела "
+                                "(%d байт) — фид пропущен: %s",
+                                name, FEED_DEADLINE_SEC, len(buf), url,
+                            )
+                            return FeedResult(ok=False, items=[])
+                        raw = bytes(buf)
+                        break  # успех — выходим из retry-цикла
+                except httpx.TimeoutException as e:
+                    if attempt == 0:
+                        # Первый таймаут — пробуем retry с пересчётом таймаутов.
+                        # Логируем до retry, чтобы в логе было понятно.
+                        logger.debug(
+                            "[%s] Таймаут (attempt 1, connect %.1f с, read %.1f с), "
+                            "пробуем retry",
+                            name, connect_timeout, read_timeout,
                         )
-                        return FeedResult(ok=False, items=[])
-                # M1: страховка после stream (медленное закрытие/финализация).
-                if time.monotonic() > deadline:
-                    logger.warning(
-                        "[%s] FEED_DEADLINE_SEC=%d превышен после чтения тела "
-                        "(%d байт) — фид пропущен: %s",
-                        name, FEED_DEADLINE_SEC, len(buf), url,
-                    )
-                    return FeedResult(ok=False, items=[])
-                raw = bytes(buf)
+                        # Пересчитываем бюджет: мог остаться небольшой остаток
+                        remaining = max(0.1, deadline - time.monotonic())
+                        if remaining < 2.0:
+                            # Не хватает бюджета даже на retry — выходим сразу
+                            raise
+                        retry_reason = "timeout"
+                        # Пересчёт таймаутов для retry: делим остаток на хопы,
+                        # backoff = 0.5 с. Бюджет сохраняется (не увеличивается).
+                        hop_budget_retry = remaining / (MAX_REDIRECTS + 1)
+                        phase_budget_retry = min(float(FETCH_TIMEOUT), hop_budget_retry / 2.0)
+                        connect_timeout_retry = max(
+                            MIN_PHASE_TIMEOUT,
+                            min(CONNECT_TIMEOUT_CAP, phase_budget_retry),
+                        )
+                        read_timeout_retry = max(MIN_PHASE_TIMEOUT, phase_budget_retry)
+                        request_timeout = httpx.Timeout(
+                            connect=connect_timeout_retry,
+                            read=read_timeout_retry,
+                            write=read_timeout_retry,
+                            pool=connect_timeout_retry,
+                        )
+                        import time as _time
+                        _time.sleep(0.5)  # backoff перед retry
+                        continue
+                    else:
+                        # Второй таймаут — всё, retry исчерпан
+                        raise
+                except httpx.HTTPStatusError as e:
+                    # Retry только на 502/503/504 — временные ошибки upstream.
+                    if e.response.status_code in (502, 503, 504) and attempt == 0:
+                        remaining = max(0.1, deadline - time.monotonic())
+                        if remaining >= 2.0:
+                            logger.debug("[%s] HTTP %d, пробуем retry", name, e.response.status_code)
+                            import time as _time
+                            _time.sleep(0.5)
+                            continue
+                    raise
+            if raw is None:
+                # теоретически невозможно, но на всякий случай
+                return FeedResult(ok=False, items=[])
         except httpx.TimeoutException:
             # Логируем ФАКТИЧЕСКИЕ per-phase таймауты, а не константу FETCH_TIMEOUT:
             # при почти исчерпанном бюджете они могут быть 1-4 с, и лог
@@ -495,43 +554,48 @@ class FeedCollector:
                              getattr(entry, "title", "")[:50])
                 continue
 
-            # M4b-фикс: относительные ссылки (/path, ../page) резолвятся
-            # через urljoin относительно feed_url (параметр `url` функции
-            # _fetch_feed). Абсолютные URL не меняются.
-            from urllib.parse import urljoin
-            resolved_link = urljoin(url, link)
-
-            # M4b-фикс: требуем валидный http(s)+host. Невалидная ссылка
-            # (пустой host, кривой URL) — WARNING и item пропускается.
-            if not self._validate_url(resolved_link):
-                logger.warning(
-                    "[%s] пропущен entry с невалидной ссылкой: %s  (feed: %s)",
-                    name, resolved_link[:200], url,
-                )
-                continue
-
-            # URL normalization (tracking-параметры, lowercase, sort, fragment).
-            # Применяется ДО создания NewsItem — нормализованный URL сохраняется
-            # в БД и используется при дедупликации (is_duplicate + UNIQUE index).
-            link_normalized = normalize_url(resolved_link)
-
-            # m-3: слишком длинный нормализованный URL отбрасывается —
-            # обрезка давала бы мёртвую ссылку и коллизии UNIQUE-индекса.
-            if len(link_normalized) > MAX_URL_CHARS:
-                logger.warning(
-                    "[%s] пропущен entry с link длиннее %d симв.: %s  (feed: %s)",
-                    name, MAX_URL_CHARS, link_normalized[:200], url,
-                )
-                continue
-
             # P2-фикс: ошибка конвертации ОДНОГО entry (кривой _strip_html,
-            # не-str term в tags, битый title в extract_location) не должна
-            # вылетать из генератора collect() и убивать остальные фиды цикла.
+            # не-str term в tags, битый title в extract_location, битый <link>
+            # вызывающий ValueError в urljoin) не должна вылетать из генератора
+            # collect() и убивать остальные фиды цикла.
+            # Minor-фикс: try/except начинается ПЕРЕД urljoin/normalize_url.
+            # urljoin на битом <link> (http://[::1], незакрытая '[') бросает
+            # ValueError из urlsplit — без этой обёртки исключение вылетало
+            # из _fetch_feed в collect() и терялся весь фид.
             try:
+                # M4b-фикс: относительные ссылки (/path, ../page) резолвятся
+                # через urljoin относительно feed_url (параметр `url` функции
+                # _fetch_feed). Абсолютные URL не меняются.
+                from urllib.parse import urljoin
+                resolved_link = urljoin(url, link)
+
+                # M4b-фикс: требуем валидный http(s)+host. Невалидная ссылка
+                # (пустой host, кривой URL) — WARNING и item пропускается.
+                if not self._validate_url(resolved_link):
+                    logger.warning(
+                        "[%s] пропущен entry с невалидной ссылкой: %s  (feed: %s)",
+                        name, resolved_link[:200], url,
+                    )
+                    continue
+
+                # URL normalization (tracking-параметры, lowercase, sort, fragment).
+                # Применяется ДО создания NewsItem — нормализованный URL сохраняется
+                # в БД и используется при дедупликации (is_duplicate + UNIQUE index).
+                link_normalized = normalize_url(resolved_link)
+
+                # m-3: слишком длинный нормализованный URL отбрасывается —
+                # обрезка давала бы мёртвую ссылку и коллизии UNIQUE-индекса.
+                if len(link_normalized) > MAX_URL_CHARS:
+                    logger.warning(
+                        "[%s] пропущен entry с link длиннее %d симв.: %s  (feed: %s)",
+                        name, MAX_URL_CHARS, link_normalized[:200], url,
+                    )
+                    continue
+
                 news_item = _entry_to_news_item(entry, name, link_normalized, lang)
             except Exception as e:
                 logger.warning(
-                    "[%s] пропущен entry (ошибка конвертации): %s", name, e,
+                    "[%s] пропущен entry (ошибка обработки ссылки): %s", name, e,
                 )
                 continue
             if news_item is not None:
@@ -606,14 +670,16 @@ def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Opt
     published_str = published_str[:MAX_PUBLISHED_CHARS]
     pub_parsed = _parse_pubdate_utc(entry)
 
-    # Читаем <category> теги из фида
+    # Читаем <category> теги из фида.
+    # Minor-фикс: капим (a) общее число тегов до 50 и (b) каждый term до 64 симв.
     raw_tags = getattr(entry, "tags", []) or []
     tags_list = []
-    for t in raw_tags:
+    for t in raw_tags[:50]:
         term = getattr(t, "term", "") or ""
         if not isinstance(term, str):
             # не-str term: json.dumps споткнулся бы, а падать из-за тега нельзя
             term = str(term)
+        term = term[:64]
         if term:
             tags_list.append(term)
     tags_str = json.dumps(tags_list) if tags_list else None

@@ -17,11 +17,11 @@ state-машина:
 
   NOTE: штатный дедуп — навсегда (URL хранится, пока существует запись).
   Автоочистка: purge_* процедуры удаляют записи старше retention (default 1 день).
-  Для больших таблиц (сотни тысяч строк) рекомендуется периодический
-  PRAGMA incremental_vacuum для высвобождения pages — штатный VACUUM заблокирует
-  БД на время перезаписи. auto_vacuum=INCREMENTAL выставляется при создании БД.
-  На существующих БД с auto_vacuum=FULL рекомендуется ручной переход:
-  PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum — без блокировки записи.
+  Minor-6-фикс: PRAGMA auto_vacuum=INCREMENTAL выставляется в _init_db_body
+  ДО первого CREATE TABLE. Для больших таблиц (сотни тысяч строк) это
+  высвобождает pages без блокировки записи. На существующих БД с
+  auto_vacuum=FULL рекомендуется ручной переход:
+  PRAGMA wal_checkpoint(TRUNCATE); PRAGMA incremental_vacuum — без блокировки.
 
 INSERT OR IGNORE + UNIQUE-констрейнты защищают от дубликатов.
 """
@@ -173,9 +173,20 @@ class Storage:
         """
         Контекстный менеджер транзакции.
         Устраняет хрупкие ROLLBACK-в-except.
+
+        Minor-5-фикс: BEGIN IMMEDIATE устанавливает write-lock СРАЗУ
+        (вместо deferred lock), предотвращая «database is locked» от
+        конкурентных writers. Реентерабельность: если conn.in_transaction,
+        значит мы уже внутри транзакции (nested call) — возвращаем conn
+        без повторного BEGIN, yield'им наружу.
         """
         conn = self._connect()
-        conn.execute("BEGIN")
+        # Minor-5: reentrancy guard. Nested _tx() вызывается когда conn
+        # уже имеет активную транзакцию → in_transaction=True.
+        if conn.in_transaction:
+            yield conn
+            return
+        conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
             conn.commit()
@@ -242,7 +253,14 @@ class Storage:
             raise
 
     def _init_db_body(self, conn: sqlite3.Connection) -> None:
+        # Minor-6-фикс: auto_vacuum=INCREMENTAL ДО первого CREATE TABLE.
+        # Этот PRAGMA применяется только при создании новой БД (таблиц ещё нет).
+        # Для существующих БД его эффект зависит от текущего режима:
+        # INCREMENTAL: работает сразу.
+        # FULL/NONE: PRAGMA меняется, но высвобождение pages произойдёт
+        # только после PRAGMA incremental_vacuum (рекомендация в docstring).
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         current_version = self._current_version()
 
         # ── 0. Downgrade guard ──────────────────────────────────────────────
@@ -356,8 +374,20 @@ class Storage:
         ):
             try:
                 conn.execute(stmt)
-            except sqlite3.OperationalError:
-                pass  # already exists или конкурентная миграция
+            except sqlite3.OperationalError as e:
+                # Minor-2: логируем как warning, кроме benign "already exists".
+                # "database is locked" и "disk I/O error" — реальные проблемы,
+                # которые раньше молча глотались, а PRAGMA user_version при
+                # этом ставился безусловно.
+                err_str = str(e).lower()
+                if "already exists" in err_str or "duplicate column" in err_str:
+                    pass  # benign
+                else:
+                    logger.warning(
+                        "CREATE TABLE пропущен (OperationalError): %s. "
+                        "SQL: %.80s",
+                        e, stmt[:80],
+                    )
 
         # ── 3. Индексы ──
         self._create_indexes(conn)

@@ -10,25 +10,34 @@ from pathlib import Path
 
 from newsbot.version import __version__
 
+logger = logging.getLogger("newsbot.log")
+
 
 # ── Фильтр токена из логов (belt-and-suspenders) ──────────────────
 # T4-фикс: три паттерна:
 #   1. bot<digits>:<secret>  — Telegram с префиксом bot
 #   2. <digits>:<secret>     — голый токен без префикса (secret ≥15 символов)
 #   3. sk-[A-Za-z0-9]{16,}   — DeepSeek API key (sk- + ≥16 alphanum)
+# Minor-фикс: userinfo в URL (scheme://user:pass@host) маскируется.
 _MASK = "***REDACTED***"
 _TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]{15,}")
 _NAKED_TOKEN_RE = re.compile(r"\d+:[A-Za-z0-9_-]{15,}")
 _DEEPSEEK_RE = re.compile(r"sk-[A-Za-z0-9]{16,}")
+# Minor-фикс: маскирует userinfo в URL (scheme://user:pass@host → scheme://***@host)
+_USERINFO_RE = re.compile(r"://[^/]*@")  # matches ://<user>:<pass>@
 
 
 def _sanitize(text: str) -> str:
-    """Belt-and-suspenders: вырезает все три вида секретов из текста."""
+    """Belt-and-suspenders: вырезает секреты и userinfo из текста."""
     if not isinstance(text, str):
         return text
     text = _TOKEN_RE.sub(_MASK, text)
     text = _NAKED_TOKEN_RE.sub(_MASK, text)
     text = _DEEPSEEK_RE.sub(_MASK, text)
+    # Minor-фикс: userinfo в URL (scheme://user:pass@host → scheme://***@host).
+    # Вырезается ДО токенов, т.к. user:pass может матчиться с _NAKED_TOKEN_RE
+    # (\d+:<secret> или bot\d+:<secret>) и давать ложные срабатывания.
+    text = _USERINFO_RE.sub("://***@", text)
     return text
 
 
@@ -136,8 +145,28 @@ def setup_logging(cfg: dict) -> None:
     cfg = {"level": "INFO", "format": "...", "file": "data/logs/newsbot.log"}
     Добавляет RotatingFileHandler (если указан file) и StreamHandler (stderr).
     """
-    level_str = cfg.get("level", "INFO").upper()
-    level = getattr(logging, level_str, logging.INFO)
+    level_str = cfg.get("level", "INFO")
+    # Major-3-фикс: isinstance check — level: null → None.upper() → AttributeError.
+    if not isinstance(level_str, str):
+        logger.warning(
+            "logging.level=%r (type %s) — ожидалась строка, используем INFO",
+            level_str, type(level_str).__name__,
+        )
+        level_str = "INFO"
+    level_str = level_str.upper()
+    # Major-3-фикс: hasattr check — опечатка (INF0, VERBOSE) давала INFO
+    # без warning. Теперь: если уровень не найден → warning с допустимыми.
+    if not hasattr(logging, level_str):
+        valid_levels = ", ".join(
+            k for k in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+            if hasattr(logging, k)
+        )
+        logger.warning(
+            "logging.level=%r неизвестен. Допустимые: %s. Используем INFO.",
+            level_str, valid_levels,
+        )
+        level_str = "INFO"
+    level = getattr(logging, level_str)
     fmt = cfg.get(
         "format",
         "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s",

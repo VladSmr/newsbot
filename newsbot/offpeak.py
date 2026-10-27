@@ -30,18 +30,30 @@ def is_deepseek_peak(now_utc: Optional[datetime] = None) -> bool:
     Китайские праздники НЕ учитываются (см. модульный docstring).
 
     Args:
-        now_utc: datetime с tzinfo. По умолчанию — datetime.now(timezone.utc).
+        now_utc: datetime с tzinfo (UTC). По умолчанию — datetime.now(timezone.utc).
                  Параметр для тестируемости.
 
     Returns:
         True — сейчас пиковое время (LLM вызывать НЕ рекомендуется).
         False — off-peak (LLM можно вызывать).
+
+    Raises:
+        ValueError: если now_utc.naive (без tzinfo). Minor-8-фикс: astimezone()
+        на naive datetime молча трактует как локальное время, что приводит
+        к неправильному определению пика. Теперь — явный ValueError.
     """
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     else:
-        # защитно нормализуем к UTC: если объект tz-aware,
-        # astimezone(timezone.utc) даёт корректный час независимо от локальной tz.
+        # Minor-8-фикс: astimezone() на naive datetime трактует как локальное
+        # (результат .hour зависит от machine tz, не от UTC). Явный ValueError
+        # вместо молчаливого fallback — caller знает, что ему передали naive dt.
+        if now_utc.tzinfo is None:
+            raise ValueError(
+                f"now_utc должен быть tz-aware (UTC), получен naive datetime: "
+                f"{now_utc!r}. Используйте now(timezone.utc) или "
+                f"fromisoformat(...).replace(tzinfo=timezone.utc)."
+            )
         now_utc = now_utc.astimezone(timezone.utc)
 
     # weekday: 0=Пн, 1=Вт, ..., 4=Пт, 5=Сб, 6=Вс
@@ -66,15 +78,24 @@ def is_llm_allowed_now(off_peak_only: bool, now_utc: Optional[datetime] = None) 
         off_peak_only: флаг из конфига llm.off_peak_only.
                        False → LLM всегда можно вызывать (текущее поведение).
                        True  → только в off-peak часы.
-        now_utc: datetime с tzinfo. По умолчанию — datetime.now(timezone.utc).
+        now_utc: datetime с tzinfo (UTC). По умолчанию — datetime.now(timezone.utc).
 
     Returns:
         True — вызывать LLM можно.
         False — вызов следует пропустить (пик DeepSeek, off_peak_only=True).
+
+    Raises:
+        ValueError: если now_utc.naive (без tzinfo). Minor-8-фикс: та же
+        проблема что в is_deepseek_peak.
     """
     if not off_peak_only:
         return True
     if now_utc is not None:
-        # единообразная нормализация с is_deepseek_peak
+        # Minor-8-фикс: та же защита что is_deepseek_peak
+        if now_utc.tzinfo is None:
+            raise ValueError(
+                f"now_utc должен быть tz-aware (UTC), получен naive datetime: "
+                f"{now_utc!r}."
+            )
         now_utc = now_utc.astimezone(timezone.utc)
     return not is_deepseek_peak(now_utc=now_utc)

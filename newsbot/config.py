@@ -253,6 +253,18 @@ def load_config(config_path: str = "") -> Dict[str, Any]:
     # Major #1-фикс: валидация database.stuck_pending_limit (целое > 0).
     _validate_stuck_pending_limit(cfg)
 
+    # Major 2-фикс: валидация database.retry_threshold_sec + приведение к int.
+    _validate_retry_threshold_sec(cfg)
+
+    # Major 2-фикс: приведение к int прочих числовых database.* полей.
+    _validate_database_numeric(cfg)
+
+    # Major 2-фикс: приведение к int числовых dedup.* полей.
+    _validate_dedup_numeric(cfg)
+
+    # Major 2-фикс: приведение к int числовых digest.* полей.
+    _validate_digest_numeric(cfg)
+
     # ── Telegram: .env поверх config.yaml ──
     # .env читается только для telegram.* — остальное из config.yaml
     env_token = telegram_token()
@@ -520,11 +532,145 @@ def _validate_poll_interval(cfg: Dict[str, Any]) -> None:
     cfg["poll_interval_minutes"] = converted
 
 
+def _validate_retry_threshold_sec(cfg: Dict[str, Any]) -> None:
+    """
+    Major 2-фикс: валидация ``database.retry_threshold_sec``.
+    YAML-кавычки превращают целое в строку ("60") → timedelta(seconds="60")
+    падает с TypeError внутри цикла (storage.py), не перехватывается → restart-луп.
+    При невалидном значении — warning + дефолт из DEFAULT_CONFIG.
+    """
+    db_cfg = cfg.get("database")
+    if not isinstance(db_cfg, dict) or "retry_threshold_sec" not in db_cfg:
+        return
+    default = DEFAULT_CONFIG["database"]["retry_threshold_sec"]
+    raw = db_cfg["retry_threshold_sec"]
+
+    converted = None
+    if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+        try:
+            f = float(raw)
+            if math.isfinite(f) and f == int(f) and int(f) >= 0:
+                converted = int(f)
+        except (TypeError, ValueError, OverflowError):
+            converted = None
+
+    if converted is None:
+        logger.warning(
+            "database.retry_threshold_sec=%r — ожидалось целое >= 0, "
+            "используется дефолт %r",
+            raw, default,
+        )
+        db_cfg["retry_threshold_sec"] = default
+        return
+
+    db_cfg["retry_threshold_sec"] = converted
+
+
+def _validate_database_numeric(cfg: Dict[str, Any]) -> None:
+    """
+    Major 2-фикс: приведение к int прочих числовых database.* полей,
+    которые используются в арифметике / передаются в SQL LIMIT
+    (гарантированный int-контракт).
+    """
+    db_cfg = cfg.get("database")
+    if not isinstance(db_cfg, dict):
+        return
+
+    # (field_name, default, min_bound)
+    fields = (
+        ("max_retries", 8, 1),
+        ("recovery_new_limit", 500, 1),
+    )
+    for field, default, min_bound in fields:
+        if field not in db_cfg:
+            continue
+        raw = db_cfg[field]
+        converted = None
+        if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+            try:
+                f = float(raw)
+                if math.isfinite(f) and f == int(f) and int(f) >= min_bound:
+                    converted = int(f)
+            except (TypeError, ValueError, OverflowError):
+                converted = None
+        if converted is None:
+            logger.warning(
+                "database.%s=%r — ожидалось целое >= %d, используется дефолт %r",
+                field, raw, min_bound, default,
+            )
+            db_cfg[field] = default
+        else:
+            db_cfg[field] = converted
+
+
+def _validate_dedup_numeric(cfg: Dict[str, Any]) -> None:
+    """
+    Major 2-фикс: приведение к int числовых dedup.* полей,
+    которые используются в арифметике или SQL LIMIT.
+    """
+    dedup_cfg = cfg.get("dedup")
+    if not isinstance(dedup_cfg, dict):
+        return
+
+    fields = (
+        ("window_days", 3, 1),
+        ("max_seen_titles", 2000, 0),
+        ("llm_recent_limit", 20, 0),
+    )
+    for field, default, min_bound in fields:
+        if field not in dedup_cfg:
+            continue
+        raw = dedup_cfg[field]
+        converted = None
+        if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+            try:
+                f = float(raw)
+                if math.isfinite(f) and f == int(f) and int(f) >= min_bound:
+                    converted = int(f)
+            except (TypeError, ValueError, OverflowError):
+                converted = None
+        if converted is None:
+            logger.warning(
+                "dedup.%s=%r — ожидалось целое >= %d, используется дефолт %r",
+                field, raw, min_bound, default,
+            )
+            dedup_cfg[field] = default
+        else:
+            dedup_cfg[field] = converted
+
+
+def _validate_digest_numeric(cfg: Dict[str, Any]) -> None:
+    """
+    Major 2-фикс: приведение к int числовых digest.* полей,
+    которые используются в арифметике (max_per_location).
+    """
+    dig_cfg = cfg.get("digest")
+    if not isinstance(dig_cfg, dict):
+        return
+
+    # max_per_location: int в цикле range() — нужен гарантированный int.
+    if "max_per_location" in dig_cfg:
+        raw = dig_cfg["max_per_location"]
+        converted = None
+        if not isinstance(raw, bool) and isinstance(raw, (int, float, str)):
+            try:
+                f = float(raw)
+                if math.isfinite(f) and f == int(f) and int(f) >= 0:
+                    converted = int(f)
+            except (TypeError, ValueError, OverflowError):
+                converted = None
+        if converted is None:
+            logger.warning(
+                "digest.max_per_location=%r — ожидалось целое >= 0, "
+                "используется дефолт %r",
+                raw, DEFAULT_CONFIG["digest"]["max_per_location"],
+            )
+            dig_cfg["max_per_location"] = DEFAULT_CONFIG["digest"]["max_per_location"]
+        else:
+            dig_cfg["max_per_location"] = converted
+
+
 def _validate_stuck_pending_limit(cfg: Dict[str, Any]) -> None:
-    """
-    Валидация ``database.stuck_pending_limit``: целое > 0.
-    Используется в storage.get_stuck_pending() для защиты RAM при большом backlog.
-    """
     db_cfg = cfg.get("database")
     if not isinstance(db_cfg, dict) or "stuck_pending_limit" not in db_cfg:
         return

@@ -1444,7 +1444,11 @@ def test_purge_items_terminalizes_large_pending_backlog_in_batches(
 
     # Батчинг реально работал: 12 порций по 1000 + завершающая пустая +
     # отдельная транзакция DELETE-фазы.
-    begins = [stmt for stmt in traced if stmt.strip().upper() == "BEGIN"]
+    # Minor-5: _tx() использует BEGIN IMMEDIATE, поэтому проверяем оба варианта.
+    begins = [
+        stmt for stmt in traced
+        if stmt.strip().upper() in ("BEGIN", "BEGIN IMMEDIATE")
+    ]
     assert len(begins) >= 12, (
         f"ожидалось ≥12 коротких транзакций (батчи), получено {len(begins)}"
     )
@@ -1466,14 +1470,24 @@ class _PoisonedConn:
     """
     Соединение, у которого падают и commit(), и ROLLBACK, и close():
     имитация мёртвого fd / disk I/O error. Все прочие вызовы — no-op.
+    Minor-5: также добавлено in_transaction и execute возвращает объект
+    с rowcount для совместимости с BEGIN IMMEDIATE + _tx().
     """
 
     row_factory = sqlite3.Row
+    in_transaction = False
 
     def execute(self, sql, *args, **kwargs):
         if sql.strip().upper().startswith("ROLLBACK"):
             raise sqlite3.OperationalError("disk I/O error (rollback)")
-        return None
+        # Minor-5: возвращаем dummy cursor для BEGIN IMMEDIATE
+        class DummyCursor:
+            rowcount = 0
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def fetchone(self): return None
+            def fetchall(self): return []
+        return DummyCursor()
 
     def commit(self):
         raise sqlite3.OperationalError("disk I/O error (commit)")

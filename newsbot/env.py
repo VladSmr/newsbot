@@ -185,6 +185,11 @@ def _write_env(key: str, value: str) -> None:
     """
     Перезаписывает KEY=VALUE в .env (пишет в _env_path(), не site-packages).
 
+    Minor-7-фикс: атомарная запись — пишем в .env.tmp, затем os.replace()
+    (атомарный rename на уровне ОС) вместо прямой записи в .env.
+    Это гарантирует, что при сбое (power loss, OOM) .env остаётся в
+    консистентном состоянии (или старый, или новый), без partial write.
+
     N7-фикс: запрещены \n и " в value.
       - \n ломает формат .env.
       - " требует экранирования (\") и корректного разэкранирования при чтении.
@@ -223,7 +228,12 @@ def _write_env(key: str, value: str) -> None:
                 lines.append(line.rstrip())
     if not found:
         lines.append(written)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    new_content = "\n".join(lines) + "\n"
+
+    # Minor-7: атомарная запись — write to .env.tmp + os.replace()
+    tmp_path = path.with_suffix(".env.tmp")
+    tmp_path.write_text(new_content, encoding="utf-8")
+    _os.replace(str(tmp_path), str(path))  # атомарный rename (os.rename on POSIX, MoveFileEx on Windows)
 
     # T2-11: chmod 600 — только на Unix (Windows игнорирует)
     try:

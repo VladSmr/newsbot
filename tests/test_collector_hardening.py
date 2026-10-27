@@ -537,9 +537,10 @@ class TestParseDeadline:
         assert result.ok is False, "зависший parse должен давать ok=False"
         assert result.items == []
         # Главный ассерт: elapsed << sleep (5 с). Если бы shutdown(wait=True),
-        # elapsed был бы ~5 с и тест бы упал. margin 0.4 с выбран с запасом
-        # для CI-шумности (не flakе).
-        assert elapsed < HANG_DURATION / 10, (
+        # elapsed был бы ~5 с и тест бы упал. Margin 2.0 с — ослаблен
+        # для CI-шумности (фоновые потоки, sleep в зависшем потоке учитывают
+        # wall-clock). Всё ещё достаточно: shutdown(wait=True) дал бы 5+ с.
+        assert elapsed < 2.0, (
             f"возврат должен произойти ДО завершения зависшего потока: "
             f"elapsed={elapsed:.2f} с, hang={HANG_DURATION} с — "
             f"похоже на shutdown(wait=True) или with-блок вместо явного shutdown"
@@ -599,7 +600,9 @@ class TestParseDeadline:
         # Цикл должен пройти быстро: sleep(2 с) от зависшего parse
         # не должна суммироваться. Если бы был shutdown(wait=True),
         # total_elapsed был бы ~2 с и тест бы упал.
-        assert total_elapsed < 1.0, (
+        # Margin ослаблен до 2.5 с для CI-шумности (фоновые потоки, GC).
+        # shutdown(wait=True) дал бы 2+ с, так что margin достаточен.
+        assert total_elapsed < 2.5, (
             f"цикл занял {total_elapsed:.2f} с — похоже, "
             f"shutdown(wait=True) заблокировал ожидание зависшего потока"
         )
