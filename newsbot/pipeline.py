@@ -36,7 +36,7 @@ from email.utils import parsedate_to_datetime as _parsedate_to_dt
 from typing import Dict, List, Optional, Set, Tuple
 
 from .collector import FeedCollector, FeedResult, NewsItem
-from .dedup import filter_new
+from .dedup import filter_new, is_containment_duplicate
 from .delivery import ConsoleDelivery, TelegramDelivery, Delivery
 from .delivery.telegram import ChatIdNotBoundError, BotBlockedError
 from .digest import run_digest as _run_digest, build_digest_messages
@@ -280,6 +280,70 @@ def normalize_location(location: Optional[str]) -> str:
     return s
 
 
+# ── F3: нормализация локации для cap'а (схлопывание вариаций) ────────────────
+# Generic-суффиксы, убираемые при нормализации ключа для location-cap.
+# English: при «Voronezh region, Russia» → «voronezh» (убираем «, Russia» ПОСЛЕ
+# comma-cut, потом убираем суффиксы).
+# Russian: «Воронежская область» → «воронежская» (без уточнителя), но
+# «Воронежская обл.» → «воронежская». В обоих случаях суффикс убирается.
+# При этом «Москва» не схлопывается с «Московская область», т.к. последняя
+# НЕ имеет generic-суффикса «область» (это основное слово, не суффикс).
+# Все паттерны — word-boundary (\b), чтобы «oblast» в «neooblast» не убирался.
+_CAP_GENERIC_PATTERNS = [
+    r"\s+region\b",       # English
+    r"\s+oblast\b",
+    r"\s+krai\b",
+    r"\s+area\b",
+    r"\s+province\b",
+    r"\s+district\b",
+    r"\s+область\b",      # Russian
+    r"\s+край\b",
+    r"\s+район\b",
+    r"\s+регион\b",
+    r"\s+обл\b",
+]
+
+
+def _normalize_cap_key(location: str) -> str:
+    """
+    Нормализует location-строку для группировки в location-cap.
+
+    F3-фикс: «Voronezh region, Russia» ≠ «Voronezh» в старом коде →
+    cap по локации не работал, все 4 новости про Воронеж проходили
+    при max_per_location=2.
+
+    Схема:
+      1. lowercase + strip.
+      2. Обрезка по первой запятой → берём только «ядро» перед страной/деталями.
+         «Voronezh, Russia» → «voronezh»; «Voronezh region, Russia» →
+         «voronezh region» (запятая после region → ядро «voronezh region»).
+      3. Отбрасывание generic-суффиксов (region, oblast, область, край, …).
+
+    Риск ложного схлопывания: «Москва» vs «Московская область».
+    «московская область» → comma-cut не срабатывает → «московская область» →
+    суффикс «область» убирается → «московская». «москва» → «москва». Это
+    разные ключи → НЕ схлопываются. ✅
+
+    Применяется одинаково в _loc_day_key и _cap_by_location → инвариант
+    группировки сохраняется.
+    """
+    if not location:
+        return ""
+    s = location.strip().lower()
+    if not s:
+        return ""
+    # (1) Обрезка по первой запятой
+    comma_pos = s.find(",")
+    if comma_pos >= 0:
+        s = s[:comma_pos].strip()
+    if not s:
+        return ""
+    # (2) Отбрасывание generic-суффиксов
+    for pat in _CAP_GENERIC_PATTERNS:
+        s = re.sub(pat, "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def _loc_day_key(item) -> Optional[tuple]:
     """
     (локация, день) из cluster_key или None, если item не попадает
@@ -296,7 +360,10 @@ def _loc_day_key(item) -> Optional[tuple]:
     if not cluster_key:
         return None
     parts = cluster_key.split('|')
-    location = (parts[0] if parts else 'other').strip().lower()
+    location = (parts[0] if parts else 'other').strip()
+    # F3-фикс: нормализуем ядро локации для cap'а (схлопываем вариации).
+    # Без этого «Voronezh region» ≠ «Voronezh» → cap пропускал все 4 новости.
+    location = _normalize_cap_key(location) or 'other'
     if location == 'other':
         return None
     pub_day = parts[2] if len(parts) > 2 else 'unknown'
@@ -343,6 +410,14 @@ def _infer_category(item) -> str:
 
     source нормализуется: lowercase + убирается пунктуация/апострофы.
     Словарь алиасов → канонический ключ (см. _SOURCE_ALIASES).
+
+    F4-фикс: перед source-first проверкой добавляется content-override.
+    Если title/summary/tags содержат политико-экономические маркеры
+    (election, president, government, war, sanctions, …) и НЕТ профильных
+    маркеров для данного источника (для cinema: film, movie, oscar, …),
+    возвращается 'other' → секция «Основные новости».
+    Это блокирует кейс Variety → «Lula's Election Win…» → political news
+    попадала в 🎬 Кино вместо 📰 Основные новости.
     """
     raw = (item.source or "").lower()
     import re
@@ -354,6 +429,101 @@ def _infer_category(item) -> str:
 
     tags = _parse_tags(getattr(item, 'tags', None))
     tags_lower = [t.lower() for t in tags]
+
+    # ── F4: собираем текст для content-check ────────────────────────────────
+    # Для content-override собираем текст из title, summary, tags
+    # (достаточно title + summary, tags обрабатываются отдельно).
+    title_text = (getattr(item, 'title', None) or "").lower()
+    summary_text = (getattr(item, 'summary', None) or "").lower()
+    combined_lower = (title_text + " " + summary_text + " " + " ".join(tags_lower)).lower()
+
+    # F4: политико-экономические маркеры → content_override = 'other'
+    # (новость о реальных событиях, не entertainment-контент).
+    _POLITICAL_MARKERS = (
+        # English
+        r"\belection\b", r"\belections\b", r"\bpresident\b", r"\bprime\s*minister\b",
+        r"\bgovernment\b", r"\bparliament\b", r"\bcongress\b", r"\bsenate\b",
+        r"\bminister\b", r"\bchancellor\b", r"\bgovernor\b",
+        r"\bwar\b", r"\bconflict\b", r"\binvasion\b",
+        r"\bsanction\b", r"\bsanctions\b", r"\btariff\b", r"\btariffs\b",
+        r"\bpolicy\b", r"\bpolicies\b", r"\blegislation\b",
+        r"\blawsuit\b", r"\bcourt\b", r"\btrial\b", r"\bverdict\b", r"\barrest\b",
+        r"\bdiplomat\b", r"\bdiplomacy\b", r"\bnato\b", r"\beu\b",  # EU standalone
+        r"\bg20\b", r"\bgaffairs\b", r"\bpolitics\b", r"\bpolitical\b",
+        r"\bvote\b", r"\breferendum\b", r"\bcampaign\b",
+        r"\bpeace\b", r"\bceasefire\b", r"\btruce\b",
+        r"\boffensive\b", r"\bassault\b", r"\battack\b", r"\bairstrike\b",
+        r"\bputin\b", r"\bzelensky\b", r"\bbiden\b", r"\btrump\b",
+        # Russian
+        r"\bвыбор[ыаеов]\b", r"\bпрезидент\b", r"\bправительств",
+        r"\bпарламент\b", r"\bдепутат\b", r"\bминистр\b", r"\bгубернатор\b",
+        r"\bвойн[аеуы]\b", r"\bконфликт\b", r"\bвоенн",
+        r"\bсанкци[яеи]\b", r"\bтаможен", r"\bпошлин",
+        r"\bзакон\b", r"\bзаконопроект\b", r"\bзаконодательств",
+        r"\bсудебн", r"\bсуд\b", r"\bприговор\b", r"\bарест\b",
+        r"\bдипломат\b", r"\bдипломати",
+        r"\bнато\b", r"\bполитик\b", r"\bполитическ",
+    )
+
+    # F4: профильные маркеры для domain-specific источников.
+    # Если они присутствуют — content НЕ переопределяется на 'other'.
+    _CINEMA_MARKERS = (
+        r"\bfilm\b", r"\bmovie\b", r"\bbox\s*office\b", r"\boscars?\b",
+        r"\bcannes\b", r"\bstreaming\b", r"\bseries\b", r"\bseason\b",
+        r"\bstudio\b", r"\bcinema\b", r"\bdirector\b", r"\bactor\b",
+        r"\bactress\b", r"\bpremiere\b", r"\btrailer\b", r"\bnetflix\b",
+        r"\bhollywood\b", r"\bemmy\b", r"\bbafta\b", r"\bgrammy\b",
+        r"\bфильм\b", r"\bсериал\b", r"\bпремьер[аеу]\b", r"\bкинотеатр\b",
+        r"\bстудия\b", r"\bрежисс[её]р\b", r"\bакт[ёе]р\b", r"\bсъёмк[аи]\b",
+    )
+    _GAMES_MARKERS = (
+        r"\bgames?\b", r"\bgaming\b", r"\bplaystation\b", r"\bxbox\b",
+        r"\bnintendo\b", r"\bsteam\b", r"\bepic\s*games\b", r"\bblizzard\b",
+        r"\bue\b(?:\s*5|\s*4|\s*engine)", r"\bunreal\b",
+        r"\bdlc\b", r"\bpatch\b", r"\bupdate\b", r"\brelease\s*date\b",
+    )
+    _SPACE_MARKERS = (
+        r"\brocket\b", r"\bsatellite\b",
+        r"\bastronaut\b", r"\bcosmonaut\b", r"\blas.launch\b",
+        r"\bspacex\b", r"\borbit\b", r"\bmission\b",
+        r"\blunar\b", r"\bmars\b", r"\bstar\b",
+        # Отдельные специфичные маркеры (без generic "space" который
+        # слишком часто встречается в NASA-политических новостях:
+        # "space program funding", "space agency cut" и т.п.)
+    )
+
+    # Определяем, есть ли политический контент
+    has_political = any(
+        re.search(pat, combined_lower) for pat in _POLITICAL_MARKERS
+    )
+
+    # Профильные маркеры — зависят от того, какую категорию source would дать
+    has_cinema_profile = any(re.search(p, combined_lower) for p in _CINEMA_MARKERS)
+    has_games_profile = any(re.search(p, combined_lower) for p in _GAMES_MARKERS)
+    has_space_profile = any(re.search(p, combined_lower) for p in _SPACE_MARKERS)
+
+    # F4: content-override для domain-specific источников с политическим контентом
+    # «Variety: Lula's Election Win» → Variety source would give 'cinema',
+    #   but has political=True + has_cinema_profile=False → return 'other'
+    # «Variety: New Marvel Movie Trailer» → has political=False → source-first
+    #   check applies → 'cinema' (unchanged behavior)
+    _SOURCE_TO_PROFILE = {
+        'cinema': has_cinema_profile,
+        'games': has_games_profile,
+        'space': has_space_profile,
+        # tech, cyber, science — не domain-specific entertainment-источники,
+        # content-override для них не нужен (редко путают контент с другими темами)
+    }
+    for cat_check, has_profile in _SOURCE_TO_PROFILE.items():
+        if source in {
+            'cinema': ('deadline', 'variety', 'hollywoodreporter', 'screendaily'),
+            'games': ('ign', 'eurogamer', 'dtf', 'gamespot', 'kotaku'),
+            'space': ('spacenews', 'nasa', 'nasaspaceflight'),
+        }.get(cat_check, ()):
+            if has_political and not has_profile:
+                return 'other'
+
+    # ── Без content-override — штатная логика ───────────────────────────
 
     # Кино
     if source in ('deadline', 'variety'):
@@ -571,6 +741,8 @@ def _cap_by_location(
     location_day_counts: Dict[tuple, int] = {}
     result: List[NewsItem] = []
     protected_dropped = 0
+    # F3: наблюдаемость — отслеживаем коллизии нормализации.
+    normalized_location_sources: Dict[str, List[str]] = {}
 
     # Protected — первыми: они занимают квоту и отсекаются последними.
     ordered_items = (
@@ -585,15 +757,21 @@ def _cap_by_location(
             continue
 
         parts = cluster_key.split('|')
-        location = (parts[0] if parts else 'other').strip().lower()
+        location = (parts[0] if parts else 'other').strip()
+        # F3-фикс: нормализуем ядро для ключа cap'а.
+        location_norm = _normalize_cap_key(location) or 'other'
         pub_day = parts[2] if len(parts) > 2 else 'unknown'
 
+        # F3: наблюдаемость — собираем маппинг нормализованный→оригинальные.
+        if location_norm != 'other':
+            normalized_location_sources.setdefault(location_norm, []).append(location)
+
         # bucket 'other' is not capped
-        if location == 'other':
+        if location_norm == 'other':
             result.append(item)
             continue
 
-        key = (location, pub_day)
+        key = (location_norm, pub_day)
         count = location_day_counts.get(key, 0)
         if count >= max_per_location:
             # Квота группы исчерпана; protected здесь тоже не проходит —
@@ -616,6 +794,18 @@ def _cap_by_location(
             "Location cap: removed %d items across %d locations",
             len(items) - len(result), locations_hit,
         )
+
+    # F3: наблюдаемость — warning если несколько исходных локаций
+    # схлопнулись в одно нормализованное ядро (наблюдаемость, не меняет поведение).
+    if len(normalized_location_sources) > 1:
+        for key_norm, orig_locations in normalized_location_sources.items():
+            if len(set(orig_locations)) > 1:
+                uniq = sorted(set(orig_locations))
+                logger.warning(
+                    "Location cap: нормализованное ядро %r объединяет "
+                    "%d вариантов локации: %s",
+                    key_norm, len(uniq), ", ".join(uniq),
+                )
 
     return result
 
@@ -1002,6 +1192,21 @@ class NewsPipeline:
         if not dup_0based:
             return 0
 
+        # Major ingest safety: если модель пометила ВСЕ кандидаты дублями
+        # (после M2 лидер тоже может быть помечен) — это ненормальный ответ.
+        # Без этой проверки все items получат state='skipped' и пропадут
+        # (recovery только по pending). Сценарий реален при непустом recent_list.
+        # Лечение: возвращаем бюджет и пропускаем (аналог except-ветки :1185-1190).
+        if len(dup_0based) >= len(candidates):
+            self._llm_calls_left += num_chunks
+            logger.warning(
+                "LLM-дедуп (ingest): модель пометила все %d кандидатов дублями — "
+                "игнорируем результат (бюджет %d возвращён). "
+                "Items остаются доступны для следующего цикла.",
+                len(candidates), num_chunks,
+            )
+            return 0
+
         # Собираем URLs дублей
         dup_urls = [candidates[idx].url for idx in sorted(dup_0based) if idx < len(candidates)]
 
@@ -1158,12 +1363,10 @@ class NewsPipeline:
             return (set(), recent_shown)
         urls: Set[str] = set()
         for i in dup_idx:
-            # MAJOR-фикс (4b): лидер (i=0) НЕ пропускается только когда RECENT
-            # пуст (классический внутри-чанковый дедуп; у лидера нет предшественника).
-            # При непустом RECENT — лидер может быть дублем показанного (и
-            # _parse_dedup_response уже отдаёт его в dup_idx).
-            if i == 0 and not recent_shown:
-                continue
+            # M2-фикс: лидер (i=0) может быть помечен как дубль более нового
+            # item'а из того же чанка — правило "newer becomes leader" (:537-539).
+            # Инвариант «хотя бы один item остаётся» при пустом RECENT
+            # обеспечивается ниже (:1365). Снимаем защиту i==0.
             if isinstance(i, int) and 0 <= i < len(items):
                 urls.add(items[i].url)
         # Инвариант: хотя бы один item (лидер) должен остаться в дайджесте.
@@ -1179,8 +1382,14 @@ class NewsPipeline:
             return (set(), recent_shown)
         if urls:
             logger.info(
-                "Дайджест: кластеризация отсеяла %d дублей из %d",
+                "Дайджест: кластеризация отсеяла %d дублей из %d кандидатов",
                 len(urls), len(items),
+            )
+        else:
+            # F: наблюдаемость — сообщаем что кластеризация прошла, но не нашла дублей.
+            logger.info(
+                "Дайджест: кластеризация проверила %d кандидатов — дубли не найдены",
+                len(items),
             )
         return (urls, recent_shown)
 
@@ -2210,6 +2419,47 @@ class NewsPipeline:
             deferred_items = [it for it in deferred_items if it.url not in _dup_urls]
         n_dedup = len(deferred_items)
 
+        # ── F6: детерминированная страховка после LLM-кластеризации ──────────
+        # LLM мог пропустить containment-пары, которые не попали в его контекст.
+        # Финальный проход: для всех пар кандидатов — containment-check
+        # (≥30 симв., числовое равенство, Jaccard ≥0.8, word-boundary containment).
+        # Лидер — первый по текущей сортировке score DESC, fetched_at ASC.
+        # Дубли помечаются в _containment_dup_urls → исключаются из отправки.
+        _containment_dup_urls: Set[str] = set()
+        if len(deferred_items) >= 2:
+            # Текущий порядок: SQL (score DESC, fetched_at ASC) от LLM-дедупа.
+            # items[i] — потенциальный лидер для items[j] (i < j).
+            for i in range(len(deferred_items)):
+                a = deferred_items[i]
+                if a.url in _containment_dup_urls:
+                    continue
+                for j in range(i + 1, len(deferred_items)):
+                    b = deferred_items[j]
+                    if b.url in _containment_dup_urls:
+                        continue
+                    a_title = getattr(a, 'title_normalized', None)() if hasattr(a, 'title_normalized') else ""
+                    b_title = getattr(b, 'title_normalized', None)() if hasattr(b, 'title_normalized') else ""
+                    if not a_title or not b_title:
+                        continue
+                    icd = is_containment_duplicate(a_title, b_title)
+                    if icd:
+                        logger.info(
+                            "F6 containment: dup %s (%s) отсеян лидером %s (%s)",
+                            getattr(b, 'url', ''), b_title[:60],
+                            getattr(a, 'url', ''), a_title[:60],
+                        )
+                        _containment_dup_urls.add(b.url)
+            n_containment = len(_containment_dup_urls)
+            if n_containment:
+                deferred_items = [it for it in deferred_items if it.url not in _containment_dup_urls]
+                logger.info(
+                    "Дайджест: containment-страховка отсеяла %d дублей из %d "
+                    "(%d кандидатов после LLM-дедупа)",
+                    n_containment, n_containment + len(deferred_items), n_dedup,
+                )
+                _dup_urls = _dup_urls | _containment_dup_urls
+        n_dedup = len(deferred_items)
+
         # Задача 2 (M1): дубли на границе max_items.
         # _check_against_shown (ранний backfill :2213, skipped :2281) видит только
         # digested/delivered из _recent_shown (get_shown_for_window).
@@ -2504,6 +2754,24 @@ class NewsPipeline:
         deferred_items.sort(key=lambda x: x.llm_score or 0, reverse=True)
         deferred_items = deferred_items[:max_items]
         n_final = len(deferred_items)
+
+        # F: наблюдаемость — DEBUG-дамп финального состава.
+        # Показывает url/title/location/cluster_key первых min(N, 10) items.
+        if logger.isEnabledFor(logging.DEBUG):
+            _dbg_lines = []
+            for _idx, _it in enumerate(deferred_items[:10]):
+                _ck = getattr(_it, 'cluster_key', '') or ''
+                _loc = _ck.split('|')[0] if _ck else 'no-key'
+                _dbg_lines.append(
+                    f"  [{_idx}] score={getattr(_it, 'llm_score', '?')} "
+                    f"loc={_loc!r} url={getattr(_it, 'url', '?')}"
+                )
+            _dbg_msg = (
+                f"Дайджест DEBUG (final {n_final} items):\n"
+                + "\n".join(_dbg_lines)
+                + (f"\n  ... и ещё {max(0, n_final - 10)} items" if n_final > 10 else "")
+            )
+            logger.debug(_dbg_msg)
 
         # M6: единый INFO-лог стадий (воронка: sql → published → top_n → dedup →
         #      early_backfill → guarantee → cap → late_backfill → final).

@@ -388,6 +388,90 @@ def _quick_filter(norm: str, candidates: List[Tuple]) -> List[Tuple]:
     return filtered[:MAX_FUZZY_CANDIDATES]
 
 
+def is_containment_duplicate(title_a: str, title_b: str, token_threshold: float = 0.8) -> bool:
+    r"""
+    Containment-дедуп: один нормализованный заголовок полностью входит в другой
+    по границе слова, при этом числовой guard и token-guard пройдены.
+
+    Публичная функция — сигнатура стабильна, используется внешними модулями.
+
+    Контракт (все проверки обязательны, без них функция НЕ безопасна):
+      1. Оба заголовка нормализованы (lowercase, без пунктуации, без source-префикса).
+      2. Длина обоих ≥ 30 символов после нормализации — защита от ложных склеек
+         коротких заголовков («EU approves» vs «EU approves law» — не дубль,
+         даже если один входит в другой; порог 30 симв. выбран эмпирически).
+      3. Containment по границе слова: `\b` в начале и конце входящего,
+         чтобы «moon» не совпал с «moonlight», а «Two killed … Voronezh»
+         совпал с «Two killed … Voronezh region …».
+      4. Числовой guard (мультимножество цифр) совпадает — защита от ложной
+         склейки «2 killed» vs «3 killed», «70 bps» vs «80 bps» и т.п.
+      5. Token Jaccard ≥ token_threshold — заголовки описывают одну сущность.
+         Guard пропускает при отсутствии значащих токенов.
+
+    NOTE: ratio НЕ проверяется — containment сам по себе достаточно сильный сигнал.
+    Проверка словлена до ratio, чтобы поймать пары типа
+    «Two killed in Ukrainian attack on Voronezh — ТАСС» /
+    «Two killed in Ukrainian attack on Voronezh — РИА»,
+    где SequenceMatcher ratio ≈ 0.935 < 0.95 и пара отклонялась бы.
+
+    Args:
+        title_a: нормализованный заголовок ( уже через title_normalized() ).
+        title_b: нормализованный заголовок.
+        token_threshold: порог Jaccard (дефолт 0.8, соответствует конфигу dedup).
+    Returns:
+        True — дубль (один заголовок целиком входит в другой, guard'ы пройдены).
+        False — не дубль или guard отклонил.
+    """
+    if not title_a or not title_b:
+        return False
+
+    a_len = len(title_a)
+    b_len = len(title_b)
+
+    # Оба ≥ 30 символов (защита от ложных склеек на коротких заголовках)
+    if a_len < 30 or b_len < 30:
+        return False
+
+    # ── (1) Числовой guard — мультимножество ─────────────────────────
+    nums_a = _number_multiset(title_a)
+    nums_b = _number_multiset(title_b)
+    if nums_a != nums_b:
+        return False
+
+    # ── (2) Token guard — Jaccard ───────────────────────────────────
+    if not _token_jaccard(title_a, title_b, token_threshold):
+        return False
+
+    # ── (3) Containment по границе слова ────────────────────────────
+    # Определяем shorter/longer и проверяем: shorter ∈ longer по границе слова.
+    if a_len <= b_len:
+        shorter, longer = title_a, title_b
+    else:
+        shorter, longer = title_b, title_a
+
+    # Ищем ВСЕ вхождения shorter в longer (их может быть ≥1 при повторах,
+    # например "war war" в "war war in war war"). Проверяем каждое:
+    # входящий фрагмент должен начинаться и заканчиваться на границе слова
+    # в контексте longer. Граница слова = начало/конец строки ИЛИ пробел.
+    # NOTE: title_normalized() удаляет пунктуацию, поэтому \b работает
+    # по границе alphanumeric/non-alphanumeric.
+    idx = 0
+    while True:
+        pos = longer.find(shorter, idx)
+        if pos == -1:
+            break
+        # Проверяем word-boundary слева: начало строки ИЛИ пробел/разделитель
+        left_ok = (pos == 0) or longer[pos - 1].isspace()
+        # Проверяем word-boundary справа: конец строки ИЛИ пробел/разделитель
+        right_ok = (pos + len(shorter) >= len(longer)) or longer[pos + len(shorter)].isspace()
+        if left_ok and right_ok:
+            return True
+        # Сдвигаем, чтобы проверить следующее вхождение (при повторах)
+        idx = pos + 1
+
+    return False
+
+
 def _is_fuzzy_similar(
     a: str, b: str, threshold: float, token_threshold: float,
 ) -> bool:
@@ -398,9 +482,11 @@ def _is_fuzzy_similar(
     Формула «дубль» (guard'ы ДО SequenceMatcher — дешёвые раньше дорогих):
         числа совпадают (мультимножество)  — жёсткий запрет при расхождении
         И token_Jaccard ≥ token_threshold  — значимые токены похожи
-        И ratio ≥ threshold               — SequenceMatcher ratio
+        И (containment  — OR — ratio ≥ threshold)
 
-    Все три условия должны выполняться.
+    Containment-проверка выполняется ДО SequenceMatcher: если один заголовок
+    целиком входит в другой по границе слова (оба ≥30 симв., числовой guard
+    и Jaccard пройдены), пара считается дублем БЕЗ вычисления ratio.
 
     NOTE: числовой guard работает на нормализованном тексте. Поскольку
     title_normalized() удаляет [^\w\s], десятичные точки, запятые, знаки
@@ -428,7 +514,11 @@ def _is_fuzzy_similar(
     if not _token_jaccard(a, b, token_threshold):
         return False
 
-    # ── (3) SequenceMatcher ratio (дорогой — последним) ───────────────
+    # ── (3) Containment-правило (без ratio) ─────────────────────────
+    if is_containment_duplicate(a, b, token_threshold):
+        return True
+
+    # ── (4) SequenceMatcher ratio (дорогой — последним) ───────────────
     ratio = SequenceMatcher(None, a, b).ratio()
     if ratio < threshold:
         return False

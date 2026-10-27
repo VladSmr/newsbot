@@ -312,3 +312,33 @@ class TestLengthButValidJson:
         client._http.post = counting
         client.chat_json(system="s", user="u")
         assert len(calls) == 1
+
+
+# ─────────────────────────────────────────────────────────────────
+# F5: NO-FACT rule in scoring (no verifiable facts → score ≤ 3)
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestF5NoFactRule:
+    def test_score_scale_contains_no_fact_rule(self):
+        """F5-fix: _SCORE_SCALE содержит правило 'no facts → score ≤ 3'."""
+        from newsbot.llm.prompts import _SCORE_SCALE
+
+        assert "NO VERIFIABLE FACTS" in _SCORE_SCALE
+        assert "score MUST be ≤ 3" in _SCORE_SCALE
+        # Пример из реального кейса: "Ebola cases rise... no figures"
+        assert "no figures" in _SCORE_SCALE.lower()
+
+    def test_batch_system_prompt_inherits_score_scale(self):
+        """F5-fix: BATCH_SYSTEM_PROMPT содержит правило NO-VERIFIABLE-FACTS."""
+        from newsbot.llm.prompts import BATCH_SYSTEM_PROMPT
+
+        assert "NO VERIFIABLE FACTS" in BATCH_SYSTEM_PROMPT
+        assert "score MUST be ≤ 3" in BATCH_SYSTEM_PROMPT
+
+    def test_system_prompt_inherits_score_scale(self):
+        """F5-fix: SYSTEM_PROMPT содержит правило NO-VERIFIABLE-FACTS."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT
+
+        assert "NO VERIFIABLE FACTS" in SYSTEM_PROMPT
+        assert "score MUST be ≤ 3" in SYSTEM_PROMPT

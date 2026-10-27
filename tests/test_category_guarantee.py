@@ -147,3 +147,143 @@ def test_nan_min_count_falls_back_to_zero_without_crash():
     items = [FakeItem(5, 'tass'), FakeItem(3, 'deadline')]
     result = _category_guarantee(items, {'cinema': float('nan')})
     assert result == items
+
+
+# =============================================================================
+# F4-тесты: content-override для domain-specific источников
+# =============================================================================
+
+class FakeItemWithText:
+    """FakeItem с title и summary для F4-тестов."""
+    def __init__(self, score, source, tags=None, title="", summary=""):
+        self.llm_score = score
+        self.source = source
+        self.tags = tags
+        self.title = title
+        self.summary = summary
+
+
+def test_variety_political_becomes_other():
+    """F4: Variety + политический title → 'other' (не 'cinema').
+
+    Кейс из реального дайджеста: «Lula's Election Win…» (Variety) →
+    политика, должна попасть в 📰 Основные новости.
+    """
+    item = FakeItemWithText(
+        score=7,
+        source='Variety',
+        title="Lula's Election Win: How Taylor Swift's Advice Shaped the Result",
+        summary="Brazil's president election aftermath analysis.",
+    )
+    assert _infer_category(item) == 'other', \
+        "Variety + politics → 'other', not 'cinema'"
+
+
+def test_variety_film_stays_cinema():
+    """F4: Variety + film markers → 'cinema' (content-override не срабатывает)."""
+    item = FakeItemWithText(
+        score=7,
+        source='Variety',
+        title="New Marvel Movie Trailer Drops — First Look at Phase 6",
+        summary="The latest Marvel cinematic universe preview.",
+    )
+    assert _infer_category(item) == 'cinema', \
+        "Variety + film markers → 'cinema'"
+
+
+def test_deadline_political_becomes_other():
+    """F4: Deadline + политический title → 'other'."""
+    item = FakeItemWithText(
+        score=7,
+        source='Deadline',
+        title="Congress Passes New Sanctions Bill Against Russia",
+        summary="Legislative update on international sanctions.",
+    )
+    assert _infer_category(item) == 'other', \
+        "Deadline + political → 'other'"
+
+
+def test_deadline_oscar_stays_cinema():
+    """F4: Deadline + oscars/cinema → 'cinema'."""
+    item = FakeItemWithText(
+        score=7,
+        source='Deadline',
+        title="Oscar Nominations Announced — Full List of 2026 Nominees",
+        summary="Academy Awards nominations reveal.",
+    )
+    assert _infer_category(item) == 'cinema', \
+        "Deadline + oscars → 'cinema'"
+
+
+def test_ign_political_becomes_other():
+    """F4: IGN + war/conflict → 'other'."""
+    item = FakeItemWithText(
+        score=7,
+        source='IGN',
+        title="NATO Summit: New War Strategy Announced",
+        summary="Military alliance decisions from Brussels summit.",
+    )
+    assert _infer_category(item) == 'other', \
+        "IGN + war/politics → 'other'"
+
+
+def test_ign_gaming_stays_games():
+    """F4: IGN + gaming → 'games'."""
+    item = FakeItemWithText(
+        score=7,
+        source='IGN',
+        title="PlayStation 6 Announced — Release Date and Features",
+        summary="Sony's next-generation console reveal.",
+    )
+    assert _infer_category(item) == 'games', \
+        "IGN + gaming → 'games'"
+
+
+def test_nasa_political_becomes_other():
+    """F4: NASA + political → 'other'."""
+    item = FakeItemWithText(
+        score=7,
+        source='NASA',
+        title="Congress Cuts NASA Budget Amid Election-Year Spending Debate",
+        summary="Legislative budget reduction impact on space program.",
+    )
+    assert _infer_category(item) == 'other', \
+        "NASA + politics → 'other'"
+
+
+def test_nasa_space_stays_space():
+    """F4: NASA + space markers → 'space'."""
+    item = FakeItemWithText(
+        score=7,
+        source='NASA',
+        title="SpaceX Rocket Launch Successful — ISS Resupply Mission",
+        summary="Cargo delivery to international space station.",
+    )
+    assert _infer_category(item) == 'space', \
+        "NASA + space → 'space'"
+
+
+def test_russian_political_markers():
+    """F4: русские политические маркеры в title/summary переопределяют категорию."""
+    item = FakeItemWithText(
+        score=7,
+        source='Variety',
+        title="Президентские выборы 2026: основные кандидаты",
+        summary="Обзор предвыборной гонки в Бразилии.",
+    )
+    assert _infer_category(item) == 'other', \
+        "Russian political markers → 'other'"
+
+
+def test_generic_source_political_unaffected():
+    """F4: generic источник (tass) с политическим контентом → 'other' (по tags)."""
+    item = FakeItemWithText(
+        score=7,
+        source='tass',
+        title="Government Announces New Tariff Policy",
+        summary="Economic policy changes announced today.",
+        tags='["politics"]',
+    )
+    # Без source-first override (tass → other), результат зависит от tags.
+    # Нет профильных tags → 'other' (по tags или fallthrough).
+    assert _infer_category(item) == 'other'

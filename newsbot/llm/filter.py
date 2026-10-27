@@ -1345,9 +1345,9 @@ class LLMFilter:
             self._record_usage(usage_before)
 
             # Парсим ответ: {"duplicates": [1, 3, ...]}
-            # recent передаётся для условного guard (лидер не пропускается только при пустом RECENT).
+            # M2-fix: лидер может быть помечен, инвариант проверяется выше по стеку.
             dup_indices = self._parse_dedup_response(
-                raw, len(chunk), chunk_start, recent,
+                raw, len(chunk), chunk_start,
             )
             all_dup_indices.update(dup_indices)
 
@@ -1408,7 +1408,6 @@ class LLMFilter:
         raw: Dict[str, Any],
         chunk_len: int,
         chunk_offset: int,
-        recent: List[dict],
     ) -> Set[int]:
         """
         Парсит ответ LLM ``{"duplicates": [1, 2, ...]}`` → Set[int] 0-based.
@@ -1416,17 +1415,12 @@ class LLMFilter:
         Битые/несуществующие/вне-диапазона индексы — игнорируются.
         Невалидная структура → пустое множество.
 
-        MAJOR-фикс — защита от «самоссылки» / лидера чанка:
-          (a) Guard лидера первого чанка (chunk_offset=0, idx=1 1-based) НЕ может
-              быть помечен как дубль — у него нет «более раннего» в чанке.
-              ДЛЯ ЧАНКОВ 2+: лидер МОЖЕТ быть кросс-чанковым дублем kept-лидера
-              из предыдущего чанка (реальный кейс: RU-версия в чанке 1, EN-версия
-              в чанке 2).
-          (b) Однако если RECENT (показанные) НЕПУСТЫ — лидер первого чанка
-              ДОЛЖЕН быть проверен против них (4b-фикс). Обоснование старого guard'а
-              ("нет более раннего в чанке") устарело: дубль мог быть показан
-              ранее в другом дайджесте. Guard остаётся когда RECENT пуст
-              (классический внутри-чанковый дедуп без внешнего контекста).
+        M2-fix: ЛЮБОЙ item (включая лидера чанка, idx=1) может быть помечен
+        как дубль более нового/полного item'а из того же чанка — это валидное
+        поведение (правило "newer becomes leader" в DEDUP_SYSTEM_PROMPT :537-543).
+        Инвариант «хотя бы один item остаётся» обеспечивается вызывающей
+        стороной: для digest-пути — pipeline.py:1362, для ingest-пути —
+        pipeline.py (Major ingest safety, _run_llm_dedup).
 
         Parameters
         ----------
@@ -1484,17 +1478,12 @@ class LLMFilter:
                 # несуществующий индекс — игнорируем
                 continue
 
-            # Guard: лидер первого чанка не пропускается как дубль, ЕСЛИ
-            # RECENT пуст (классический внутри-чанковый дедуп).
-            # При непустом RECENT лидер ДОЛЖЕН быть проверен против показанных
-            # (реальный кейс: дубль показан утром, вечерний лидер — тот же дубль).
-            if chunk_offset == 0 and idx == 1 and not recent:
-                logger.debug(
-                    "LLM-дедуп: модель пометила лидера первого чанка "
-                    "(1-based idx=1) как дубль — игнорируем (RECENT пуст, "
-                    "защита от самоссылки)",
-                )
-                continue
+            # M2-fix: leader of first chunk (idx=1) may be marked as duplicate
+            # of a newer/more-complete item from the same chunk -- valid behavior
+            # (rule "newer becomes leader" in DEDUP_SYSTEM_PROMPT :537-539).
+            # Invariant "at least one item remains" is guaranteed by caller:
+            # digest path — pipeline.py:1362; ingest path — pipeline.py
+            # (Major ingest safety, _run_llm_dedup).
 
             result.add(chunk_offset + (idx - 1))
 

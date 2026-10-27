@@ -20,6 +20,7 @@ from newsbot.llm.client import LLMError
 from newsbot.llm.prompts import (
     DEDUP_SYSTEM_PROMPT, build_dedup_user_message, sanitize_item_field,
     build_dedup_context_message, BuildDedupContext,
+    MAX_PROMPT_DEDUP_SUMMARY_CHARS,
 )
 from newsbot.storage import Storage
 
@@ -140,6 +141,56 @@ class TestDedupPrompts(unittest.TestCase):
         self.assertNotIn("RECENT NEWS", msg)
         self.assertIn("NEW NEWS", msg)
 
+    def test_build_dedup_user_message_contains_summary(self):
+        """F2-fix: dedup user-message содержит summary каждого item."""
+        items = [
+            _mk_item(
+                title="Над областями сбили 2 БПЛА",
+                summary="Российские системы ПВО сбили 2 украинских беспилотника над Белгородской областью. Пострадавших нет.",
+            ),
+        ]
+        msg = build_dedup_user_message(items, [])
+
+        # summary присутствует (ключевая часть текста)
+        self.assertIn("Белгородской", msg)
+        # title тоже присутствует
+        self.assertIn("сбили 2 БПЛА", msg)
+        # разметка summary
+        self.assertIn("# Summary", msg)
+
+    def test_build_dedup_user_message_summary_capped_at_200_chars(self):
+        """F2-fix: summary обрезается до MAX_PROMPT_DEDUP_SUMMARY_CHARS."""
+        from newsbot.llm.prompts import MAX_PROMPT_DEDUP_SUMMARY_CHARS
+
+        long_text = "X" * 1000
+        items = [
+            _mk_item(
+                title="Title",
+                summary=long_text,
+            ),
+        ]
+        msg = build_dedup_user_message(items, [])
+
+        # полный summary (1000 X's) не должен присутствовать
+        self.assertNotIn(long_text, msg)
+        # начало summary (первые MAX-3 X's) должно быть
+        self.assertIn(long_text[:MAX_PROMPT_DEDUP_SUMMARY_CHARS - 3], msg)
+
+    def test_dedup_system_prompt_has_updated_casualty_rule(self):
+        """F2-fix: DEDUP_SYSTEM_PROMPT содержит правило обновлённого числа жертв."""
+        from newsbot.llm.prompts import DEDUP_SYSTEM_PROMPT
+
+        self.assertIn("UPDATED casualty", DEDUP_SYSTEM_PROMPT)
+        self.assertIn("DUPLICATE", DEDUP_SYSTEM_PROMPT)
+        self.assertIn("same-place + same-incident + same-or-updated-figures", DEDUP_SYSTEM_PROMPT)
+        self.assertIn("24 hours", DEDUP_SYSTEM_PROMPT)
+
+    def test_dedup_system_prompt_narrows_stages_exception(self):
+        """F2-fix: исключение stages сужено до >24h."""
+        from newsbot.llm.prompts import DEDUP_SYSTEM_PROMPT
+
+        self.assertIn(">24 hours", DEDUP_SYSTEM_PROMPT)
+
 
 # =============================================================================
 # detect_duplicates — unit-тесты
@@ -226,17 +277,18 @@ class TestDetectDuplicatesParse(unittest.TestCase):
         self.assertEqual(result, set(), "LLMError в первом чанке → пустое множество")
 
     def test_out_of_range_index_ignored(self):
-        """Индексы за пределами чанка игнорируются; лидер (idx=1) защищён."""
+        """Индексы за пределами чанка игнорируются; лидер (idx=1) НЕ защищён (M2-fix)."""
         mock_client = MagicMock()
-        # При 5 items валидные 1-based: 2..5 (idx=1 — лидер, защищён).
+        # При 5 items валидные 1-based: 1..5.
         # 6, 999 — вне диапазона → игнорируются.
+        # M2-fix: idx=1 (лидер) БЕЗ защиты — снимается M2-фиксом.
         mock_client.chat_json.return_value = {"duplicates": [1, 6, 999]}
         flt = self._make_filter(mock_client)
 
         items = [_mk_item(title=str(i), url=f"u{i}") for i in range(5)]
         result = flt.detect_duplicates(items, [])
-        # idx=1 — лидер → защищён; 6, 999 — out-of-range → игнорируются
-        self.assertEqual(result, set())
+        # idx=1 → 0-based {0}; 6, 999 — out-of-range → игнорируются
+        self.assertEqual(result, {0})
 
     def test_broken_structure_no_crash(self):
         """Невалидная структура → пустое множество, не падает."""
@@ -693,13 +745,13 @@ class TestGetRecentTitles(unittest.TestCase):
 # =============================================================================
 
 class TestDedupLeaderGuard(unittest.TestCase):
-    """Minor #4-фикс: защита от пометки первого item чанка как дубль."""
+    """M2-fix: лидер чанка (idx=1) БЕЗ защиты — может быть помечен как дубль."""
 
     def _make_filter(self, mock_client) -> LLMFilter:
         return _make_filter(mock_client)
 
-    def test_leader_not_marked_as_duplicate(self):
-        """Первый item чанка (chunk_offset+1) не пропускается как дубль."""
+    def test_leader_may_be_marked_as_duplicate(self):
+        """M2-fix: первый item чанка МОЖЕТ быть помечен как дубль (newer becomes leader)."""
         mock_client = MagicMock()
         mock_client.chat_json.return_value = {"duplicates": [1, 2]}  # лидер + второй помечены
         flt = self._make_filter(mock_client)
@@ -711,49 +763,45 @@ class TestDedupLeaderGuard(unittest.TestCase):
         ]
 
         result = flt.detect_duplicates(items, [])
-        # idx=0 (лидер) — игнорируется; idx=1 (второй) — добавляется
-        self.assertEqual(result, {1})
-        self.assertNotIn(0, result, "Лидер чанка не должен быть помечен дублем")
+        # M2-fix: idx=1→0-based {0}, idx=2→1-based {1} — оба пропускаются
+        self.assertEqual(result, {0, 1})
 
     
 
-    def test_leader_guard_in_second_chunk(self):
+    def test_leader_may_be_marked_in_any_chunk(self):
         """
-        Cross-chunk dedup fix: лидер второго чанка (chunk_offset>0, idx=1 1-based)
-        МОЖЕТ быть помечен дублем — если он дублирует kept-лидер из чанка 1
+        M2-fix: лидер ЛЮБОГО чанка (включая chunk_offset=0) МОЖЕТ быть помечен
+        как дубль более нового/полного item'а из того же чанка.
+        Лидер второго чанка (chunk_offset>0, idx=1 1-based) — cross-chunk dup
         (реальный кейс: RU-версия в чанке 1, EN-версия в чанке 2).
-        Лидер первого чанка (chunk_offset=0) защищён — у него нет предшественников.
         """
         mock_client = MagicMock()
         # Для 50 items (2 чанка: 40 + 10):
-        # chunk 1 (offset=0, 40 items): guard idx=1 (лидер чанка 1), idx2→0-based 1
-        # chunk 2 (offset=40, 10 items): idx=1→0-based 40 (cross-chunk dup!), idx2→41, idx3→42
+        # chunk 1 (offset=0, 40 items): idx=1→0-based 0, idx=2→0-based 1
+        # chunk 2 (offset=40, 10 items): idx=1→0-based 40 (cross-chunk!), idx2→41, idx3→42
         mock_client.chat_json.side_effect = [
-            {"duplicates": [1, 2]},   # chunk 1: guard 1, 2→0-based 1
-            {"duplicates": [1, 2, 3]}, # chunk 2: idx1→40 (cross-chunk! allowed), 2→41, 3→42
+            {"duplicates": [1, 2]},    # chunk 1: 1→{0}, 2→{1}
+            {"duplicates": [1, 2, 3]},  # chunk 2: 1→{40}, 2→{41}, 3→{42}
         ]
         flt = self._make_filter(mock_client)
 
         items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(50)]
 
         result = flt.detect_duplicates(items, [])
-        # Лидер первого чанка защищён
-        self.assertNotIn(0, result, "Лидер чанка 1 (0-based=0) не должен быть помечен")
-        # Лидер второго чанка (chunk_offset>0) — МОЖЕТ быть дублем
+        # M2-fix: лидер любого чанка не защищён
+        self.assertIn(0, result, "M2-fix: лидер чанка 1 (0-based=0) может быть помечен")
+        self.assertIn(1, result, "idx=2 в чанке 1 проходит")
+        # Лидер второго чанка — cross-chunk dup
         self.assertIn(40, result, "Лидер чанка 2 (cross-chunk dup) может быть помечен")
-        # Не-лидеры проходят
-        self.assertIn(1, result)   # chunk1: 2→1
-        self.assertIn(41, result)  # chunk2: 2→41
-        self.assertIn(42, result)  # chunk2: 3→42
-        self.assertEqual(len(result), 4)
+        self.assertIn(41, result)
+        self.assertIn(42, result)
+        self.assertEqual(len(result), 5)
 
-    def test_all_chunk_marked_leaves_leader(self):
+    def test_partial_mark_leaves_some_0based_indices(self):
         """
-        Реальный сценарий: 10 новостей об одном событии (10 ссылок на статью
-        РИА «Россия сбила 80 украинских дронов»). LLM вернула duplicates=[2..10]
-        (все не-лидеры). После guard (a) лидер (idx=1) заблокирован, в result
-        попадают все 9 не-лидеров — они скипаются при доставке.
-        Лидер (idx=0) остаётся и доставляется.
+        M2-fix: модель пометила 9 из 10 items (idx 2..10), лидер (idx=1)
+        НЕ помечен. Это типичный валидный ответ — лидер доставляется,
+        9 остальных скипаются.
         """
         mock_client = MagicMock()
         # Модель пометила все 9 не-лидеров (1-based idx 2..10)
@@ -764,11 +812,10 @@ class TestDedupLeaderGuard(unittest.TestCase):
 
         result = flt.detect_duplicates(items, [])
 
-        # Guard (a): idx=1 (лидер) → заблокирован → 0 NOT in result
-        # Все остальные (idx 2..10 → 0-based 1..9) → в result
-        expected = {1, 2, 3, 4, 5, 6, 7, 8, 9}
-        self.assertEqual(result, expected)
-        self.assertNotIn(0, result, "Лидер чанка не должен быть помечен как дубль")
+        # M2-fix: лидер (idx=1→0-based 0) не помечен моделью → отсутствует в result
+        # Остальные (idx 2..10 → 0-based 1..9) → в result
+        self.assertNotIn(0, result, "Лидер не помечен моделью — отсутствует в result")
+        self.assertEqual(result, {1, 2, 3, 4, 5, 6, 7, 8, 9})
 
     def test_budget_refused_when_insufficient(self):
         """
@@ -821,6 +868,63 @@ class TestDedupLeaderGuard(unittest.TestCase):
                             pipeline.close()
 
         self.assertEqual(skipped, 0, "Дедуп должен быть пропущен при недостатке бюджета")
+
+    def test_all_items_marked_returns_0_and_no_skipped(self):
+        """
+        Major ingest safety: если модель пометила ВСЕ кандидаты дублями —
+        результат игнорируется, бюджет возвращается, items остаются state='new'.
+        Это предотвращает тихую потерю батча при невалидном ответе LLM.
+        """
+        from newsbot.pipeline import NewsPipeline
+
+        mock_client = MagicMock()
+        # Модель пометила ВСЕ 3 items как дубли (1-based idx 1, 2, 3)
+        mock_client.chat_json.return_value = {"duplicates": [1, 2, 3]}
+        flt = LLMFilter({
+            "enabled": True, "api_key": "key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+        }, client=mock_client)
+
+        cfg = {
+            "llm": {"llm_dedup": True, "enabled": True, "api_key": "key",
+                    "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False},
+            "dedup": {"window_days": 3, "llm_recent_limit": 20},
+        }
+
+        candidates = [_mk_item(title=str(i), url=f"u{i}") for i in range(3)]
+
+        with _tmp_db() as db_path:
+            store = Storage(db_path)
+            inserted = store.save_many(candidates)
+            self.assertEqual(len(inserted), 3)
+            store.close()
+
+            cfg_copy = dict(cfg)
+            cfg_copy["database"] = {"path": db_path}
+            with patch.object(NewsPipeline, '_build_delivery', return_value=MagicMock()):
+                with patch.object(NewsPipeline, '_build_llm_filter', return_value=flt):
+                    with patch.object(NewsPipeline, '_resolve_db_path', return_value=db_path):
+                        pipeline = NewsPipeline(cfg_copy)
+                        try:
+                            pipeline._llm_dedup_skipped_urls = set()
+                            pipeline.llm_filter = flt
+                            pipeline._llm_calls_left = 10  # достаточно
+
+                            skipped = pipeline._run_llm_dedup(candidates)
+
+                            # Вернулся 0 — никаких дублей не зафиксировано
+                            self.assertEqual(skipped, 0)
+                            # Бюджет НЕ списан (было 10, стало 10)
+                            self.assertEqual(pipeline._llm_calls_left, 10)
+                            # LLM всё равно был вызван
+                            mock_client.chat_json.assert_called_once()
+                            # set_state('skipped') НЕ вызывался — items в 'new'
+                            self.assertEqual(
+                                pipeline.storage.count_by_state("new"), 3,
+                                "Все items должны остаться state='new', не 'skipped'",
+                            )
+                        finally:
+                            pipeline.close()
 
     def test_budget_subtracted_on_success(self):
         """

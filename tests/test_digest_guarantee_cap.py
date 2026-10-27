@@ -421,5 +421,235 @@ class TestLocDayKeyMatchesCap(unittest.TestCase):
             p.close()
 
 
+# =============================================================================
+# F3-тесты: нормализация локации для cap'а
+# =============================================================================
+
+class TestNormalizeCapKey(unittest.TestCase):
+    """F3-фикс: _normalize_cap_key схлопывает вариации локаций в одно ядро."""
+
+    def _key(self, loc):
+        from newsbot.pipeline import _normalize_cap_key
+        return _normalize_cap_key(loc)
+
+    def test_english_variations_collapse(self):
+        """«Voronezh region» и «Voronezh» → одинаковый ключ."""
+        self.assertEqual(self._key("Voronezh region"), self._key("Voronezh"))
+        self.assertEqual(self._key("Voronezh region, Russia"), self._key("Voronezh"))
+        self.assertEqual(self._key("Voronezh"), self._key("voronezh"))
+
+    def test_comma_cut_keeps_core(self):
+        """Обрезка по запятой: «City, Country» → «city» (generic-суффикс убирается)."""
+        self.assertEqual(self._key("Voronezh, Russia"), "voronezh")
+        self.assertEqual(self._key("Moscow, Russia"), "moscow")
+        # "Krasnodar Krai" → comma-cut → "Krasnodar Krai" → strip "krai" → "krasnodar"
+        self.assertEqual(self._key("Krasnodar Krai, Russia"), "krasnodar")
+
+    def test_generic_suffixes_stripped(self):
+        """English generic-суффиксы убираются."""
+        self.assertEqual(self._key("Voronezh region"), "voronezh")
+        self.assertEqual(self._key("Leningrad oblast"), "leningrad")
+        self.assertEqual(self._key("Stavropol krai"), "stavropol")
+        self.assertEqual(self._key("Primorsky district"), "primorsky")
+        self.assertEqual(self._key("Catalonia province"), "catalonia")
+        self.assertEqual(self._key("Bavaria area"), "bavaria")
+
+    def test_russian_generic_suffixes_stripped(self):
+        """Russian generic-суффиксы убираются."""
+        self.assertEqual(self._key("Воронежская область"), "воронежская")
+        self.assertEqual(self._key("Краснодарский край"), "краснодарский")
+        self.assertEqual(self._key("Ростовская обл"), "ростовская")
+        self.assertEqual(self._key("Татарстан регион"), "татарстан")
+        self.assertEqual(self._key("Саратовский район"), "саратовский")
+
+    def test_moscow_vs_moscow_oblast_not_collapsed(self):
+        """Критический регрессионный: «Москва» ≠ «Московская область».
+
+        «московская область» не схлопывается, т.к. «область» здесь —
+        основное слово (без уточнителя), а не generic-суффикс.
+        """
+        # «Москва» → «москва»
+        self.assertEqual(self._key("Москва"), "москва")
+        # «Московская область» → comma-cut не срабатывает (нет запятой) →
+        #   generic-суффикс «область» убирается → «московская»
+        self.assertNotEqual(self._key("Московская область"), self._key("Москва"))
+
+    def test_empty_and_none(self):
+        """Пустая/None → ''."""
+        self.assertEqual(self._key(""), "")
+        self.assertEqual(self._key(None), "")
+        self.assertEqual(self._key("   "), "")
+
+    def test_comma_only_before_generic(self):
+        """«Voronezh region, Russia» → comma-cut даёт «voronezh region»,
+        затем убирается « region»."""
+        self.assertEqual(self._key("Voronezh region, Russia"), "voronezh")
+
+
+class TestCapByLocationNormalization(unittest.TestCase):
+    """F3-фикс: cap схлопывает «Voronezh region» и «Voronezh» в одну группу."""
+
+    class FakeItem:
+        def __init__(self, url, cluster_key):
+            self.url = url
+            self.cluster_key = cluster_key
+
+    def test_varied_location_variants_capped_together(self):
+        """«Voronezh region» и «Voronezh» попадают в одну группу → cap=2 пропускает 2."""
+        items = [
+            self.FakeItem("u1", "voronezh region|a|2026-10-20"),
+            self.FakeItem("u2", "Voronezh|b|2026-10-20"),
+            self.FakeItem("u3", "voronezh, russia|c|2026-10-20"),
+            self.FakeItem("u4", "Voronezh Region|d|2026-10-20"),
+        ]
+        result = _cap_by_location(items, max_per_location=2)
+        # Все 4 → одно нормализованное ядро «voronezh» → cap=2 → первые 2 проходят
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            sorted(it.url for it in result),
+            ["u1", "u2"],
+            "Первые 2 (по порядку) должны пройти, остальные — cap отсек",
+        )
+
+    def test_different_locations_separate(self):
+        """Разные локации не схлопываются."""
+        items = [
+            self.FakeItem("u1", "voronezh region|a|2026-10-20"),
+            self.FakeItem("u2", "moscow region|b|2026-10-20"),
+            self.FakeItem("u3", "voronezh|c|2026-10-20"),
+            self.FakeItem("u4", "krasnodar|d|2026-10-20"),
+        ]
+        result = _cap_by_location(items, max_per_location=2)
+        # voronezh (2 variant) + moscow + krasnodar = 4, cap=2 на группу
+        # voronezh: 2 items (both pass cap=2)
+        # moscow: 1 item (passes)
+        # krasnodar: 1 item (passes)
+        self.assertEqual(len(result), 4, "cap не схлопывает voronezh и moscow")
+
+    def test_russian_location_variants_capped(self):
+        """F3: русские вариации схлопываются через generic-stripping.
+
+        «Воронежская область» → «воронежская» (убираем « область»)
+        «Воронежская» → «воронежская» (без изменений)
+        Оба имеют ключ «воронежская» → cap=2 пропускает оба.
+        «Воронеж» → «воронеж» (отдельный ключ, cap=2 пропускает).
+        Итого все 3 проходят: cap НЕ ограничивает «воронежскую»+«воронежскую»+
+        «воронеж» в одно ведро, т.к. «воронежская»≠«воронеж».
+        """
+        items = [
+            self.FakeItem("u1", "воронежская область|a|2026-10-20"),
+            self.FakeItem("u2", "воронеж|b|2026-10-20"),
+            self.FakeItem("u3", "воронежская|c|2026-10-20"),
+        ]
+        result = _cap_by_location(items, max_per_location=2)
+        # «воронежская» (u1,u3) в одном бакете — cap=2, оба проходят.
+        # «воронеж» (u2) — отдельный бакет — cap=2, проходит.
+        # Все 3 проходят.
+        self.assertEqual(len(result), 3,
+            "воронежская+воронежская (область) НЕ схлопываются с воронеж")
+
+    def test_loc_day_key_uses_normalization(self):
+        """_loc_day_key возвращает нормализованную локацию."""
+        from newsbot.pipeline import _loc_day_key
+        item1 = self.FakeItem("u1", "Voronezh region|a|2026-10-20")
+        item2 = self.FakeItem("u2", "Voronezh|b|2026-10-20")
+        key1 = _loc_day_key(item1)
+        key2 = _loc_day_key(item2)
+        self.assertEqual(key1, key2,
+            "_loc_day_key должен схлопывать вариации")
+        self.assertEqual(key1[0], "voronezh")
+
+
+class TestCapNormalizationWarning(unittest.TestCase):
+    """F3: warning при коллизиях нормализации."""
+
+    class FakeItem:
+        def __init__(self, url, cluster_key):
+            self.url = url
+            self.cluster_key = cluster_key
+
+    def test_warning_on_collision(self):
+        """При схлопывании >1 исходной строки в одно ядро — WARNING.
+
+        Warning вызывается когда cap реально удаляет items (len(result)<len(items)).
+        Используем 3 варианта локации → 2 нормализованных ядра:
+        - 'voronezh region' и 'Voronezh' → нормализуются в 'voronezh'
+        - 'krasnodar krai' → нормализуется в 'krasnodar'
+        При cap=1: voronezh бакет получает 2 item'а → cap отсекает 1 →
+        warning срабатывает (len(result)=2 < len(items)=3).
+        """
+        items = [
+            self.FakeItem("u1", "Voronezh region|a|2026-10-20"),
+            self.FakeItem("u2", "Voronezh|b|2026-10-20"),
+            self.FakeItem("u3", "Krasnodar Krai|c|2026-10-20"),
+        ]
+        with self.assertLogs("newsbot.pipeline", level="WARNING") as cm:
+            _cap_by_location(items, max_per_location=1)
+        self.assertTrue(
+            len(cm.output) >= 1,
+            f"Expected at least 1 WARNING, got: {cm.output}",
+        )
+
+    def test_same_location_no_warning(self):
+        """Одинаковые локации — схлопывания нет → warning НЕ вызывается."""
+        import logging
+
+        records = []
+
+        class _H(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _H()
+        pipe_logger = logging.getLogger("newsbot.pipeline")
+        pipe_logger.addHandler(handler)
+        try:
+            items = [
+                self.FakeItem("u1", "voronezh|a|2026-10-20"),
+                self.FakeItem("u2", "voronezh|b|2026-10-20"),
+                self.FakeItem("u3", "voronezh|c|2026-10-20"),
+            ]
+            # cap=1: убирает 2 из 3, но все из одной локации → нет вариантов → нет warning
+            _cap_by_location(items, max_per_location=1)
+            # Нет warning-ов о нормализации
+            uniq_warns = [r for r in records if "вариантов" in r]
+            self.assertEqual(uniq_warns, [], f"Не должно быть warning о вариантах: {uniq_warns}")
+        finally:
+            pipe_logger.removeHandler(handler)
+
+    def test_variant_collapse_logs_warning_with_uniq_text(self):
+        """«Voronezh region» + «Voronezh» → warning ЕСТЬ, 2 уникальных варианта."""
+        import logging
+
+        records = []
+
+        class _H(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        handler = _H()
+        pipe_logger = logging.getLogger("newsbot.pipeline")
+        pipe_logger.addHandler(handler)
+        try:
+            items = [
+                self.FakeItem("u1", "Voronezh region|a|2026-10-20"),
+                self.FakeItem("u2", "Voronezh|b|2026-10-20"),
+                self.FakeItem("u3", "krasnodar|c|2026-10-20"),
+            ]
+            _cap_by_location(items, max_per_location=1)
+            uniq_warns = [r for r in records if "вариантов" in r]
+            self.assertTrue(
+                len(uniq_warns) >= 1,
+                f"Expected warning о вариантах, got: {records}",
+            )
+            # текст содержит 2 варианта (не len(orig_locations)=2, а uniq count)
+            self.assertIn(
+                "2 вариантов", uniq_warns[0],
+                f"Warning должен показать 2 варианта: {uniq_warns}",
+            )
+        finally:
+            pipe_logger.removeHandler(handler)
+
+
 if __name__ == "__main__":
     unittest.main()

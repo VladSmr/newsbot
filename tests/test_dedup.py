@@ -26,6 +26,7 @@ from newsbot.dedup import (
     _number_multiset,
     _meaningful_tokens,
     _token_jaccard,
+    is_containment_duplicate,
 )
 from newsbot.storage import Storage, MIN_TITLE_LEN
 
@@ -1880,6 +1881,247 @@ class TestSeenTitlesLimit(unittest.TestCase):
             rows_limited = st.get_recent_normalized_titles(window_days=3, limit=10)
             self.assertEqual(len(rows_limited), 10,
                              "limit>0 должен усекать выборку до LIMIT")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+
+# =============================================================================
+# Containment-дедуп: один заголовок целиком входит в другой (F1 fix)
+# =============================================================================
+
+class TestContainmentDedup(unittest.TestCase):
+    """Containment-правило: один нормализованный заголовок входит в другой."""
+
+    # ── Позитивные кейсы ──────────────────────────────────────────────
+
+    def test_containment_voronezh_tass_ria(self):
+        """
+        Containment по prefix: короче на ~7 символов — «region» отсутствует.
+        ratio ≈ 0.905 < 0.95 — без containment не был бы дублем.
+        is_containment_duplicate: оба ≥30, числовой guard (нет чисел → пустые
+        Counter совпадают), Jaccard токенов = 1.0 ≥ 0.8, shorter ∈ longer → True.
+        """
+        # a = longer (47 симв.), b = shorter (40 симв.)
+        # b = prefix a: "two killed in ... voronezh" является началом a
+        a = "two killed in ukrainian attack on voronezh tass"
+        b = "two killed in ukrainian attack on voronezh"
+        self.assertTrue(is_containment_duplicate(a, b, 0.8))
+        self.assertTrue(is_containment_duplicate(b, a, 0.8))
+
+    def test_containment_voronezh_english(self):
+        """
+        Та же пара: shorter входит в longer по границе слова.
+        """
+        a = "two killed in ukrainian attack on voronezh region"
+        b = "two killed in ukrainian attack on voronezh"
+        self.assertTrue(is_containment_duplicate(a, b, 0.8))
+        self.assertTrue(is_containment_duplicate(b, a, 0.8))
+
+    def test_containment_russian_version(self):
+        """Русская версия: один заголовок полностью входит в другой."""
+        a = "два человека погибли при украинской атаке на воронежскую область тасс"
+        b = "два человека погибли при украинской атаке на воронежскую область"
+        # a = 67 симв., b = 63 симв. — оба ≥30; b ∈ a (prefix)
+        self.assertTrue(is_containment_duplicate(a, b, 0.8))
+        self.assertTrue(is_containment_duplicate(b, a, 0.8))
+
+    def test_containment_fuzzy_path_voronezh(self):
+        """
+        Интеграционно (через _is_fuzzy_similar): пара с prefix containment
+        распознаётся как дубль через containment-ветку (без ratio).
+        ratio ≈ 0.905 < 0.95, но containment срабатывает.
+        """
+        a = "two killed in ukrainian attack on voronezh reuters"
+        b = "two killed in ukrainian attack on voronezh"
+        self.assertTrue(_is_fuzzy_similar(a, b, 0.95, 0.8))
+
+    def test_containment_exact_substring(self):
+        """Полное вхождение одной строки в другую — дубль (оба ≥30 симв.)."""
+        a = "bitcoin fell to 60000 dollars amid global market selloff"
+        b = "bitcoin fell to 60000 dollars amid global market"
+        # b (43) ∈ a (56) — real prefix match; оба ≥30
+        self.assertTrue(is_containment_duplicate(a, b, 0.8))
+        self.assertTrue(is_containment_duplicate(b, a, 0.8))
+
+    def test_containment_with_numbers_same(self):
+        """Containment с совпадающими числами — дубль (оба ≥30 симв.)."""
+        a = "fed raises rates by 25 bps amid inflation concerns"
+        b = "fed raises rates by 25 bps amid inflation"
+        # b (38) ∈ a (45) — prefix match; оба ≥30, числа 25 одинаковые
+        self.assertTrue(is_containment_duplicate(a, b, 0.8))
+        self.assertTrue(is_containment_duplicate(b, a, 0.8))
+
+    # ── Негативные кейсы ─────────────────────────────────────────────
+
+    def test_containment_different_numbers_blocked(self):
+        """
+        Containment, но РАЗНЫЕ числа → числовой guard блокирует.
+        «2 killed» vs «3 killed» — разные факты, не дубль.
+        """
+        a = "two killed in attack on voronezh region"
+        b = "three killed in attack on voronezh region"
+        # один входит в другой, но числа разные
+        self.assertFalse(is_containment_duplicate(a, b, 0.8))
+        self.assertFalse(is_containment_duplicate(b, a, 0.8))
+
+    def test_containment_different_entities_blocked(self):
+        """
+        Containment по prefix, но РАЗНЫЕ сущности (числа/токены) —
+        числовой guard или token-guard блокирует.
+        «bitcoin falls» vs «ethereum falls» — не дубль.
+        """
+        a = "bitcoin fell to 60000 dollars on monday"
+        b = "ethereum fell to 60000 dollars on monday"
+        # containment: b не в a, a не в b — оба не входят друг в друга
+        self.assertFalse(is_containment_duplicate(a, b, 0.8))
+        self.assertFalse(is_containment_duplicate(b, a, 0.8))
+
+    def test_containment_short_titles_not_applied(self):
+        """
+        Короткие заголовки (<30 симв.) — containment не применяется.
+        «EU approves» vs «EU approves law» — не дубль (правило не применяется).
+        """
+        a = "eu approves new regulation for banks"
+        b = "eu approves new regulation"
+        # a = 33 симв., b = 25 симв. → b < 30, правило не применяется
+        self.assertFalse(is_containment_duplicate(a, b, 0.8))
+        self.assertFalse(is_containment_duplicate(b, a, 0.8))
+
+    def test_containment_word_boundary_exact(self):
+        """
+        Containment по границе слова: «bitcoin» не совпадает с «bitcoins».
+        NOTE: нормализованный текст без пунктуации, поэтому «bitcoins» и «bitcoin»
+        — разные токены.
+        """
+        a = "bitcoins surge after regulatory news"
+        b = "bitcoin surge after regulatory news"
+        # a = 36, b = 35 — оба ≥30, числовой guard (нет чисел) → пустые
+        # Но: «bitcoin» не входит в «bitcoins» и наоборот (не совпадают).
+        # containment проверяет literal substring — это разные строки.
+        self.assertFalse(is_containment_duplicate(a, b, 0.8))
+
+    def test_containment_empty_strings(self):
+        """Пустые строки — не дубль."""
+        self.assertFalse(is_containment_duplicate("", "hello world", 0.8))
+        self.assertFalse(is_containment_duplicate("hello world", "", 0.8))
+        self.assertFalse(is_containment_duplicate("", "", 0.8))
+
+    def test_containment_one_short(self):
+        """Один из пары < 30 симв. — правило не применяется (длина <30 отсекается)."""
+        a = "russia launches new missile from black sea fleet"  # 50 симв.
+        b = "short headline"                                   # 14 симв.
+        # b < 30 → containment не запускается → False
+        self.assertFalse(is_containment_duplicate(a, b, 0.8))
+        self.assertFalse(is_containment_duplicate(b, a, 0.8))
+
+    # ── Регрессия: существующие fuzzy-кейсы не изменились ───────────
+
+    def test_fuzzy_existing_behavior_unchanged(self):
+        """
+        Регресс: существующие кейсы _is_fuzzy_similar не должны измениться.
+        Тестируем наборами из TestFuzzyDedup и TestNumberGuard.
+        """
+        # Точное совпадение
+        self.assertTrue(_is_fuzzy_similar("hello world", "hello world", 0.9, 0.8))
+        # Высокая схожесть ≥ threshold
+        a = "russia launches new missile from black sea fleet"
+        b = "russia launches new missile from black sea"
+        self.assertTrue(_is_fuzzy_similar(a, b, 0.9, 0.8))
+        # Низкая схожесть < threshold
+        a = "scientists discover new species of deep sea fish"
+        b = "government announces new tax policy for businesses"
+        self.assertFalse(_is_fuzzy_similar(a, b, 0.9, 0.8))
+        # Числовой guard блокирует разные числа
+        a = "bitcoin fell to 60000 dollars"
+        b = "bitcoin fell to 30000 dollars"
+        self.assertFalse(_is_fuzzy_similar(a, b, 0.9, 0.8))
+
+    def test_fuzzy_integration_voronezh_not_ratio(self):
+        """
+        Интеграция: prefix pair — ratio < threshold, но containment → дубль.
+        Числовой guard: пустые множества (совпадают).
+        """
+        a = "two killed in ukrainian attack on voronezh reuters"
+        b = "two killed in ukrainian attack on voronezh"
+        # ratio ≈ 0.913 < 0.95, но containment (b ∈ a) → True
+        self.assertTrue(_is_fuzzy_similar(a, b, 0.95, 0.8))
+
+
+class TestContainmentDedupIntegration(unittest.TestCase):
+    """Интеграция containment в filter_new: дубли отклоняются через containment."""
+
+    def test_filter_new_containment_dup_voronezh(self):
+        """
+        filter_new: пара «Latest: Two killed ... — Reuters» / «Two killed ... — Reuters»
+        отклоняется через containment-ветку.
+        item1.normalized = "latest two killed in ... voronezh reuters" (57 симв.)
+        item2.normalized = "two killed in ... voronezh reuters" (50 симв.)
+        item2.normalized ∈ item1.normalized (prefix, word-boundary OK).
+        """
+        path = _tmp_db()
+        try:
+            cfg = {
+                "cross_source": True, "fuzzy": True,
+                "threshold": 0.95, "token_threshold": 0.8, "window_days": 3,
+            }
+            st = Storage(Path(path), dedup_config=cfg)
+
+            # item1 с «Latest:» — нормализуется в
+            # "latest two killed in ukr...voronezh reuters" (57 симв.)
+            item1 = _mk_item(
+                title="Latest: Two killed in Ukrainian attack on Voronezh — Reuters",
+                source="reuters.com",
+                url="https://reuters.com/voronezh",
+            )
+            st.save(item1)
+            st.set_state([item1.url], "delivered")
+
+            # item2 без «Latest:» — нормализуется в
+            # "two killed in ukr...voronezh reuters" (50 симв.)
+            # Это prefix item1.normalized (item2.norm starts at pos 7 in item1.norm).
+            item2 = _mk_item(
+                title="Two killed in Ukrainian attack on Voronezh — Reuters",
+                source="reuters2.com",
+                url="https://reuters2.com/voronezh",
+            )
+
+            new_items, total, dup = filter_new([item2], st, dedup_config=cfg)
+            self.assertEqual(dup, 1, "Containment: prefix pair — дубль")
+            self.assertEqual(len(new_items), 0)
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_filter_new_containment_different_numbers_not_dup(self):
+        """
+        filter_new: «2 killed» vs «3 killed» — НЕ дубль (числовой guard).
+        """
+        path = _tmp_db()
+        try:
+            cfg = {
+                "cross_source": True, "fuzzy": True,
+                "threshold": 0.95, "token_threshold": 0.8, "window_days": 3,
+            }
+            st = Storage(Path(path), dedup_config=cfg)
+
+            item1 = _mk_item(
+                title="Two killed in Ukrainian attack on Voronezh — ТАСС",
+                source="tass.ru",
+                url="https://tass.ru/voronezh-2",
+            )
+            st.save(item1)
+            st.set_state([item1.url], "delivered")
+
+            item2 = _mk_item(
+                title="Three killed in Ukrainian attack on Voronezh — РИА",
+                source="ria.ru",
+                url="https://ria.ru/voronezh-3",
+            )
+
+            new_items, total, dup = filter_new([item2], st, dedup_config=cfg)
+            self.assertEqual(dup, 0, "Разные числа — не дубль (числовой guard)")
+            self.assertEqual(len(new_items), 1)
             st.close()
         finally:
             _cleanup_db(path)

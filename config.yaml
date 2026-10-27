@@ -152,7 +152,9 @@ digest:
   times: ["08:00", "20:00"]         # HH:MM в ЛОКАЛЬНОЙ tz; совпадает с format_time_utc
   max_items: 30                      # лимит новостей в одном дайджесте (≤30 самых важных, сортировка: score DESC, fetched_at ASC).
                                    # При 40 deferred-items в дайджест попадают только топ-30 (т.к. get_deferred_items LIMIT 30).
-  max_items_per_message: 20         # новостей на одно Telegram-сообщение (не более 4096 символов)
+  max_items_per_message: 20         # новостей на одно Telegram-сообщение (НЕ БОЛЕЕ 4096 символов;
+                                   # фактическая нарезка — по бюджету ≈4096 символов, а не по count;
+                                   # при typical length ~400 chars/item реально ≈10 items)
   on_empty: skip                    # "skip" — не слать пустой дайджест; другое — на будущее
   cluster_duplicates: true          # финальная LLM-кластеризация deferred перед отправкой (убирает дубли одного события)
   max_age_hours: 24                 # выбирать deferred-items не старше N часов (суточное окно)
@@ -163,7 +165,10 @@ digest:
                                     # ограничивает выборку (lag scheduler не урезает 24ч-окно
                                     # владельца). При отсутствии/битом значении — fallback на
                                     # digest_window_started_at из meta.
-  guarantee_min_score: 3           # порог llm_score для добора skipped-items в гарантию категорий
+  guarantee_min_score: 4           # порог llm_score для добора skipped-items в гарантию категорий
+                                   # F5-fix: поднят с 3, т.к. "пустышки" (no facts) теперь score≤3
+                                   # по общему правилу в _SCORE_SCALE; гарантия добирает ≤3 → избыточно.
+                                   # Изменение обратимо: вернуть 3 если понадобится.
   max_per_location: 2               # макс. новостей на локацию/день в дайджесте
 
   # Минимум новостей по категории (каждая учитывается по скорингу)

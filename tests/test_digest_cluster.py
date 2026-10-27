@@ -22,7 +22,7 @@ _root = Path(__file__).parent.parent
 sys.path.insert(0, str(_root))
 
 from newsbot.collector import NewsItem
-from newsbot.pipeline import NewsPipeline
+from newsbot.pipeline import NewsPipeline, _cap_by_location
 from newsbot.storage import Storage
 
 
@@ -331,8 +331,85 @@ class TestClusterUnit(unittest.TestCase):
 
         items = [_mk_item(title=str(i), url=f"https://ex.com/l{i}") for i in range(5)]
         result_dups, _ = p._cluster_deferred_duplicates(items, "2026-01-01T00:00:00+00:00")
-
         self.assertEqual(result_dups, {"https://ex.com/l1"})
+
+    def test_llm_passes_case_variant_pair(self):
+        """
+        LLM-дедуп (mock) пропускает пару заголовков в разном регистре —
+        оба проходят в пул. F6-детерминированный containment работает
+        отдельно в run_digest (протестирован в test_dedup.py:
+        is_containment_duplicate с title_normalized).
+        """
+        items = [
+            _mk_item(title="Two Killed in Ukrainian Attack on Voronezh Region",
+                     url="https://ex.com/c1"),
+            _mk_item(title="Two killed in Ukrainian attack on Voronezh region",
+                     url="https://ex.com/c2"),
+        ]
+        mock_filter = MagicMock()
+        mock_filter.detect_duplicates.return_value = set()  # LLM не нашла дублей
+        p = _mk_pipeline_unit(llm_filter=mock_filter)
+
+        result_dups, _ = p._cluster_deferred_duplicates(
+            items, "2026-01-01T00:00:00+00:00",
+        )
+        # LLM-шаг: дубли не найдены → оба проходят в пул (для F6)
+        self.assertEqual(result_dups, set(),
+                         "LLM не помечает пару с разным регистром — оба в пуле")
+
+
+# =============================================================================
+# M4: location-cap warning observability
+# =============================================================================
+
+# =============================================================================
+# M4: location-cap warning observability (pytest style for caplog fixture)
+# =============================================================================
+
+def test_duplicate_location_no_warning():
+    """
+    Две новости с ОДИНАКОВОЙ локацией → warning НЕТ.
+    len(set(orig_locations)) == 1 → внешний if False.
+    """
+    items = [
+        _mk_item(title="Item A", url="https://ex.com/mos1",
+                 cluster_key="москва|other|2026-10-20"),
+        _mk_item(title="Item B", url="https://ex.com/mos2",
+                 cluster_key="москва|other|2026-10-20"),
+    ]
+    result = _cap_by_location(items, max_per_location=2)
+    # Ни один не отсечён (лимит 2), warning не генерируется
+    assert len(result) == 2
+
+
+def test_normalized_collision_warns_with_variants(caplog):
+    """
+    Minor C (pipeline.py:800-808): warning при схлопывании нескольких вариантов
+    в одно нормализованное ядро — считаются УНИКАЛЬНЫЕ варианты, не вхождения.
+    Условие: `normalized_location_sources` содержит ≥1 ключ с ≥2 уникальными
+    исходными строками. Два разных cluster_key нормализуются к одному ядру
+    (loc_norm, day), поэтому лежат в одной группе — len(set) > 1 внутри группы.
+    """
+    items = [
+        # оба нормализуются к (voronezh, 2026-10-20) но с РАЗНЫХ raw строк
+        _mk_item(title="A", url="https://ex.com/v1",
+                 cluster_key="voronezh region|a|2026-10-20"),
+        _mk_item(title="B", url="https://ex.com/v2",
+                 cluster_key="Voronezh|b|2026-10-20"),
+        # отдельный ключ (krasnodar, 2026-10-21) — чтобы len(normalized_location_sources) > 1
+        _mk_item(title="C", url="https://ex.com/v3",
+                 cluster_key="krasnodar|c|2026-10-21"),
+    ]
+    with caplog.at_level("WARNING"):
+        result = _cap_by_location(items, max_per_location=1)
+    # cap=1: voronezh отдаёт 1, krasnodar не ограничен → 2 результата
+    assert len(result) == 2
+    # Warning: 2 уникальных варианта в ядре 'voronezh'
+    assert any(
+        "объединяет 2 вариантов" in record.message
+        and "voronezh" in record.message.lower()
+        for record in caplog.records
+    ), f"Warning должен сообщать о 2 вариантах (uniq). Got: {[r.message for r in caplog.records]}"
 
 
 # =============================================================================
@@ -788,6 +865,294 @@ class TestOffpeakGateInCheckAgainstShown(unittest.TestCase):
             mock_filter.detect_duplicates.assert_not_called()
 
             p.storage.close()
+            p.close()
+
+
+# =============================================================================
+# F6-тесты: детерминированная containment-страховка после LLM-кластеризации
+# =============================================================================
+
+class TestContainmentDedupAfterLLM(unittest.TestCase):
+    """F6-фикс: после LLM-кластеризации — проход containment-check.
+
+    LLM мог пропустить пары с одинаковым содержанием, но разной формулировкой.
+    Containment-check (is_containment_duplicate) ловит такие пары:
+    - ≥30 символов нормализованных заголовков
+    - одинаковое числовое множество (guard от «2 killed» vs «3 killed»)
+    - Jaccard ≥0.8
+    - word-boundary containment
+    """
+
+    def test_containment_duplicate_filtered_leader_sent(self):
+        """
+        Два containment-дубля в пуле дайджеста:
+        - leader (высокий score) → отправлен
+        - duplicate (низкий score) → отфильтрован, помечен 'digested'
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.close()
+
+            # Титлы ≥30 символов, одинаковые числа, containment.
+            # Leader: score 8, fetched 2025-01-01 (ранее → лидер по tiebreak).
+            # Duplicate: score 6, fetched 2025-01-02 (позже).
+            # LLM-кластеризация пропускает их (detect_duplicates → {}).
+            leader_title = "Two killed in Ukrainian attack on Voronezh region"
+            dup_title = "Two killed in Ukrainian attack on Voronezh"
+            # Оба ≥ 30 символов после normalize_location (title_normalized в dedup):
+            # "two killed in ukrainian attack on voronezh region" = 38
+            # "two killed in ukrainian attack on voronezh" = 33
+
+            _insert_deferred_item(
+                db_path,
+                title=leader_title,
+                url="https://ex.com/leader-f6",
+                published="2025-01-01 12:00",
+                fetched_at="2025-01-01T12:00:00+00:00",
+                score=8,
+            )
+            _insert_deferred_item(
+                db_path,
+                title=dup_title,
+                url="https://ex.com/dup-f6",
+                published="2025-01-01 12:00",
+                fetched_at="2025-01-02T12:00:00+00:00",
+                score=6,
+            )
+
+            # LLM пропускает пары (не находит дублей)
+            mock_filter = MagicMock()
+            mock_filter.detect_duplicates.return_value = set()
+
+            p = _mk_pipeline_integration(db_path, llm_filter=mock_filter)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Leader отправлен, dup отфильтрован (проверяем по URL, не по title,
+            # т.к. dup_title — подстрока leader_title)
+            self.assertEqual(count, 1)
+            send_args = delivery.send_text.call_args[0][0]
+            self.assertIn("https://ex.com/leader-f6", send_args)
+            self.assertNotIn("https://ex.com/dup-f6", send_args)
+
+            # После успешного дайджеста ВСЁ окно удалено (лидер отправлен → digested → удалён)
+            all_urls = set()
+            for state in ("deferred", "digested", "new", "pending", "skipped", "failed"):
+                all_urls.update(i.url for i in p.storage.get_all_by_state(state))
+            self.assertNotIn("https://ex.com/leader-f6", all_urls)
+            self.assertNotIn("https://ex.com/dup-f6", all_urls)
+            p.close()
+
+    def test_three_items_two_containment_pairs_one_leader_survives(self):
+        """
+        Три новости: leader(A) + dup(B) + unrelated(C).
+        Containment: A⊇B. C не в паре.
+        Результат: A и C отправлены, B отфильтрован.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.close()
+
+            leader = "Russian drone strike hits civilian target in Moscow"
+            dup = "Russian drone strike hits civilian target in Moscow city"
+            unrelated = "SpaceX launches new satellite constellation successfully"
+
+            for title, url, score, fetched in [
+                (leader, "https://ex.com/a", 9, "2025-01-01T12:00:00+00:00"),
+                (dup, "https://ex.com/b", 5, "2025-01-02T12:00:00+00:00"),
+                (unrelated, "https://ex.com/c", 8, "2025-01-03T12:00:00+00:00"),
+            ]:
+                _insert_deferred_item(
+                    db_path, title=title, url=url,
+                    published="2025-01-01 12:00",
+                    fetched_at=fetched, score=score,
+                )
+
+            mock_filter = MagicMock()
+            mock_filter.detect_duplicates.return_value = set()
+
+            p = _mk_pipeline_integration(db_path, llm_filter=mock_filter)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # A (leader, score 9) + C (unrelated, score 8) отправлены = 2
+            self.assertEqual(count, 2, "leader + unrelated должны пройти, dup — нет")
+            send_args = delivery.send_text.call_args[0][0]
+            self.assertIn(leader, send_args)
+            self.assertIn(unrelated, send_args)
+            self.assertNotIn(dup, send_args)
+
+            p.close()
+
+    def test_containment_skipped_when_numerical_guard_fails(self):
+        """
+        Containment-пара с РАЗНЫМИ числами: «Two killed» vs «Three killed».
+        Числовой guard отклоняет → оба проходят (не дубль).
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.close()
+
+            # Оба ≥30, но разные числа → числовой guard не пройдён
+            # Containment: "Three killed" in "Three killed in attack on Voronezh"
+            a_title = "Three killed in attack on Voronezh region"
+            b_title = "Three killed in attack on Voronezh region"  # exact same
+            # But wait — for this test let's use different numbers:
+            a_title = "Two killed in attack on Voronezh region"
+            b_title = "Three killed in attack on Voronezh region"
+
+            _insert_deferred_item(
+                db_path, title=a_title, url="https://ex.com/2killed",
+                published="2025-01-01 12:00", fetched_at="2025-01-01T12:00:00+00:00",
+                score=8,
+            )
+            _insert_deferred_item(
+                db_path, title=b_title, url="https://ex.com/3killed",
+                published="2025-01-01 12:00", fetched_at="2025-01-02T12:00:00+00:00",
+                score=7,
+            )
+
+            mock_filter = MagicMock()
+            mock_filter.detect_duplicates.return_value = set()
+
+            p = _mk_pipeline_integration(db_path, llm_filter=mock_filter)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Оба проходят: числовой guard отклонил containment
+            self.assertEqual(count, 2, "2 killed ≠ 3 killed, оба проходят")
+            send_args = delivery.send_text.call_args[0][0]
+            self.assertIn("Two killed", send_args)
+            self.assertIn("Three killed", send_args)
+            p.close()
+
+    def test_containment_different_case_filtered(self):
+        """
+        F6: containment-пара с РАЗНЫМ РЕГИСТРОМ — «Two Killed…» vs «Two killed…».
+        Нормализация lower() ловит это → F6 отсекает дубликат.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.close()
+
+            # Leader: title ≥30, "two killed..." after normalize_location+lower
+            # Duplicate: same text, "Killed" capitalized — same after lower
+            leader_title = "Two Killed in Ukrainian attack on Voronezh region"
+            dup_title = "Two killed in Ukrainian attack on Voronezh region"
+
+            _insert_deferred_item(
+                db_path, title=leader_title, url="https://ex.com/leader-case",
+                published="2025-01-01 12:00", fetched_at="2025-01-01T12:00:00+00:00",
+                score=8,
+            )
+            _insert_deferred_item(
+                db_path, title=dup_title, url="https://ex.com/dup-case",
+                published="2025-01-01 12:00", fetched_at="2025-01-02T12:00:00+00:00",
+                score=6,
+            )
+
+            # LLM пропускает пары (не находит дублей — разный регистр)
+            mock_filter = MagicMock()
+            mock_filter.detect_duplicates.return_value = set()
+
+            p = _mk_pipeline_integration(db_path, llm_filter=mock_filter)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Leader отправлен, dup отфильтрован F6-ContainmentCheck
+            self.assertEqual(count, 1, "Разный регистр → containment → leader остаётся")
+            send_args = delivery.send_text.call_args[0][0]
+            self.assertIn("https://ex.com/leader-case", send_args)
+            self.assertNotIn("https://ex.com/dup-case", send_args)
+            p.close()
+
+    def test_containment_short_titles_not_flagged(self):
+        """
+        Containment-пара с короткими заголовками (<30 символов).
+        is_containment_duplicate возвращает False → оба проходят.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.close()
+
+            # Оба < 30 символов после нормализации
+            a_title = "Two killed in Voronezh attack"
+            b_title = "Two killed in Voronezh"  # short
+
+            _insert_deferred_item(
+                db_path, title=a_title, url="https://ex.com/short1",
+                published="2025-01-01 12:00", fetched_at="2025-01-01T12:00:00+00:00",
+                score=8,
+            )
+            _insert_deferred_item(
+                db_path, title=b_title, url="https://ex.com/short2",
+                published="2025-01-01 12:00", fetched_at="2025-01-02T12:00:00+00:00",
+                score=7,
+            )
+
+            mock_filter = MagicMock()
+            mock_filter.detect_duplicates.return_value = set()
+
+            p = _mk_pipeline_integration(db_path, llm_filter=mock_filter)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Оба проходят: <30 символов → containment guard пропускает
+            self.assertEqual(count, 2, "короткие титлы не подпадают под containment")
+            p.close()
+
+    def test_llm_dup_and_containment_dup_both_excluded(self):
+        """
+        Один item помечен LLM-дублем, другой — containment-дублем.
+        Оба исключаются, лидер отправляется.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.close()
+
+            # item[0] — лидер, item[1] — LLM-дубль, item[2] — containment-дубль
+            for title, url, score, fetched in [
+                ("Global leaders meet for G20 summit discussion", "https://ex.com/l0", 9, "2025-01-01T12:00:00+00:00"),
+                ("Global leaders meet for G20 summit discussion", "https://ex.com/l1", 7, "2025-01-02T12:00:00+00:00"),
+                ("Global leaders meet for G20 summit", "https://ex.com/l2", 5, "2025-01-03T12:00:00+00:00"),
+            ]:
+                _insert_deferred_item(
+                    db_path, title=title, url=url,
+                    published="2025-01-01 12:00", fetched_at=fetched, score=score,
+                )
+
+            # LLM отмечает l1 как дубль (индекс 1)
+            mock_filter = MagicMock()
+            mock_filter.detect_duplicates.return_value = {1}
+
+            p = _mk_pipeline_integration(db_path, llm_filter=mock_filter)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # Лидер l0 отправлен, l1 (LLM-дубль) и l2 (containment-дубль) отфильтрованы
+            self.assertEqual(count, 1)
+            send_args = delivery.send_text.call_args[0][0]
+            self.assertIn("l0", send_args)
+            self.assertNotIn("l1", send_args)
+            self.assertNotIn("l2", send_args)
             p.close()
 
 

@@ -1084,12 +1084,12 @@ class TestDedupFloatIndices:
         )
 
     def test_float_indices_recognized(self):
-        """[1.0, 2.0] → дубли найдены (1.0 = лидер чанка, 2.0 → индекс 1)."""
+        """[1.0, 2.0] → оба легальны (float в позиции лидера — M2-fix)."""
         flt = self._filter()
         dups = flt._parse_dedup_response(
-            {"duplicates": [1.0, 2.0]}, chunk_len=3, chunk_offset=0, recent=[],
+            {"duplicates": [1.0, 2.0]}, chunk_len=2, chunk_offset=0,
         )
-        assert dups == {1}
+        assert dups == {0, 1}
 
     def test_non_integral_and_nan_floats_ignored(self):
         flt = self._filter()
@@ -1097,14 +1097,13 @@ class TestDedupFloatIndices:
             {"duplicates": [2.5, float("nan"), float("inf"), 3.0]},
             chunk_len=3,
             chunk_offset=0,
-            recent=[],
         )
         assert dups == {2}
 
     def test_float_out_of_range_ignored(self):
         flt = self._filter()
         assert flt._parse_dedup_response(
-            {"duplicates": [4.0]}, chunk_len=3, chunk_offset=0, recent=[],
+            {"duplicates": [4.0]}, chunk_len=3, chunk_offset=0,
         ) == set()
 
 
