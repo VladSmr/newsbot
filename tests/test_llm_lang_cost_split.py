@@ -905,7 +905,7 @@ class TestNonFiniteNumericFields:
                 "daily_cost_limit": 0,
             })
         try:
-            assert flt.client.max_tokens == 4096
+            assert flt.client.max_tokens == 4608
         finally:
             flt.client.close()
         assert _warnings(caplog.records, "max_tokens")

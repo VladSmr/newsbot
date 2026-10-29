@@ -34,7 +34,7 @@ sys.path.insert(0, str(_root))
 
 from newsbot.storage import Storage
 from newsbot.collector import NewsItem
-from newsbot.digest import build_digest_messages, run_digest, _TG_MESSAGE_MAX
+from newsbot.digest import build_digest_messages, run_digest, _TG_MESSAGE_MAX, _utf16_units
 
 # =============================================================================
 # helpers
@@ -447,7 +447,8 @@ def test_run_digest_long_items_still_sent():
 
         for call in delivery.send_text.call_args_list:
             msg = call[0][0]
-            assert len(msg) <= _TG_MESSAGE_MAX
+            # Minor-6-фикс: Telegram измеряет лимит в UTF-16 units, не в code points
+            assert _utf16_units(msg) <= _TG_MESSAGE_MAX
 
         storage.close()
     finally:
@@ -835,6 +836,248 @@ def test_run_digest_buttons_partial_failure():
         assert len(rows_digested) == 2
         rows_deferred = storage.get_all_by_state("deferred")
         assert len(rows_deferred) == 2
+        storage.close()
+    finally:
+        _cleanup(db_path)
+
+
+# =============================================================================
+# Major-2: дайджест >4096 UTF-16 units нарезается на подсообщения
+# =============================================================================
+
+def test_run_digest_oversized_message_split():
+    """
+    digest msg > 4096 UTF-16 units → нарезается на подсообщения ≤ 4096,
+    ни один sub не превышает лимит.
+    """
+    from newsbot.digest import _split_message, _TG_MESSAGE_MAX
+    from newsbot.delivery.telegram import _utf16_units
+
+    # oversized: 5 абзацев, каждый ~900 UTF-16 units → общий размер > 4096
+    para = "X" * 900  # ~900 UTF-16 units per para
+    oversized_msg = "\n\n".join([para] * 5)  # ~5×900 + 4×2 = ~4508 > 4096
+
+    assert _utf16_units(oversized_msg) > _TG_MESSAGE_MAX, \
+        f"test msg too short: {_utf16_units(oversized_msg)} units"
+
+    parts = _split_message(oversized_msg)
+    assert len(parts) > 1, f"oversized msg должен нарезаться, got {len(parts)} parts"
+    for p in parts:
+        assert _utf16_units(p) <= _TG_MESSAGE_MAX, \
+            f"sub-часть {_utf16_units(p)} превышает {_TG_MESSAGE_MAX}"
+    # нетезированные абзацы сохраняются (без hard-slice), verify count
+    # 5 абзацев × 900 units каждый → 4508 total
+    # → 5 msg = 1 msg per para (каждый 900 < 4096, итого 5 подсообщений)
+    # NOTE: при изменении packing логики достаточно проверять лимит
+    assert sum(_utf16_units(p) for p in parts) >= _utf16_units(para) * 4, \
+        "нетезированные абзацы не должны теряться"
+
+    # normal msg проходит без split
+    normal_msg = "X" * 100
+    assert _split_message(normal_msg) == [normal_msg]
+
+
+def test_split_message_no_double_escape():
+    """
+    Major-1: _split_message НЕ переэкранирует — <b> и <a href> сохраняются
+    (не превращаются в &lt;b&gt;). CONTRACT: msg уже экранирован (_emit).
+    """
+    from newsbot.digest import _split_message, _utf16_units
+
+    # msg содержит уже экранированные <b> и <a href>
+    # 10 абзацев × 600 = 6000 > 4096: гарантированно oversized
+    para = "X" * 600
+    html_msg = (
+        f"<b>Bold Title</b>\n\n{para}\n\n"
+        f'<a href="https://example.com/path">link</a>\n\n'
+        f"{para}\n\n{para}\n\n{para}\n\n"
+        f"{para}\n\n{para}\n\n{para}\n\n{para}\n\n{para}"
+    )
+    # проверяем что oversized для надёжности
+    assert _utf16_units(html_msg) > 4096, \
+        f"msg={_utf16_units(html_msg)} — тест должен быть oversized"
+
+    parts = _split_message(html_msg)
+    for i, p in enumerate(parts):
+        # (а) НЕТ &lt;b&gt; (double-escape сломает HTML)
+        assert "&lt;b&gt;" not in p, f"part[{i}] содержит &lt;b&gt; — double-escape!"
+        # (г) каждое ≤ лимита
+        assert _utf16_units(p) <= 4096, f"part[{i}] = {_utf16_units(p)} > 4096"
+
+
+def test_split_message_preserves_links():
+    """
+    Major-1: <a href="..."> не разрывается — граница ищется по > / \\n / пробелу.
+    """
+    from newsbot.digest import _split_message, _utf16_units
+
+    # Oversized-абзац с <a href> внутри: нужно чтобы ссылка не разрезалась
+    link_part = '<a href="https://example.com/very-long-url">нажмите здесь</a>'
+    # 5000 + link + 5000 = ~10100 > 4096*2, гарантированно oversized
+    oversized = "X" * 5000 + link_part + "Y" * 5000
+    assert _utf16_units(oversized) > 8192, \
+        f"msg={_utf16_units(oversized)} — тест должен быть oversized"
+
+    parts = _split_message(oversized)
+    for p in parts:
+        # ни одна часть не должна содержать битую ссылку:
+        # <a href="... без > — обрезана внутри тега
+        assert not re.search(r'<a href="[^"]*$', p), "ссылка обрезана внутри href"
+        assert not re.search(r'<a [^>]*$', p), "тег <a обрезан внутри"
+        # если ссылка присутствует — она целая
+        if "example.com" in p:
+            assert p.count("<a ") == p.count("</a>"), "непарный <a в part"
+
+
+def test_split_message_no_content_loss():
+    """
+    Major-1: _hard_slice возвращает ВСЕ чанки (список), не теряет остаток.
+    Один oversized-абзац нарезается на ≥2 частей, суммарно весь контент сохранён.
+    """
+    from newsbot.digest import _split_message, _hard_slice, _utf16_units
+
+    # Один oversized-абзац, который превышает лимит целиком
+    # 4500 единиц > 4096
+    big_para = "A" * 4500
+    assert _utf16_units(big_para) > 4096
+
+    # _hard_slice должен вернуть список чанков, покрывающий весь контент
+    chunks = _hard_slice(big_para, 4096)
+    assert len(chunks) >= 2, f"oversized para должен дать ≥2 чанков, got {len(chunks)}"
+    assert sum(_utf16_units(c) for c in chunks) == _utf16_units(big_para), \
+        "хвост потерян — сумма чанков != исходный размер"
+
+    # _split_message вызывает _hard_slice для oversized-абзацев
+    msg = "<b>Title</b>\n\n" + big_para
+    parts = _split_message(msg)
+    assert len(parts) >= 2
+    # весь контент (title + все чанки big_para) присутствует
+    full_text = "".join(parts)
+    assert "A" * 4500 in full_text, "контент oversized-абзаца потерян"
+
+
+def test_split_message_safe_boundary_entities():
+    """
+    Major-1: _hard_slice режет по безопасной границе — HTML-сущности не рвутся.
+    &amp; / &lt; / &gt; / &quot; / &#x27; не должны быть оборваны.
+    Minor-1-фикс: regex ловит частичный обрыв (&quo, &am) и открытые теги.
+    Валидные &#x27; (hex) и &#27; (decimal) не считаются обрывом.
+    """
+    from newsbot.digest import _hard_slice, _utf16_units
+
+    # Строка с HTML-сущностями, oversized
+    with_entities = "&amp;&lt;&gt;&quot;&#x27;" * 1000  # ~70 * 1000 = 70000
+    assert _utf16_units(with_entities) > 4096 * 2
+
+    chunks = _hard_slice(with_entities, 4096)
+
+    # Minor-1: усиленный regex — ловит &quo, &am, &quot без ;
+    # НЕ ловит &#x27; — это валидная hex-сущность (&#x + hex digits + ;)
+    # НЕ ловит &#27; — decimal сущность
+    # Named-partial: & + letters {1,5} без ; в конце
+    entity_broken_re = re.compile(r"&[a-zA-Z]{1,5}(?!;)$")
+    for i, c in enumerate(chunks):
+        assert not entity_broken_re.search(c), (
+            f"chunk[{i}] содержит оборванную HTML-сущность: {c[-40:]!r}"
+        )
+
+
+def test_split_message_safe_boundary_partial_entities():
+    """
+    Minor-1: гарантия что срез НЕ попадает внутрь &quot; / &#x27; —
+    даже когда лимит разрезает середину сущности.
+    """
+    from newsbot.digest import _hard_slice, _utf16_units
+
+    # Паттерн: "&quot;" (6 UTF-16 units) чередуется с &#x27; (6 units).
+    # При малом max_units грубый срез неизбежно попадает внутрь.
+    # _hard_slice должен корректно откатить до безопасной точки.
+    base = "&quot;&#x27;"  # 12 units total
+    oversized = base * 1000  # 12000 units >> 4096
+
+    # Искусственно маленький лимит — гарантированно рвёт внутри сущности
+    chunks = _hard_slice(oversized, 1000)
+    # Ловим только именованные (&quo, &amp без ;), НЕ hex/dec сущности
+    entity_broken_re = re.compile(r"&[a-zA-Z]{1,5}(?!;)$")
+    tag_open_re = re.compile(r"<[a-zA-Z][^>]*$")
+    for i, c in enumerate(chunks):
+        assert not entity_broken_re.search(c), (
+            f"chunk[{i}] оборвал HTML-сущность: {c[-30:]!r}"
+        )
+        assert not tag_open_re.search(c), (
+            f"chunk[{i}] оборвал открывающий тег: {c[-30:]!r}"
+        )
+
+
+def test_split_message_safe_boundary_tags():
+    """
+    Minor-1: гарантия что срез НЕ попадает внутрь <a href=...> —
+    Major-фикс добавил > в набор границ, но если срез всё же рвёт
+    открывающий тег — откат до последнего <.
+    """
+    from newsbot.digest import _hard_slice, _utf16_units
+
+    # Строка с открывающими тегами: гарантированно oversized
+    # ~40 * 250 = 10000 > 8192
+    with_tags = '<a href="https://example.com/1">link</a>' * 250
+    assert _utf16_units(with_tags) > 4096 * 2
+
+    chunks = _hard_slice(with_tags, 4096)
+    tag_open_re = re.compile(r"<[a-zA-Z][^>]*$")
+    for i, c in enumerate(chunks):
+        assert not tag_open_re.search(c), (
+            f"chunk[{i}] оборвал открывающий тег: {c[-40:]!r}"
+        )
+
+
+def test_run_digest_oversized_integrated():
+    """
+    run_digest с oversized-msg: send_digest вызывается ≥2 раз,
+    buttons отправлены только с последним sub.
+    """
+    from newsbot.digest import _split_message
+    from newsbot.delivery.telegram import _utf16_units
+
+    db_path = _tmp_db()
+    try:
+        storage = Storage(db_path)
+        item = _mk_item(title="Oversized", url="https://ex.com/over", llm_score=5)
+        storage.save(item)
+        storage.set_state(["https://ex.com/over"], "deferred")
+
+        delivery = MagicMock()
+        call_args = []
+
+        def capture_send(text, buttons):
+            call_args.append((text, buttons))
+            return True
+        delivery.send_digest.side_effect = capture_send
+
+        # build_digest_messages сам группирует, нам нужен oversized-msg
+        # напрямую: делаем oversized msg через item_buttons_per_msg + groups
+        # 5 абзацев × 900 units = 4508 > 4096
+        para = "X" * 900
+        oversized_html = f"<b>Title</b>\n\n{para}\n\n{para}\n\n{para}\n\n{para}\n\n{para}\n\n<a href=\"https://ex.com/over\">🔗</a>"
+
+        # проверяем что msg превышает лимит
+        assert _utf16_units(oversized_html) > 4096, \
+            f"oversized_html too short: {_utf16_units(oversized_html)} units"
+
+        # вызываем run_digest напрямую с oversized groups
+        count, urls, _failed, _ex = run_digest(
+            storage, delivery, max_items=1, max_items_per_message=1,
+            item_buttons_per_msg=[[{"url": "https://ex.com/over", "target_id": 1}]],
+            groups=[(oversized_html, [item])],
+        )
+        assert count == 1
+        assert call_args, "send_digest должен быть вызван"
+        # buttons должны быть только в последнем sub-сообщении
+        last_call_buttons = call_args[-1][1]
+        assert last_call_buttons == [{"url": "https://ex.com/over", "target_id": 1}]
+        for i, (text, buttons) in enumerate(call_args[:-1]):
+            assert buttons == [], f"sub[{i}] не должен иметь buttons"
+            assert _utf16_units(text) <= 4096
+
         storage.close()
     finally:
         _cleanup(db_path)

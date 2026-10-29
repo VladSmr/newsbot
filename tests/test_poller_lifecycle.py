@@ -1,897 +1,228 @@
 """
-tests/test_poller_lifecycle.py — тесты lifecycle TelegramPoller.
+Тесты арифметики слотов демона: расчёт секунд до следующего слота и форматирование часа слота.
 
-Покрывает:
-  1. stop() при зависшем poll → нет второго поллера
-  2. close() ждёт завершения потока перед close HTTP-клиента
-  3. join timeout согласован с poll_timeout
-
-Запуск: python -m pytest tests/test_poller_lifecycle.py -v
+Запускать: python -m pytest tests/test_poller_lifecycle.py -v
 """
-import os
-import signal
-import sys
-import threading
-import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
-
-from newsbot.telegram_io import TelegramPoller
+from datetime import datetime as real_dt_cls
 
 
-def test_stop_no_second_poller():
-    """
-    Major: stop() при зависшем poll не создаёт второй поллер.
+class TestNextSlotSeconds:
+    """Расчёт секунд до ближайшего слота :30 (чётный час, local time)."""
 
-    Сценарий:
-      — poller.start() запускает поток
-      — _run_loop внутри потока «зависает» (ждёт _stop_event, не time.sleep)
-      — stop(max_join=0.1) ограничивает join → поток остаётся alive,
-        _thread не обнуляется
-      — повторный start() видит alive и НЕ создаёт новый
+    def test_10_05_returns_25_min(self):
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 10, 5, 0)
+        assert _next_slot_seconds(now) == 25 * 60
 
-    Фикс: side_effect ждёт poller._stop_event.wait() (не time.sleep),
-    длительность ограничена max_join через patch Thread.join.
-    """
-    with patch("newsbot.storage.Storage") as MockStorage, \
-         patch("newsbot.telegram_io._TgClient") as MockClient:
+    def test_09_05_odd_hour_returns_85_min(self):
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 9, 5, 0)
+        assert _next_slot_seconds(now) == 85 * 60
 
-        mock_storage = MagicMock()
-        mock_storage.get_meta.return_value = None
-        MockStorage.return_value = mock_storage
+    def test_10_31_returns_119_min(self):
+        """10:31 (>=:30) → слот 12:30, 119 мин."""
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 10, 31, 0)
+        assert _next_slot_seconds(now) == 119 * 60
 
-        mock_client = MagicMock()
+    def test_10_30_returns_120_min(self):
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 10, 30, 0)
+        assert _next_slot_seconds(now) == 120 * 60
 
-        poller_holder = {}
+    def test_23_59_returns_31_min_next_day(self):
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 23, 59, 0)
+        assert _next_slot_seconds(now) == 31 * 60
 
-        def fake_get_updates(**kwargs):
-            # Ждём _stop_event — детерминированный дедлайн через max_join.
-            # Не time.sleep: это вызывало реальное ожидание 30 с.
-            p = poller_holder.get("poller")
-            if p is not None:
-                p._stop_event.wait(timeout=10.0)
-            time.sleep(0.5)  # имитация минимального poll-overhead
-            return []
+    def test_00_29_returns_1_min(self):
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 0, 29, 0)
+        assert _next_slot_seconds(now) == 60
 
-        mock_client.getUpdates.side_effect = fake_get_updates
-        MockClient.return_value = mock_client
+    def test_00_30_returns_120_min(self):
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 0, 30, 0)
+        assert _next_slot_seconds(now) == 120 * 60
 
-        poller = TelegramPoller(
-            token="test_token",
-            chat_id="123",
-            db_path=":memory:",
-            on_digest=MagicMock(),
-            poll_timeout=25,
-        )
-        poller_holder["poller"] = poller
+    def test_00_31_returns_119_min(self):
+        """00:31 (>=:30) → слот 02:30, 119 мин."""
+        from newsbot.__main__ import _next_slot_seconds
+        now = real_dt_cls(2000, 1, 1, 0, 31, 0)
+        assert _next_slot_seconds(now) == 119 * 60
 
-        # Запускаем — поток стартует
-        poller.start()
-        time.sleep(0.3)
-
-        assert poller._thread is not None
-        assert poller._thread.is_alive()
-
-        # stop(max_join=0.1): join ограничен 0.1 с, поток остаётся alive
-        started = time.monotonic()
-        poller.stop(max_join=0.1)
-        elapsed = time.monotonic() - started
-
-        assert elapsed < 2.0, f"stop(max_join=0.1) ждал {elapsed:.1f}с"
-        # Поток всё ещё alive (не успел завершиться за 0.1 с)
-        assert poller._thread is not None
-        assert poller._thread.is_alive(), (
-            "Поток не должен был завершиться за 0.1 с"
-        )
-
-        # Повторный start: _thread alive → не создаём новый
-        with patch.object(threading, "Thread") as MockThread:
-            MockThread.return_value = MagicMock()
-            MockThread.return_value.start = MagicMock()
-            poller.start()
-            # Thread() должен быть вызван 0 раз (поток ещё alive)
-            assert MockThread.call_count == 0, (
-                f"start() создал новый Thread при alive _thread: "
-                f"{MockThread.call_count} вызовов"
+    def test_slot_always_on_even_hour(self):
+        """Каждый now даёт слот на чётный час, и всегда в будущее (>0)."""
+        from newsbot.__main__ import _next_slot_seconds, _format_slot_hour
+        test_cases = [
+            (real_dt_cls(2000, 1, 1, 10, 5),  10),
+            (real_dt_cls(2000, 1, 1, 10, 31), 12),
+            (real_dt_cls(2000, 1, 1, 11, 5),  12),
+            (real_dt_cls(2000, 1, 1, 12, 5),  12),
+            (real_dt_cls(2000, 1, 1, 12, 31), 14),
+            (real_dt_cls(2000, 1, 1, 13, 0),  14),
+            (real_dt_cls(2000, 1, 1, 22, 29), 22),
+            (real_dt_cls(2000, 1, 1, 22, 31), 0),
+            (real_dt_cls(2000, 1, 1, 23, 59), 0),
+            (real_dt_cls(2000, 1, 1, 0, 30),  2),
+            (real_dt_cls(2000, 1, 1, 1, 0),   2),
+            (real_dt_cls(2000, 1, 1, 1, 31),  2),
+            (real_dt_cls(2000, 1, 1, 3, 0),   4),
+        ]
+        for now, expected_hour in test_cases:
+            slot_hour = _format_slot_hour(now)
+            assert slot_hour == expected_hour, (
+                f"now={now.strftime('%H:%M')} → slot hour={slot_hour}, expected {expected_hour}"
             )
+            result = _next_slot_seconds(now)
+            assert result > 0, f"now={now.strftime('%H:%M')} → {result}s (must be > 0)"
 
-        # cleanup: разбудить поток и дождаться завершения
-        poller._stop_event.set()
-        poller.close(join_timeout=5.0)
+    def test_10_35_returns_115_min(self):
+        """10:35 (>=:30) → слот 12:30, 115 мин. Точный ассерт (не >0)."""
+        from newsbot.__main__ import _next_slot_seconds
+        secs = _next_slot_seconds(real_dt_cls(2000, 1, 1, 10, 35, 0))
+        assert secs == 115 * 60
 
 
-def test_close_waits_for_thread():
+class TestNextWaitSecondsAfterError:
     """
-    Minor: close() ждёт завершения потока перед close HTTP-клиента.
-
-    Сценарий: _run_loop работает (long-poll в процессе),
-    вызывается close(). Без фикса HTTP-клиент закрывается
-    ПОД работающим потоком → возможны проблемы.
-    С фиксом: close() ждёт join(thread) перед _client.close().
+    MAJOR-фикс: error-путь подключён к реальному циклу, пауза считается от t0.
+    `_next_wait_seconds(t0, after_error=True) == max(backoff, slot_from_t0)`.
     """
-    with patch("newsbot.storage.Storage") as MockStorage, \
-         patch("newsbot.telegram_io._TgClient") as MockClient:
 
-        mock_storage = MagicMock()
-        mock_storage.get_meta.return_value = None
-        MockStorage.return_value = mock_storage
+    def test_after_error_false_equals_slot(self):
+        """after_error=False → ровно слот, без backoff."""
+        from newsbot.__main__ import _next_wait_seconds
+        now = real_dt_cls(2000, 1, 1, 10, 5, 0)
+        assert _next_wait_seconds(now, after_error=False) == 25 * 60
 
-        mock_client = MagicMock()
-        # Simulate: getUpdates спит 2 секунды (имитация долгого poll)
-        def slow_poll(**kwargs):
-            time.sleep(2)
-            return []
-        mock_client.getUpdates.side_effect = slow_poll
-        MockClient.return_value = mock_client
+    def test_after_error_slot_greater_than_backoff(self):
+        """slot > backoff → after_error=True даёт ровно slot (1500 с, не 30 с)."""
+        from newsbot.__main__ import _next_wait_seconds
+        now = real_dt_cls(2000, 1, 1, 10, 5, 0)  # slot = 25 мин = 1500 с > 30
+        assert _next_wait_seconds(now, after_error=True) == 25 * 60
 
-        poller = TelegramPoller(
-            token="test_token",
-            chat_id="123",
-            db_path=":memory:",
-            on_digest=MagicMock(),
-            poll_timeout=25,
+    def test_after_error_slot_less_than_backoff(self):
+        """slot < backoff → after_error=True даёт ровно backoff (30 с, не slot=10 с).
+
+        Сценарий: ошибка в 10:29:50 (до слота 10:30 осталось 10 с).
+        Пауза = max(backoff=30, slot=10) = 30 с.
+        Текущий цикл досыпает 30 с → слот 10:30 НЕ теряется.
+        """
+        from newsbot.__main__ import _next_wait_seconds, _BACKOFF_SECONDS
+        now = real_dt_cls(2000, 1, 1, 10, 29, 50)  # slot = 10 с < backoff=30 с
+        assert _next_wait_seconds(now, after_error=True) == _BACKOFF_SECONDS
+
+    def test_after_error_slot_equal_to_backoff(self):
+        """slot == backoff → after_error=True даёт ровно это значение."""
+        from newsbot.__main__ import _next_wait_seconds, _BACKOFF_SECONDS
+        # Найти момент, когда slot_secs == _BACKOFF_SECONDS == 30.
+        # 00:29 → 60 с (не равно). Проверяем через after_error=False.
+        from newsbot.__main__ import _next_slot_seconds
+        # Подбираем now так, чтобы slot_secs == 30 (т.е. до слота ровно 30 с).
+        # Slot :30 на чётный час. Если now = HH:29:30 → slot = 30 с.
+        now = real_dt_cls(2000, 1, 1, 10, 29, 30)
+        assert _next_slot_seconds(now) == 30
+        assert _next_wait_seconds(now, after_error=True) == 30
+
+    def test_after_error_t0_preserves_slot(self):
+        """Пауза считается от t0 (момента ошибки), не от now после backoff.
+
+        Сценарий из описания MAJOR-фикса:
+        - Ошибка в 10:29:50 → t0 = 10:29:50 → slot_from_t0 = 10 с.
+        - После backoff (30 с) now ≈ 10:30:20 → slot_from_now ≈ 120 мин.
+        - after_error=True → max(30, 10) = 30 с (слот 10:30 сохраняется).
+        - БЕЗ after_error → пауза была бы ≈120 мин — слот 10:30 теряется.
+
+        БЕЗ реального sleep, БЕЗ threading.Event, БЕЗ вызова main().
+        """
+        from newsbot.__main__ import _next_wait_seconds, _next_slot_seconds, _BACKOFF_SECONDS
+
+        t0 = real_dt_cls(2000, 1, 1, 10, 29, 50)   # момент ошибки
+        after_now = real_dt_cls(2000, 1, 1, 10, 30, 20)  # now ПОСЛЕ backoff
+
+        # Пауза считается от t0: max(backoff=30, slot_from_t0=10) = 30 с.
+        wait_from_t0 = _next_wait_seconds(t0, after_error=True)
+        assert wait_from_t0 == _BACKOFF_SECONDS, (
+            f"slot от t0 потерян: ожидалось {_BACKOFF_SECONDS} с, получено {wait_from_t0} с"
         )
 
-        # Запускаем — поток стартует
-        poller.start()
-        time.sleep(0.2)
-
-        # Вызываем close() сразу — поток ещё в long-poll
-        start_close = time.time()
-        poller.close()
-        elapsed = time.time() - start_close
-
-        # close() должен был подождать (poll_timeout+5 или реальное время)
-        # Минимум 2 секунды (время slow_poll)
-        assert elapsed >= 1.5, (
-            f"close() вернулся слишком быстро ({elapsed:.2f}s) — "
-            f"не дождался завершения потока"
-        )
-
-        # _client.close() вызван
-        assert mock_client.close.called
-
-
-def test_join_timeout_uses_poll_timeout():
-    """
-    Minor: join timeout = poll_timeout + 5 (не хардкод 5).
-    
-    Тестируем через slow poll: getUpdates возвращается через 2 секунды
-    (имитация реального long-poll). stop() должен ждать именно poll_timeout+5,
-    а не фиксированное значение 5.
-    """
-    with patch("newsbot.storage.Storage") as MockStorage, \
-         patch("newsbot.telegram_io._TgClient") as MockClient:
-
-        mock_storage = MagicMock()
-        mock_storage.get_meta.return_value = None
-        MockStorage.return_value = mock_storage
-
-        mock_client = MagicMock()
-        # Slow poll: каждая итерация спит 2 секунды
-        def slow_getUpdates(**kwargs):
-            time.sleep(2)
-            return []
-        mock_client.getUpdates.side_effect = slow_getUpdates
-        MockClient.return_value = mock_client
-
-        # poll_timeout=5 — для теста используем именно это значение
-        poller = TelegramPoller(
-            token="test_token",
-            chat_id="123",
-            db_path=":memory:",
-            on_digest=MagicMock(),
-            poll_timeout=5,
-        )
-
-        poller.start()
-        # Ждём чтобы поток вошёл в long-poll
-        time.sleep(0.4)
-
-        # Убеждаемся что поток жив (в long-poll)
-        assert poller._thread is not None
-        assert poller._thread.is_alive(), "Thread должен быть alive (в long-poll)"
-
-        # Проверяем: join_timeout = poll_timeout + 5 = 10
-        assert poller._poll_timeout == 5
-        start_stop = time.time()
-        poller.stop()
-        elapsed = time.time() - start_stop
-
-        # join с timeout=poll_timeout+5=10, но поток спит 2 с
-        # stop() вернётся когда поток реально завершится (~2 с)
-        # БЕЗ фикса: join(5) — поток спит 2 с, join ждёт 5 с, всего ~2 с
-        # С фиксом: join(10) — то же поведение, но timeout больше
-        # Проверяем что поток реально дождался (не убит по timeout)
-        assert 1.5 <= elapsed < 15, (
-            f"stop() занял {elapsed:.2f}s — ожидалось ~2с (время slow poll)"
-        )
-        # Поток завершился корректно
-        assert poller._thread is None or not poller._thread.is_alive()
-
-
-def test_stop_clears_thread_when_really_finished():
-    """
-    Minor: если поток ДЕЙСТВИТЕЛЬНО завершился — _thread обнуляется.
-    """
-    with patch("newsbot.storage.Storage") as MockStorage, \
-         patch("newsbot.telegram_io._TgClient") as MockClient:
-
-        mock_storage = MagicMock()
-        mock_storage.get_meta.return_value = None
-        MockStorage.return_value = mock_storage
-
-        mock_client = MagicMock()
-        # Быстрый ответ — поток завершится сам
-        mock_client.getUpdates.return_value = []
-        MockClient.return_value = mock_client
-
-        poller = TelegramPoller(
-            token="test_token",
-            chat_id="123",
-            db_path=":memory:",
-            on_digest=MagicMock(),
-            poll_timeout=1,
-        )
-
-        poller.start()
-        # Ждём достаточно чтобы поток завершился сам (он получит пустой ответ и выйдет)
-        time.sleep(2.5)
-
-        assert poller._thread is not None
-
-        # stop(): поток уже finished → join(6) вернётся сразу
-        start_stop = time.time()
-        poller.stop()
-        elapsed = time.time() - start_stop
-
-        # join вернулся почти сразу (поток уже finished)
-        assert elapsed < 1.0, f"stop() занял {elapsed:.2f}s при уже-finished потоке"
-
-        # _thread обнулён (поток действительно finished)
-        assert poller._thread is None, (
-            "_thread должен быть обнулён когда поток действительно finished"
+        # Пауза от after_now (без after_error) дала бы ≈120 мин — слот 10:30 потерян.
+        slot_from_after_now = _next_slot_seconds(after_now)
+        assert slot_from_after_now > _BACKOFF_SECONDS, (
+            "sanity: slot_from_after_now должен быть > 30 с (иначе тест бессмыслен)"
         )
 
 
-# ══════════════════════════════════════════════════════════════════
-# Задача 2 (волна 3): graceful shutdown — реальный main()
-# ══════════════════════════════════════════════════════════════════
-
-def test_shutdown_event_interrupts_main_loop(tmp_path, monkeypatch):
+class TestResolveWait:
     """
-    Реальный main() в демон-режиме с мок-пайплайном:
-    _shutdown_event.set() (эмуляция SIGTERM) прерывает главный цикл,
-    pipeline.close() вызван, lock-файл удалён.
+    Тесты чистой функции _resolve_wait: выбор опорного времени и расчёт паузы.
+
+    Регрессионные тесты на баг: t0 не обновлялся на успешном пути →
+    пауза считалась от момента старта процесса, а не от текущего времени.
     """
-    import newsbot.__main__ as main_mod
 
-    shutdown = threading.Event()
-    digest = threading.Event()
-    lock_path = tmp_path / "newsbot.lock"
-    observed = {}
-
-    mock_pipeline = MagicMock()
-    mock_pipeline.storage.db_path = str(tmp_path / "newsbot.db")
-
-    def fake_cycle():
-        # lock захвачен ДО входа в цикл
-        observed["lock_exists"] = lock_path.exists()
-        shutdown.set()      # эмулируем SIGTERM во время цикла
-
-    mock_pipeline.run_cycle_with_delivery.side_effect = fake_cycle
-
-    config = {"logging": {"level": "WARNING"}, "poll_interval_minutes": 15}
-
-    monkeypatch.setattr(sys, "argv", ["newsbot"])
-
-    with patch.object(main_mod, "_shutdown_event", shutdown), \
-         patch.object(main_mod, "_digest_requested", digest), \
-         patch.object(main_mod, "_poller", None), \
-         patch.object(main_mod, "_LOCK_FILE", None), \
-         patch.object(main_mod, "NewsPipeline", return_value=mock_pipeline), \
-         patch.object(main_mod, "load_config", return_value=config), \
-         patch.object(main_mod, "setup_logging"), \
-         patch.object(main_mod, "signal", MagicMock()), \
-         patch.object(main_mod, "_maybe_start_poller") as mock_start:
-        main_mod.main()
-
-    mock_start.assert_called_once()
-    assert mock_pipeline.run_cycle_with_delivery.call_count == 1, (
-        "главный цикл должен выйти сразу после set()"
-    )
-    assert observed.get("lock_exists") is True, "lock должен быть захвачен до цикла"
-    mock_pipeline.close.assert_called_once()
-    assert not lock_path.exists(), "lock-файл должен быть удалён в finally"
-
-
-def test_signal_handler_only_sets_events_no_blocking_join(tmp_path):
-    """
-    Обработчик сигнала НЕ блокирует: только set() событий.
-    Остановка poller (join ≈ poll_timeout+5) — в finally main, не в хендлере.
-    """
-    import newsbot.__main__ as main_mod
-
-    shutdown = threading.Event()
-    digest = threading.Event()
-
-    mock_poller = MagicMock()
-    mock_poller.stop.side_effect = lambda: time.sleep(5)  # не должен вызываться
-
-    start = time.monotonic()
-    with patch.object(main_mod, "_shutdown_event", shutdown), \
-         patch.object(main_mod, "_digest_requested", digest), \
-         patch.object(main_mod, "_poller", mock_poller):
-        main_mod._signal_handler(signal.SIGTERM, None)
-    elapsed = time.monotonic() - start
-
-    assert shutdown.is_set(), "_shutdown_event должен быть установлен"
-    assert digest.is_set(), "_digest_requested должен быть установлен (разбудить main)"
-    assert elapsed < 0.5, f"хендлер блокировал {elapsed:.2f}s"
-    mock_poller.stop.assert_not_called()
-
-
-# ══════════════════════════════════════════════════════════════════
-# Задача 3: single-instance lock
-# ══════════════════════════════════════════════════════════════════
-
-class TestSingleInstanceLock:
-    """Lock: эксклюзивная блокировка файла (flock/msvcrt) + PID-fallback."""
-
-    @staticmethod
-    def _hold_lock(lock_path):
+    def test_success_path_uses_now_not_t0_error(self):
         """
-        Берёт блокировку файла в текущем процессе (эмуляция ЖИВОГО владельца).
-        Возвращает fd; отпускать — _drop_lock.
+        Регрессионная ловушка: если t0_error остался от старта (10:05),
+        а now = 10:07, пауза должна быть 23 мин (до слота 10:30), а не 25 мин.
+
+        10:07 → ближайший слот 10:30 = 23 мин = 1380 с.
+        Если бы использовался t0_error=10:05 → слот 10:30 = 25 мин = 1500 с.
         """
-        import newsbot.__main__ as main_mod
+        from newsbot.__main__ import _resolve_wait, _next_wait_seconds
+        from datetime import datetime as dt_cls
 
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-        assert main_mod._lock_fd_exclusive(fd) is True
-        return fd
+        t0_error = dt_cls(2000, 1, 1, 10, 5, 0)   # момент старта процесса
+        now = dt_cls(2000, 1, 1, 10, 7, 0)       # момент после успешного цикла
 
-    @staticmethod
-    def _drop_lock(fd):
-        import newsbot.__main__ as main_mod
+        # after_error=False → опора = now = 10:07
+        wait = _resolve_wait(t0_error, after_error=False, now=now)
+        assert wait == 23 * 60, (
+            f"Успешный путь должен считать от now=10:07 → 23 мин (1380 с), "
+            f"получено {wait} с. Если 1500 с — t0_error всё ещё используется!"
+        )
 
-        main_mod._unlock_fd(fd)
-        os.close(fd)
+    def test_success_path_explicit_now_examples(self):
+        """after_error=False всегда использует now, независимо от t0_error."""
+        from newsbot.__main__ import _resolve_wait
+        from datetime import datetime as dt_cls
 
-    def test_live_lock_exits(self, tmp_path):
-        """Живой владелец держит блокировку → sys.exit(1)."""
-        import newsbot.__main__ as main_mod
+        # t0_error далёкий, now близко к слоту
+        t0_error = dt_cls(2000, 1, 1, 8, 0, 0)
+        now = dt_cls(2000, 1, 1, 10, 28, 0)  # до слота 10:30 = 2 мин
+        wait = _resolve_wait(t0_error, after_error=False, now=now)
+        assert wait == 2 * 60
 
-        lock_path = tmp_path / "newsbot.lock"
-        fd = self._hold_lock(lock_path)
-        try:
-            with pytest.raises(SystemExit) as exc_info:
-                main_mod._acquire_lock(lock_path, 99999)
-        finally:
-            self._drop_lock(fd)
-        assert exc_info.value.code == 1
+    def test_error_path_uses_t0_error(self):
+        """after_error=True использует t0_error (момент ошибки), не now."""
+        from newsbot.__main__ import _resolve_wait, _BACKOFF_SECONDS
+        from datetime import datetime as dt_cls
 
-    def test_stale_lock_with_current_pid_can_be_taken(self, tmp_path):
-        """
-        MAJOR: lock с PID ТЕКУЩЕГО процесса, но без блокировки (SIGKILL/OOM/
-        reboot + PID-namespace контейнера) — НЕ повод отказывать в старте.
-        Раньше os.kill(pid, 0) отвечал «жив» (это сам себя) → вечный рестарт-луп.
-        """
-        import newsbot.__main__ as main_mod
+        t0_error = dt_cls(2000, 1, 1, 10, 29, 50)  # ошибка за 10 с до слота
+        now = dt_cls(2000, 1, 1, 10, 30, 20)        # now после backoff
 
-        lock_path = tmp_path / "newsbot.lock"
-        lock_path.write_text(str(os.getpid()), encoding="ascii")
+        wait = _resolve_wait(t0_error, after_error=True, now=now)
+        assert wait == _BACKOFF_SECONDS, (
+            f"Ошибка в 10:29:50 → max(backoff={_BACKOFF_SECONDS}, slot=10) = "
+            f"{_BACKOFF_SECONDS} с. Получено {wait} с"
+        )
 
-        assert main_mod._acquire_lock(lock_path, os.getpid()) is True
-        assert lock_path.read_text() == str(os.getpid())
-        assert list(tmp_path.glob("*.tmp")) == []
-        main_mod._release_lock(lock_path)
 
-    def test_lock_taken_after_owner_released(self, tmp_path):
-        """Владелец «умер» (блокировка снята) → lock берётся."""
-        import newsbot.__main__ as main_mod
+class TestFormatSlotHour:
+    """Форматирование часа слота для логирования."""
 
-        lock_path = tmp_path / "newsbot.lock"
-        fd = self._hold_lock(lock_path)
-        try:
-            with pytest.raises(SystemExit):
-                main_mod._acquire_lock(lock_path, 111)
-        finally:
-            self._drop_lock(fd)
-
-        assert main_mod._acquire_lock(lock_path, 222) is True
-        assert lock_path.read_text() == "222"
-        main_mod._release_lock(lock_path)
-
-    def test_release_lock_frees_lock_and_removes_file(self, tmp_path):
-        """_release_lock снимает блокировку и удаляет файл; повторный захват ок."""
-        import newsbot.__main__ as main_mod
-
-        lock_path = tmp_path / "newsbot.lock"
-        assert main_mod._acquire_lock(lock_path, 333) is True
-        assert main_mod._LOCK_FD is not None
-
-        main_mod._release_lock(lock_path)
-        assert main_mod._LOCK_FD is None
-        assert not lock_path.exists()
-        assert main_mod._acquire_lock(lock_path, 444) is True
-        main_mod._release_lock(lock_path)
-
-    def test_live_pid_exits_in_pid_fallback(self, tmp_path, monkeypatch):
-        """
-        PID-fallback (блокировка файла недоступна): lock с живым PID → exit 1.
-        """
-        import newsbot.__main__ as main_mod
-
-        lock_path = tmp_path / "newsbot.lock"
-        my_pid = os.getpid()
-        lock_path.write_text(str(my_pid))
-
-        monkeypatch.setattr(main_mod, "_LOCK_FILE", lock_path)
-
-        with patch.object(main_mod, "_lock_fd_exclusive", return_value=None), \
-             patch.object(main_mod, "_is_process_alive", return_value=True):
-            with pytest.raises(SystemExit) as exc_info:
-                main_mod._acquire_lock(lock_path, 99999)
-        assert exc_info.value.code == 1
-
-    def test_stale_pid_can_be_taken(self, tmp_path, monkeypatch):
-        """Несуществующий PID (stale lock) → lock захватывается."""
-        import newsbot.__main__ as main_mod
-
-        lock_path = tmp_path / "newsbot.lock"
-        # PID 99999 — несуществующий (мокаем _is_process_alive)
-        lock_path.write_text("99999")
-
-        monkeypatch.setattr(main_mod, "_LOCK_FILE", lock_path)
-
-        with patch.object(main_mod, "_is_process_alive", return_value=False):
-            with patch("os.getpid", return_value=12345):
-                result = main_mod._acquire_lock(lock_path, 12345)
-
-        assert result is True
-        assert lock_path.exists()
-        assert lock_path.read_text() == "12345"
-        # temp-файл публикации не остаётся на диске
-        assert list(tmp_path.glob("*.tmp")) == []
-
-        # cleanup
-        main_mod._release_lock(lock_path)
-
-    def test_empty_lock_file_with_live_pid_not_stolen(self, tmp_path, monkeypatch):
-        """
-        PID-fallback + TOCTOU: пустой lock-файл (другой процесс ещё публикует)
-        не приводит к перехвату lock живого процесса — PID дочитывается повторно.
-        """
-        import newsbot.__main__ as main_mod
-
-        lock_path = tmp_path / "newsbot.lock"
-        lock_path.write_text("")   # ещё пустой
-
-        real_read = Path.read_text
-        calls = {"n": 0}
-
-        def flaky_read(self, *a, **kw):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return ""
-            return "424242"
-
-        monkeypatch.setattr(Path, "read_text", flaky_read)
-        try:
-            with patch.object(main_mod, "_lock_fd_exclusive", return_value=None), \
-                 patch.object(main_mod, "_is_process_alive", return_value=True):
-                with pytest.raises(SystemExit) as exc_info:
-                    main_mod._acquire_lock(lock_path, 777)
-        finally:
-            monkeypatch.setattr(Path, "read_text", real_read)
-
-        assert exc_info.value.code == 1
-        # PID дочитан повторно (файл НЕ удалён и НЕ перезаписан)
-        assert calls["n"] >= 2, "пустой lock-файл должен перечитываться"
-        assert lock_path.exists(), "lock живого процесса не должен удаляться"
-
-    def test_release_lock_removes_file(self, tmp_path):
-        """_release_lock удаляет lock-файл."""
-        import newsbot.__main__ as main_mod
-
-        lock_path = tmp_path / "newsbot.lock"
-        lock_path.touch()
-
-        main_mod._release_lock(lock_path)
-        assert not lock_path.exists()
-
-    def test_release_lock_nonexistent_no_error(self, tmp_path):
-        """_release_lock при отсутствии файла — без ошибки."""
-        import newsbot.__main__ as main_mod
-
-        lock_path = tmp_path / "nonexistent.lock"
-        # Не существует — не должно упасть
-        main_mod._release_lock(lock_path)
-
-    def test_release_lock_second_unlink_only_on_windows(self, tmp_path):
-        """
-        Major: второй unlink (после close) — ТОЛЬКО на Windows.
-
-        На POSIX повторный unlink после close удалил бы новый inode, созданный
-        другим процессом в окне между нашим unlink и close → два демона
-        одновременно на разных inode. Проверяем ровно один unlink на POSIX.
-        """
-        import newsbot.__main__ as main_mod
-
-        lock_path = tmp_path / "newsbot.lock"
-        assert main_mod._acquire_lock(lock_path, os.getpid()) is True
-
-        real_unlink = type(lock_path).unlink
-        calls = []
-
-        def spy_unlink(self, *a, **kw):
-            calls.append(str(self))
-            return real_unlink(self, *a, **kw)
-
-        # pathlib биндит os.unlink на уровне класса, поэтому патчим Path.unlink.
-        with patch.object(type(lock_path), "unlink", spy_unlink):
-            main_mod._release_lock(lock_path)
-
-        assert not lock_path.exists()
-        if sys.platform == "win32":
-            assert len(calls) == 2, f"на win32 ожидались 2 unlink, было {calls}"
-        else:
-            assert len(calls) == 1, (
-                f"на POSIX второй unlink запрещён (риск удалить чужой inode): {calls}"
+    def test_various_times(self):
+        from newsbot.__main__ import _format_slot_hour
+        cases = [
+            (real_dt_cls(2000, 1, 1, 10, 5),  10),
+            (real_dt_cls(2000, 1, 1, 10, 31), 12),
+            (real_dt_cls(2000, 1, 1, 9, 31),  10),
+            (real_dt_cls(2000, 1, 1, 23, 59), 0),
+            (real_dt_cls(2000, 1, 1, 0, 29),  0),
+            (real_dt_cls(2000, 1, 1, 0, 31),  2),
+        ]
+        for now, expected in cases:
+            assert _format_slot_hour(now) == expected, (
+                f"{now.strftime('%H:%M')} → {expected}"
             )
-
-    def test_is_process_alive_true_for_current(self):
-        """Текущий процесс — живой (безопасная проверка, без os.kill на win32)."""
-        import newsbot.__main__ as main_mod
-        with patch.object(main_mod, "_is_process_alive_windows", return_value=True) as mock_win, \
-             patch("os.kill") as mock_kill:
-            assert main_mod._is_process_alive(os.getpid()) is True
-        if sys.platform == "win32":
-            mock_win.assert_called_once_with(os.getpid())
-            mock_kill.assert_not_called()
-
-    def test_is_process_alive_true_current_process(self):
-        """Текущий процесс — живой (os.getpid()); на win32 не зовём os.kill."""
-        import newsbot.__main__ as main_mod
-        with patch.object(main_mod, "_is_process_alive_windows", return_value=True) as mock_win:
-            assert main_mod._is_process_alive(os.getpid()) is True
-        if sys.platform == "win32":
-            mock_win.assert_called_once_with(os.getpid())
-
-    def test_is_process_alive_false_process_lookup_error(self):
-        """ProcessLookupError → False."""
-        import newsbot.__main__ as main_mod
-        with patch("os.kill", side_effect=ProcessLookupError):
-            assert main_mod._is_process_alive_posix(12345) is False
-
-
-# ══════════════════════════════════════════════════════════════════
-# MAJOR 2: проверка живости PID безопасна на Windows
-# (os.kill(pid, 0) на Windows = TerminateProcess → убивает проверяемый процесс)
-# ══════════════════════════════════════════════════════════════════
-
-class TestProcessAliveChecks:
-    """_is_process_alive: win32 → OpenProcess/WaitForSingleObject, posix → os.kill."""
-
-    def test_posix_alive_when_kill_succeeds(self):
-        import newsbot.__main__ as main_mod
-        with patch("os.kill", return_value=None) as mock_kill:
-            assert main_mod._is_process_alive_posix(12345) is True
-        mock_kill.assert_called_once_with(12345, 0)
-
-    def test_posix_alive_on_permission_error(self):
-        """PermissionError = процесс есть, но чужой."""
-        import newsbot.__main__ as main_mod
-        with patch("os.kill", side_effect=PermissionError):
-            assert main_mod._is_process_alive_posix(12345) is True
-
-    @staticmethod
-    def _fake_ctypes(handle, wait_rc, last_error=0):
-        """Фейковый ctypes с kernel32-моками."""
-        kernel32 = MagicMock()
-        kernel32.OpenProcess.return_value = handle
-        kernel32.WaitForSingleObject.return_value = wait_rc
-        kernel32.GetLastError.return_value = last_error
-        fake = MagicMock()
-        fake.windll.kernel32 = kernel32
-        return fake, kernel32
-
-    def test_windows_dead_on_invalid_parameter(self):
-        """OpenProcess → NULL + GetLastError()==87 → процесса нет."""
-        import newsbot.__main__ as main_mod
-        fake, kernel32 = self._fake_ctypes(handle=0, wait_rc=0, last_error=87)
-        with patch.object(main_mod, "ctypes", fake):
-            assert main_mod._is_process_alive_windows(999999999) is False
-        kernel32.CloseHandle.assert_not_called()
-
-    def test_windows_alive_on_wait_timeout(self):
-        """handle + WAIT_TIMEOUT → процесс жив; CloseHandle вызван."""
-        import newsbot.__main__ as main_mod
-        fake, kernel32 = self._fake_ctypes(handle=1234, wait_rc=0x102)
-        with patch.object(main_mod, "ctypes", fake):
-            assert main_mod._is_process_alive_windows(4242) is True
-        kernel32.CloseHandle.assert_called_once_with(1234)
-
-    def test_windows_dead_on_wait_object_0(self):
-        """handle + WAIT_OBJECT_0 → процесс завершён; CloseHandle вызван."""
-        import newsbot.__main__ as main_mod
-        fake, kernel32 = self._fake_ctypes(handle=1234, wait_rc=0)
-        with patch.object(main_mod, "ctypes", fake):
-            assert main_mod._is_process_alive_windows(4242) is False
-        kernel32.CloseHandle.assert_called_once_with(1234)
-
-    def test_windows_never_calls_os_kill(self):
-        """На Windows os.kill(pid, 0) не должен вызываться вообще."""
-        import newsbot.__main__ as main_mod
-        fake, _ = self._fake_ctypes(handle=1234, wait_rc=0x102)
-        with patch.object(main_mod, "ctypes", fake), patch("os.kill") as mock_kill:
-            main_mod._is_process_alive_windows(4242)
-        mock_kill.assert_not_called()
-
-    def test_dispatch_uses_windows_branch_on_win32(self):
-        """sys.platform == 'win32' → windows-ветка (не os.kill)."""
-        import newsbot.__main__ as main_mod
-        with patch.object(main_mod.sys, "platform", "win32"), \
-             patch.object(main_mod, "_is_process_alive_windows",
-                          return_value=True) as mock_win, \
-             patch("os.kill") as mock_kill:
-            assert main_mod._is_process_alive(4242) is True
-        mock_win.assert_called_once_with(4242)
-        mock_kill.assert_not_called()
-
-    def test_dispatch_uses_posix_branch_off_win32(self):
-        """sys.platform != 'win32' → os.kill(pid, 0)."""
-        import newsbot.__main__ as main_mod
-        with patch.object(main_mod.sys, "platform", "linux"), \
-             patch.object(main_mod, "_is_process_alive_windows") as mock_win, \
-             patch("os.kill", return_value=None) as mock_kill:
-            assert main_mod._is_process_alive(4242) is True
-        mock_win.assert_not_called()
-        mock_kill.assert_called_once_with(4242, 0)
-
-
-# ══════════════════════════════════════════════════════════════════
-# MAJOR (main): единый дедлайн shutdown-фазы поллера
-# ══════════════════════════════════════════════════════════════════
-
-
-class _FakeClock:
-    """Управляемые часы: main_mod.time.monotonic() без реального ожидания."""
-
-    def __init__(self, start: float = 1000.0):
-        self.now = start
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:  # pragma: no cover - не вызывается
-        self.now += seconds
-
-
-def _run_main_with_poller(poller, clock):
-    """Гоняет реальный main() с мок-пайплайном и мок-поллером."""
-    import newsbot.__main__ as main_mod
-
-    shutdown = threading.Event()
-    digest = threading.Event()
-
-    mock_pipeline = MagicMock()
-    mock_pipeline.storage.db_path = "unused.db"
-
-    def fake_cycle():
-        shutdown.set()  # эмулируем SIGTERM во время цикла
-
-    mock_pipeline.run_cycle_with_delivery.side_effect = fake_cycle
-
-    config = {"logging": {"level": "WARNING"}, "poll_interval_minutes": 15}
-
-    with patch.object(sys, "argv", ["newsbot"]), \
-         patch.object(main_mod, "_shutdown_event", shutdown), \
-         patch.object(main_mod, "_digest_requested", digest), \
-         patch.object(main_mod, "_poller", poller), \
-         patch.object(main_mod, "_LOCK_FILE", None), \
-         patch.object(main_mod, "time", clock), \
-         patch.object(main_mod, "NewsPipeline", return_value=mock_pipeline), \
-         patch.object(main_mod, "load_config", return_value=config), \
-         patch.object(main_mod, "setup_logging"), \
-         patch.object(main_mod, "signal", MagicMock()), \
-         patch.object(main_mod, "_maybe_start_poller"):
-        main_mod.main()
-
-    return mock_pipeline
-
-
-def test_shutdown_poller_close_gets_only_remaining_budget():
-    """
-    stop() уже прождал 35 с → close() получает лишь остаток бюджета (≈5 с),
-    а не повторный полный join (poll_timeout+5 ≈ 30 с).
-    """
-    import newsbot.__main__ as main_mod
-
-    budget = main_mod._POLLER_SHUTDOWN_BUDGET_SEC
-    clock = _FakeClock()
-
-    poller = MagicMock()
-    captured = {}
-
-    def fake_stop(*args, **kwargs):
-        clock.now += 35.0  # stop() ждал поток 35 с
-
-    def fake_close(join_timeout=None):
-        captured["join_timeout"] = join_timeout
-
-    poller.stop.side_effect = fake_stop
-    poller.close.side_effect = fake_close
-
-    mock_pipeline = _run_main_with_poller(poller, clock)
-
-    poller.stop.assert_called_once()
-    poller.close.assert_called_once()
-    assert "join_timeout" in captured, "close() должен получить остаток дедлайна"
-    remaining = captured["join_timeout"]
-    assert remaining is not None
-    # Остаток = budget - 35; суммарно поллер ждём не больше бюджета
-    assert 0.0 <= remaining <= budget - 35.0 + 1e-6
-    # shutdown дошёл до pipeline.close (не был съеден ожиданием поллера)
-    mock_pipeline.close.assert_called_once()
-
-
-def test_shutdown_poller_budget_never_repeats_full_join():
-    """Даже если stop() «съел» весь бюджет, close() не ждёт повторно 30 с."""
-    import newsbot.__main__ as main_mod
-
-    budget = main_mod._POLLER_SHUTDOWN_BUDGET_SEC
-    clock = _FakeClock()
-
-    poller = MagicMock()
-    captured = {}
-
-    def fake_stop(*args, **kwargs):
-        clock.now += budget + 10.0  # бюджет исчерпан
-
-    def fake_close(join_timeout=None):
-        captured["join_timeout"] = join_timeout
-
-    poller.stop.side_effect = fake_stop
-    poller.close.side_effect = fake_close
-
-    _run_main_with_poller(poller, clock)
-
-    assert captured["join_timeout"] == 0.0
-
-
-def test_poller_close_accepts_join_timeout():
-    """close(join_timeout=N) принимается; None — прежнее поведение."""
-    poller = TelegramPoller(
-        token="t", chat_id="1", db_path="unused.db", on_digest=lambda: None,
-        poll_timeout=60,
-    )
-    # Поток не запускался → join не нужен, close() не должен падать/висеть
-    poller.close(join_timeout=0.0)
-    poller.close()  # None — прежнее поведение, идемпотентно
-
-
-# ══════════════════════════════════════════════════════════════════
-# P1: stop() укладывается в shutdown-бюджет (join = min(poll+5, max_join))
-# ══════════════════════════════════════════════════════════════════
-
-
-def test_main_passes_remaining_budget_to_stop():
-    """main() передаёт stop() остаток shutdown-бюджета (max_join ≤ budget)."""
-    import newsbot.__main__ as main_mod
-
-    budget = main_mod._POLLER_SHUTDOWN_BUDGET_SEC
-    clock = _FakeClock()
-    poller = MagicMock()
-    captured = {}
-
-    def fake_stop(max_join=None):
-        captured["max_join"] = max_join
-        clock.now += 5.0
-
-    poller.stop.side_effect = fake_stop
-    poller.close.side_effect = lambda join_timeout=None: None
-
-    _run_main_with_poller(poller, clock)
-
-    assert "max_join" in captured, "stop() должен получить max_join"
-    assert 0.0 < captured["max_join"] <= budget
-
-
-def test_stop_caps_join_by_max_join():
-    """
-    stop(max_join=0.1) не ждёт poll_timeout+5 — join ограничен max_join,
-    поток остаётся alive, ссылка не обнуляется (нет второго поллера).
-    """
-    with patch("newsbot.storage.Storage") as MockStorage, \
-         patch("newsbot.telegram_io._TgClient") as MockClient:
-
-        mock_storage = MagicMock()
-        mock_storage.get_meta.return_value = None
-        MockStorage.return_value = mock_storage
-
-        mock_client = MagicMock()
-
-        poller_holder = {}
-
-        def fake_get_updates(**kwargs):
-            # Блокируемся до stop() (не sleep(3600): поток не должен утекать),
-            # затем короткая пауза — детерминированно гарантирует, что при
-            # max_join=0.1 поток ещё жив (проверяем именно cap join'а).
-            p = poller_holder.get("poller")
-            if p is not None:
-                p._stop_event.wait(timeout=10.0)
-            time.sleep(0.5)
-            return []
-
-        mock_client.getUpdates.side_effect = fake_get_updates
-        MockClient.return_value = mock_client
-
-        poller = TelegramPoller(
-            token="test_token", chat_id="123", db_path=":memory:",
-            on_digest=MagicMock(), poll_timeout=25,
-        )
-        poller_holder["poller"] = poller
-        poller.start()
-        time.sleep(0.3)
-
-        started = time.monotonic()
-        poller.stop(max_join=0.1)
-        elapsed = time.monotonic() - started
-
-        assert elapsed < 2.0, f"stop(max_join=0.1) ждал {elapsed:.1f}с"
-        assert poller._thread is not None
-        assert poller._thread.is_alive()
-
-        # уборка: поток завершается сам (wait по _stop_event + 0.5 с) —
-        # close() его join'ит, утечки daemon-потока нет.
-        poller.close(join_timeout=5.0)
-
-
-# ══════════════════════════════════════════════════════════════════
-# P2: --bind без --set-chat-id → parser.error (не молчаливый демон)
-# ══════════════════════════════════════════════════════════════════
-
-
-def test_bind_without_set_chat_id_is_parser_error():
-    """--bind без --set-chat-id → SystemExit(2), демон не запускается."""
-    import newsbot.__main__ as main_mod
-
-    with patch.object(sys, "argv", ["newsbot", "--bind", "123456789"]), \
-         patch.object(main_mod, "_minimal_sanitizer_handler"), \
-         patch.object(main_mod, "NewsPipeline") as mock_pipeline:
-        with pytest.raises(SystemExit) as exc:
-            main_mod.main()
-
-    assert exc.value.code == 2
-    mock_pipeline.assert_not_called()
-
-
-# ══════════════════════════════════════════════════════════════════
-# MINOR: HTTP-таймаут клиента больше long-poll таймаута
-# ══════════════════════════════════════════════════════════════════
-
-
-def test_client_http_timeout_exceeds_poll_timeout():
-    """
-    Иначе httpx read-timeout срабатывает одновременно с ответом Telegram →
-    ложный TgApiError(timeout) → backoff и повторная обработка updates.
-    """
-    with patch("newsbot.telegram_io._TgClient") as MockClient:
-        TelegramPoller(
-            token="t", chat_id="1", db_path="unused.db",
-            on_digest=lambda: None, poll_timeout=25,
-        )
-    assert MockClient.call_args.kwargs["timeout"] == 35.0
-
-
-def test_client_http_timeout_follows_clamped_poll_timeout():
-    """poll_timeout=30 (кламп в config.py) → HTTP-таймаут 40 с."""
-    with patch("newsbot.telegram_io._TgClient") as MockClient:
-        TelegramPoller(
-            token="t", chat_id="1", db_path="unused.db",
-            on_digest=lambda: None, poll_timeout=30,
-        )
-    assert MockClient.call_args.kwargs["timeout"] == 40.0

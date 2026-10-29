@@ -142,6 +142,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "window_days": 3,       # окно сравнения для fuzzy и cross_source
         "max_seen_titles": 2000,  # лимит выборки заголовков за окно (0 = без лимита)
         "llm_recent_limit": 20,  # недавних заголовков для LLM-дедупа
+        "prefetch_window_hours": 2,  # окно prefetch-кеша для _domain_recent_duplicate_legacy
     },
 }
 
@@ -616,6 +617,7 @@ def _validate_dedup_numeric(cfg: Dict[str, Any]) -> None:
         ("window_days", 3, 1),
         ("max_seen_titles", 2000, 0),
         ("llm_recent_limit", 20, 0),
+        ("prefetch_window_hours", 2, 1),
     )
     for field, default, min_bound in fields:
         if field not in dedup_cfg:
@@ -637,6 +639,17 @@ def _validate_dedup_numeric(cfg: Dict[str, Any]) -> None:
             dedup_cfg[field] = default
         else:
             dedup_cfg[field] = converted
+
+    # MAJOR-prefetch-фикс: prefetch_window_hours имеет верхнюю границу 48 ч.
+    if "prefetch_window_hours" in dedup_cfg:
+        raw = dedup_cfg["prefetch_window_hours"]
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            if raw > 48:
+                logger.warning(
+                    "dedup.prefetch_window_hours=%r превышает максимум 48, "
+                    "клампим до 48.", raw,
+                )
+                dedup_cfg["prefetch_window_hours"] = 48
 
 
 def _validate_digest_numeric(cfg: Dict[str, Any]) -> None:

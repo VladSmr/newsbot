@@ -65,7 +65,7 @@ def _tmp_db():
 
 def _build_prefetch(items_and_titles):
     """
-    Строит prefetch-dict для _domain_recent_duplicate по схеме storage.get_recent_for_dedup().
+    Строит prefetch-dict для _domain_recent_duplicate_legacy по схеме storage.get_recent_for_dedup().
     ИСПОЛЬЗУЕТ реальный формат ключа из Storage — при смене формата тесты не молчат.
 
     items_and_titles: список кортежей (cluster_key, title) из БД.
@@ -239,7 +239,7 @@ class TestQuickFilter(unittest.TestCase):
             ("h3", "one two three four", "", ""),
         ]
         # нормализованный с 4 словами
-        result = _quick_filter("one two three four", candidates)
+        result, _lh = _quick_filter("one two three four", candidates)
         # h1 (1 слово) — отсекается (|4-1| > MAX_LEN_DIFF=15 — проверю)
         # h2 (13 слов) — пропускается (|4-13|=9 ≤ 15)
         # h3 (4 слова) — пропускается
@@ -252,27 +252,32 @@ class TestQuickFilter(unittest.TestCase):
             ("h1", "cat dog mouse elephant", "", ""),
             ("h2", "hello world foo bar", "", ""),
         ]
-        result = _quick_filter("cat dog mouse", candidates)
+        result, limit_hit = _quick_filter("cat dog mouse", candidates)
         # h1: пересечение 3/3=1.0 ≥ MIN_TOKEN_INTERSECTION → пропускается
         # h2: пересечение 0 → отсекается
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], "h1")
+        self.assertFalse(limit_hit)
 
     def test_empty_candidates(self):
-        result = _quick_filter("hello world", [])
+        result, limit_hit = _quick_filter("hello world", [])
         self.assertEqual(result, [])
+        self.assertFalse(limit_hit)
 
     def test_empty_norm(self):
-        result = _quick_filter("", [("h1", "hello", "", "")])
+        result, limit_hit = _quick_filter("", [("h1", "hello", "", "")])
         self.assertEqual(result, [])
+        self.assertFalse(limit_hit)
 
     def test_respects_limit(self):
         """Не возвращает больше MAX_FUZZY_CANDIDATES."""
         candidates = [("h", "word1 word2 word3", "", "") for _ in range(500)]
-        result = _quick_filter("word1 word2 word3", candidates)
+        result, limit_hit = _quick_filter("word1 word2 word3", candidates)
         # После предфильтра лимит ещё применяется в _quick_filter
-        # Проверяем что нет exception и возвращается список
+        # MINOR-3: limit_hit флаг вынесен, но усечение происходит внутри
         self.assertIsInstance(result, list)
+        self.assertLessEqual(len(result), 200)
+        self.assertTrue(limit_hit)
 
 
 class TestFuzzySimilarity(unittest.TestCase):
@@ -985,7 +990,7 @@ class TestEnhancedFilterByLength(unittest.TestCase):
             ("h1", "word", "", ""),
             ("h3", "one two three four", "", ""),
         ]
-        result = _quick_filter("one two three four", candidates)
+        result, _lh = _quick_filter("one two three four", candidates)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][0], "h3")
 
@@ -995,7 +1000,7 @@ class TestEnhancedFilterByLength(unittest.TestCase):
             # 16 слов, но есть пересечение токенов с квери
             ("h1", "one two three four a b c d e f g h i j k l m", "", ""),
         ]
-        result = _quick_filter("one two three four", candidates)  # 4 слова
+        result, _lh = _quick_filter("one two three four", candidates)  # 4 слова
         # |4-16|=12 ≤ MAX_LEN_DIFF=15 → проходит фильтр по длине;
         # token_ratio = 4/4 = 1.0 ≥ MIN_TOKEN_INTERSECTION → проходит
         self.assertEqual(len(result), 1)
@@ -1008,7 +1013,7 @@ class TestEnhancedRespectsLimit(unittest.TestCase):
         """При >500 кандидатах результат ≤ MAX_FUZZY_CANDIDATES (200)."""
         from newsbot.dedup import MAX_FUZZY_CANDIDATES
         candidates = [("h", "word1 word2 word3", "", "") for _ in range(600)]
-        result = _quick_filter("word1 word2 word3", candidates)
+        result, _lh = _quick_filter("word1 word2 word3", candidates)
         self.assertLessEqual(len(result), MAX_FUZZY_CANDIDATES,
             f"Результат должен быть ≤ {MAX_FUZZY_CANDIDATES}")
 
@@ -1155,9 +1160,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
-    # ── _domain_recent_duplicate ──────────────────────────────────────────────
+    # ── _domain_recent_duplicate_legacy ──────────────────────────────────────────────
 
-    def test_domain_recent_duplicate_blocks_same_cluster_key(self):
+    def test_domain_recent_duplicate_legacy_blocks_same_cluster_key(self):
         """Тот же cluster_key в окне → item отклоняется."""
         path = _tmp_db()
         try:
@@ -1170,15 +1175,15 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
             st.save(item)
 
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
             prefetch = _build_prefetch([(item.cluster_key, item.title)])
-            result = _domain_recent_duplicate(item, prefetch)
+            result = _domain_recent_duplicate_legacy(item, prefetch)
             self.assertTrue(result, "Item с тем же cluster_key в окне должен блокироваться")
             st.close()
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_different_cluster_key_passes(self):
+    def test_domain_recent_duplicate_legacy_different_cluster_key_passes(self):
         """Другой cluster_key → item проходит."""
         path = _tmp_db()
         try:
@@ -1197,16 +1202,16 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://ria.ru/new",
                 cluster_key="euro_strength",  # другой cluster_key
             )
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
             prefetch = _build_prefetch([(item_old.cluster_key, item_old.title)])
-            result = _domain_recent_duplicate(item_new, prefetch)
+            result = _domain_recent_duplicate_legacy(item_new, prefetch)
             self.assertFalse(result, "Item с другим cluster_key должен пройти")
             st.close()
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_db_error_fail_open(self):
-        """DB-исключение в _domain_recent_duplicate → fail-open (item проходит) + warning."""
+    def test_domain_recent_duplicate_legacy_db_error_fail_open(self):
+        """DB-исключение в _domain_recent_duplicate_legacy → fail-open (item проходит) + warning."""
         path = _tmp_db()
         try:
             st = Storage(Path(path))
@@ -1219,15 +1224,15 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             st.save(item)
             st.close()
 
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
             # prefetch=None эмулирует ошибку получения prefetch в реальном коде
             # (prefetch не был построен — fail-open без логирования).
-            result = _domain_recent_duplicate(item, None)
+            result = _domain_recent_duplicate_legacy(item, None)
             self.assertFalse(result, "Fail-open: при None-prefetch item должен пройти")
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_suffix_match_different_location_same_stem(self):
+    def test_domain_recent_duplicate_legacy_suffix_match_different_location_same_stem(self):
         """
         M2-фикс: ingest-ключ 'other|abc|day' должен детектировать дубль
         для БД-ключа 'moscow|abc|day' (тот же stem, другая location).
@@ -1257,9 +1262,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key="other|abc12345|2026-10-24",
             )
 
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
-            result = _domain_recent_duplicate(ingest_item, prefetch)
+            result = _domain_recent_duplicate_legacy(ingest_item, prefetch)
             self.assertTrue(
                 result,
                 "Ingest-ключ 'other|abc|day' должен блокироваться при наличии "
@@ -1269,7 +1274,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_suffix_match_different_stem_passes(self):
+    def test_domain_recent_duplicate_legacy_suffix_match_different_stem_passes(self):
         """
         M2-фикс: ingest-ключ 'other|abc|day' НЕ должен блокировать item
         с БД-ключом 'moscow|xyz|day' (другой stem) — это разные темы.
@@ -1293,9 +1298,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key="other|abc12345|2026-10-24",  # другой stem
             )
 
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
-            result = _domain_recent_duplicate(ingest_item, prefetch)
+            result = _domain_recent_duplicate_legacy(ingest_item, prefetch)
             self.assertFalse(
                 result,
                 "Разные stem → разные темы → guard не должен блокировать"
@@ -1304,7 +1309,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_suffix_match_same_stem_different_day(self):
+    def test_domain_recent_duplicate_legacy_suffix_match_same_stem_different_day(self):
         """
         M2-фикс: ingest-ключ 'other|abc|24.10.2026' не должен блокировать
         item с БД-ключом 'moscow|abc|23.10.2026' (другой день).
@@ -1328,9 +1333,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key="other|abc12345|2026-10-24",  # другой день
             )
 
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
-            result = _domain_recent_duplicate(ingest_item, prefetch)
+            result = _domain_recent_duplicate_legacy(ingest_item, prefetch)
             self.assertFalse(
                 result,
                 "Другой день → guard не должен блокировать"
@@ -1364,9 +1369,9 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key="dollar_rate_2024",  # тот же легаси-ключ
             )
 
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
-            result = _domain_recent_duplicate(ingest_item, prefetch)
+            result = _domain_recent_duplicate_legacy(ingest_item, prefetch)
             self.assertTrue(
                 result,
                 "Легаси-ключ без '|' → exact match → guard должен блокировать"
@@ -1379,7 +1384,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 url="https://ria.ru/euro",
                 cluster_key="euro_rate_2024",
             )
-            result2 = _domain_recent_duplicate(other_item, prefetch)
+            result2 = _domain_recent_duplicate_legacy(other_item, prefetch)
             self.assertFalse(
                 result2,
                 "Другой легаси-ключ → не блокируется"
@@ -1393,7 +1398,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
     # заголовки, различающиеся ТОЛЬКО числами, получают одинаковый cluster_key.
     # Guard сверяет мультимножество чисел заголовков.
 
-    def test_domain_recent_duplicate_different_numbers_passes(self):
+    def test_domain_recent_duplicate_legacy_different_numbers_passes(self):
         """
         «Fed raises rates by 25 bps» vs «... by 50 bps»: cluster_key совпадает
         (числа вырезаны из stem), но числа заголовков разные → НЕ дубль.
@@ -1401,7 +1406,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             title_old = "Fed raises rates by 25 bps"
@@ -1429,7 +1434,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key=key,
             )
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
-            result = _domain_recent_duplicate(ingest_item, prefetch)
+            result = _domain_recent_duplicate_legacy(ingest_item, prefetch)
             self.assertFalse(
                 result,
                 "Разные числа (25 vs 50) → это разные факты, guard не должен "
@@ -1439,7 +1444,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_same_numbers_still_blocks(self):
+    def test_domain_recent_duplicate_legacy_same_numbers_still_blocks(self):
         """
         Пересказ с теми же числами (перестановка слов) → guard блокирует.
         Валидирует и инвариант stem-хеша: normalize() сортирует слова, поэтому
@@ -1448,7 +1453,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             title_old = "Fed raises rates by 25 bps"
@@ -1476,7 +1481,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
                 cluster_key=key,
             )
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
-            result = _domain_recent_duplicate(ingest_item, prefetch)
+            result = _domain_recent_duplicate_legacy(ingest_item, prefetch)
             self.assertTrue(
                 result,
                 "Те же числа → дубль, guard должен блокировать",
@@ -1485,7 +1490,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_scans_all_candidates_same_cluster_key(self):
+    def test_domain_recent_duplicate_legacy_scans_all_candidates_same_cluster_key(self):
         """
         Несколько записей с ОДИНАКОВЫМ cluster_key в окне: у первой числа
         другие, у второй — совпадают → guard обязан вернуть True.
@@ -1495,7 +1500,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             title_new = "Fed raises rates by 25 bps"
@@ -1530,7 +1535,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             # Храним ту, чьи числа совпадают с ingest → guard срабатывает.
             prefetch = _build_prefetch([(item25.cluster_key, item25.title)])
             self.assertTrue(
-                _domain_recent_duplicate(ingest_item, prefetch),
+                _domain_recent_duplicate_legacy(ingest_item, prefetch),
                 "Совпадение чисел во ВТОРОЙ записи окна должно блокировать item "
                 "(guard сканирует всех кандидатов по cluster_key, а не первого)",
             )
@@ -1538,7 +1543,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_non_str_title_no_crash(self):
+    def test_domain_recent_duplicate_legacy_non_str_title_no_crash(self):
         """
         Не-str title из внешнего кода не должен обрывать filter_new (fail-open):
         guard деградирует, но исключение наружу не уходит.
@@ -1546,7 +1551,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             stem = stem_hash("Fed raises rates by 25 bps")
@@ -1567,13 +1572,13 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
             weird.title = None  # грязные данные из внешнего кода
             prefetch = _build_prefetch([(db_weird.cluster_key, db_weird.title)])
-            result = _domain_recent_duplicate(weird, prefetch)  # не должно бросить
+            result = _domain_recent_duplicate_legacy(weird, prefetch)  # не должно бросить
             self.assertIsInstance(result, bool)
             st.close()
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_counter_not_set(self):
+    def test_domain_recent_duplicate_legacy_counter_not_set(self):
         """
         Мультимножество, а не множество: «70 70» vs «70» ({70:2} ≠ {70:1})
         → НЕ дубль. Заголовки отличаются ТОЛЬКО числами (одинаковый stem),
@@ -1582,7 +1587,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             title_old = "Regulator fines bank 70 70 million"
@@ -1610,7 +1615,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
             prefetch = _build_prefetch([(db_item70.cluster_key, db_item70.title)])
             self.assertFalse(
-                _domain_recent_duplicate(ingest_item, prefetch),
+                _domain_recent_duplicate_legacy(ingest_item, prefetch),
                 "{70: 2} != {70: 1} → разные мультимножества → не дубль "
                 "(set-семантика склеила бы их ошибочно)",
             )
@@ -1618,7 +1623,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_numbers_multiset_counts_multiplicity(self):
+    def test_domain_recent_duplicate_legacy_numbers_multiset_counts_multiplicity(self):
         """
         Мультимножество, а не множество: «2 dead in 2 regions» vs «2 dead in 3
         regions» различаются, а разные кратности одного числа — тоже.
@@ -1626,7 +1631,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             title_old = "Storm kills 2 in 2 regions of Japan"
@@ -1649,14 +1654,14 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
             self.assertFalse(
-                _domain_recent_duplicate(ingest_item, prefetch),
+                _domain_recent_duplicate_legacy(ingest_item, prefetch),
                 "2 vs 3 в мультимножестве чисел → разные факты → не дубль",
             )
             st.close()
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_no_numbers_behavior_unchanged(self):
+    def test_domain_recent_duplicate_legacy_no_numbers_behavior_unchanged(self):
         """
         Заголовки без чисел → оба мультимножества пустые → поведение прежнее:
         suffix-match по stem|day блокирует (в т.ч. при другой локации в БД).
@@ -1664,7 +1669,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             title = "ЦБ повысил ключевую ставку"
@@ -1687,19 +1692,19 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
             self.assertTrue(
-                _domain_recent_duplicate(ingest_item, prefetch),
+                _domain_recent_duplicate_legacy(ingest_item, prefetch),
                 "Без чисел → пустые мультимножества совпадают → дубль как раньше",
             )
             st.close()
         finally:
             _cleanup_db(path)
 
-    def test_domain_recent_duplicate_numbers_only_in_one_title_passes(self):
+    def test_domain_recent_duplicate_legacy_numbers_only_in_one_title_passes(self):
         """Числа есть только в одном заголовке → мультимножества разные → не дубль."""
         path = _tmp_db()
         try:
             from newsbot.stemmer import stem_hash
-            from newsbot.dedup import _domain_recent_duplicate
+            from newsbot.dedup import _domain_recent_duplicate_legacy
 
             st = Storage(Path(path))
             title_old = "Fed raises rates"
@@ -1722,7 +1727,7 @@ class TestDedupNoNPlusOne(unittest.TestCase):
             )
             prefetch = _build_prefetch([(db_item.cluster_key, db_item.title)])
             self.assertFalse(
-                _domain_recent_duplicate(ingest_item, prefetch),
+                _domain_recent_duplicate_legacy(ingest_item, prefetch),
                 "Пустое множество vs {{25}} → разные факты → не дубль",
             )
             st.close()

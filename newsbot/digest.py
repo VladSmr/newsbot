@@ -28,7 +28,7 @@ from .delivery import Delivery, format_time_utc
 # единственный источник истины для лимита (не дублируем формулу).
 from .delivery.telegram import (
     _utf16_units, is_valid_http_url, _strip_control_chars,
-    PermanentDeliveryError,
+    PermanentDeliveryError, ChatIdNotBoundError, BotBlockedError,
 )
 
 # Тип для кнопок одной новости в дайджесте
@@ -54,6 +54,157 @@ _MARGIN = 20
 # Максимальный escaped overhead footer: "<a href=\"\">🔗</a>" ≈ 17 + url_esc + time_esc.
 # Максимальный footer с time≈20: 17+500+20 = 537 → footer << 4096.
 _MAX_FOOTER_URL_ESC_LEN = 500
+
+# _UTF16_BYTES_PER_UNIT — 2 байта на единицу (в telegram.py)
+_UTF16_BYTES_PER_UNIT = 2
+
+
+# =============================================================================
+# Major-2: нарезка oversized-дайджестов на подсообщения ≤ 4096 UTF-16 units
+# =============================================================================
+
+def _split_message(msg: str) -> List[str]:
+    """
+    Разбивает oversized-дайджест на подсообщения ≤ 4096 UTF-16 units.
+
+    Режет по абзацам (\\n\\n). CONTRACT: msg — УЖЕ валидный HTML
+    (escaped в build_digest_messages / _emit). Повторное экранирование
+    разрушает &lt; → &amp;lt;, &gt; → &amp;gt; и рвёт ссылки в футере.
+    Консистентно с telegram.py `_split_text` и console.py:35.
+
+    Возвращает ≥1 строк, ни одна не превышает _TG_MESSAGE_MAX.
+    Один oversized-абзац → жёсткий срез через _hard_slice (безопасно для
+    HTML-сущностей — граница ищется по > / \\n / пробелу).
+    """
+    if _utf16_units(msg) <= _TG_MESSAGE_MAX:
+        return [msg]
+
+    packed: List[str] = []
+    buf = ""
+    for para in msg.split("\n\n"):
+        if not para.strip():
+            continue
+        # Major-1: НЕ экранируем — msg уже экранирован (_emit → build_digest_messages)
+        para_esc = para
+        if _utf16_units(para_esc) > _TG_MESSAGE_MAX:
+            # один абзац превышает лимит целиком → сбрасываем buf,
+            # режем жёстко и расширяем packed ВСЕМИ чанками (_hard_slice
+            # возвращает List[str], не теряет остаток)
+            if buf:
+                packed.append(buf)
+                buf = ""
+            packed.extend(_hard_slice(para_esc, _TG_MESSAGE_MAX))
+        else:
+            # greedy packing: пытаемся уложить в текущий буфер
+            test = (buf + "\n\n" + para_esc) if buf else para_esc
+            if _utf16_units(test) <= _TG_MESSAGE_MAX:
+                buf = test
+            else:
+                if buf:
+                    packed.append(buf)
+                buf = para_esc
+
+    if buf:
+        packed.append(buf)
+
+    return packed if packed else [msg]
+
+
+def _hard_slice(text: str, max_units: int) -> List[str]:
+    """
+    Жёсткий срез строки по UTF-16 units. Режет по ближайшей безопасной
+    границе (закрывающий тег `>`, перевод строки `\\n`, пробел, таб).
+    Major-фикс: если грубый срез попадает ВНУТРЬ `&...` (незакрытая сущность)
+    или ВНУТРЬ открывающего тега `<...` (без `>`) — сдвигает границу назад
+    до символа `&` или `<` соответственно.
+    Текст уже экранирован (вызывается ПОСЛЕ html.escape).
+    Возвращает ≥1 кусков, ни один не превышает max_units.
+    """
+    if _utf16_units(text) <= max_units:
+        return [text]
+
+    chunks: List[str] = []
+    while _utf16_units(text) > max_units:
+        encoded = text.encode("utf-16-le")
+        raw_limit = max_units * _UTF16_BYTES_PER_UNIT
+        # грубый срез
+        rough = encoded[:raw_limit].decode("utf-16-le", errors="ignore")
+
+        # ищем ближайшую безопасную границу в пределах лимита.
+        # Пропускаем `>` если она была бы единственным символом чанка:
+        # это признак UTF-16 byte-boundary slice через `</a>` → бесконечный
+        # цикл (пустой chunk потребляет 0 символов из text).
+        cut = len(rough)
+        found_at_zero = False  # True если единственная safe boundary = position 0
+        for i in range(len(rough) - 1, -1, -1):
+            ch = rough[i]
+            if ch in (" ", "\t", "\n"):
+                cut = i
+                break
+            if ch == ">":
+                tail = rough[i + 1 :]
+                # внутри значения атрибута — нечётное число кавычек после >
+                if tail.count('"') % 2 != 0:
+                    continue
+                # (a) если перед > идёт `</` — это закрывающий тег → safe
+                if i >= 2 and rough[i - 2 : i] == "</":
+                    cut = i
+                    break
+                # (b) иначе > вне значения атрибута → safe boundary
+                cut = i
+                if i == 0:
+                    found_at_zero = True  # отложим решение после entity-check
+                else:
+                    break
+
+        chunk = rough[:cut]
+
+        # Если единственная safe граница = position 0 из-за `>` в `</a`
+        # (UTF-16 byte-boundary slice) и entity-rollback не помог —
+        # пропускаем эту границу и ищем space.
+        if found_at_zero and not chunk:
+            for i in range(len(rough) - 1, -1, -1):
+                if rough[i] in (" ", "\t", "\n"):
+                    cut = i
+                    break
+            chunk = rough[:cut]
+
+        # Major-фикс: если срез попал ВНУТРЬ &-сущности (&... без ;)
+        # или ВНУТРЬ открывающего тега (<... без >) — сдвигаем назад.
+        if chunk:
+            last_amp = rough.rfind("&", 0, cut)
+            if last_amp != -1:
+                tail = rough[last_amp:]
+                if ";" not in tail:
+                    chunk = rough[:last_amp]
+
+        if chunk:
+            last_lt = rough.rfind("<", 0, len(chunk))
+            if last_lt != -1:
+                after_lt = rough[last_lt:]
+                if ">" not in after_lt:
+                    chunk = rough[:last_lt]
+
+        # Major-фикс (critical): если rough оборвался ВНУТРИ `</a>`
+        # (UTF-16 byte boundary = 2×N не совпадает с char boundary),
+        # `>` вынесен в следующий символ text[len(chunk)]. Ловим: если
+        # chunk заканчивается на `/` и следующий символ text = `>`,
+        # включаем `>` в chunk.
+        if chunk and len(text) > len(chunk) and text[len(chunk)] == ">":
+            chunk = chunk + ">"
+            text = text[1:]
+
+        if not chunk:
+            # защита от пустого чанка: берём 1 символ
+            chunk = rough[:1]
+
+        chunks.append(chunk)
+        text = text[len(chunk):]
+
+    if text:
+        chunks.append(text)
+
+    return chunks if chunks else [text]
 
 
 # =============================================================================
@@ -542,9 +693,6 @@ def _send_digest_with_targets(
     N3: лимит 4096 проверен на уровне build_digest_messages;
         консервативно: если текст всё равно >4096 — логируем warning.
     """
-    # M3: импортируем здесь чтобы избежать circular import и ValueError
-    # при запуске тестов напрямую (digest.py импортируется как top-level).
-    from newsbot.delivery.telegram import PermanentDeliveryError
 
     sent_urls: List[str] = []
     sent_groups: List[Tuple[str, List[NewsItem]]] = []
@@ -577,30 +725,73 @@ def _send_digest_with_targets(
         if not msg.strip():
             continue
 
-        # N3: консервативный check на превышение 4096 (в UTF-16 units)
-        msg_units = _utf16_units(msg)
-        if msg_units > _TG_MESSAGE_MAX:
-            logger.warning(
-                "Дайджест msg[%d/%d]: %d UTF-16 units (>%d лимит)",
-                i, n_groups, msg_units, _TG_MESSAGE_MAX,
-            )
-
         # M1-фикс: try/except ВНУТРИ цикла — падение одного сообщения
         # не отменяет отправку остальных.
         # M3-фикс: PermanentDeliveryError отлавливается отдельно.
         try:
-            ok = delivery.send_digest(msg, item_buttons)
-        except PermanentDeliveryError as e:
-            # M3-фикс: content-level ошибка — этот message доставлен НЕ будет.
-            # Его urls → permanent_failed_urls → state='failed'.
-            msg_urls = [item.url for item in group_items]
-            permanent_failed_urls.extend(msg_urls)
-            logger.warning(
-                "Дайджест msg[%d/%d]: PermanentDeliveryError (%s) — "
-                "%d items → failed, остальные сообщения отправляются",
-                i, n_groups, e, len(group_items),
-            )
-            continue
+            msg_units = _utf16_units(msg)
+            if msg_units > _TG_MESSAGE_MAX:
+                logger.warning(
+                    "Дайджест msg[%d/%d]: %d UTF-16 units (>%d лимит) — "
+                    "нарезаем на подсообщения",
+                    i, n_groups, msg_units, _TG_MESSAGE_MAX,
+                )
+
+            # Major-2-фикс: нарезаем oversized-msg на подсообщения ≤ 4096 UTF-16 units.
+            sub_messages = _split_message(msg)
+
+            # для oversized-дайджестов item_buttons привязываются к ПОСЛЕДНЕМУ
+            # подсообщению (кнопки 👍/👎 для всех items группы — в конце).
+            sub_ok = True
+            for sub_i, sub_msg in enumerate(sub_messages):
+                sub_is_last = (sub_i == len(sub_messages) - 1)
+                sub_buttons = item_buttons if sub_is_last else []
+                try:
+                    sub_ok = delivery.send_digest(sub_msg, sub_buttons) and sub_ok
+                except (ChatIdNotBoundError, BotBlockedError) as e:
+                    logger.warning(
+                        "Дайджест msg[%d/%d] sub[%d/%d]: (%s) — дайджест прерван, "
+                        "оставшиеся sub-сообщения пропущены",
+                        i, n_groups, sub_i + 1, len(sub_messages), type(e).__name__,
+                    )
+                    raise
+                except PermanentDeliveryError as e:
+                    msg_urls = [item.url for item in group_items]
+                    permanent_failed_urls.extend(msg_urls)
+                    logger.warning(
+                        "Дайджест msg[%d/%d] sub[%d/%d]: PermanentDeliveryError (%s) — "
+                        "%d items → failed, остаток sub-сообщений пропущен",
+                        i, n_groups, sub_i + 1, len(sub_messages), e, len(group_items),
+                    )
+                    sub_ok = False
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "Дайджест msg[%d/%d] sub[%d/%d]: исключение (%s): %s — "
+                        "sub-сообщения пропущены",
+                        i, n_groups, sub_i + 1, len(sub_messages),
+                        type(e).__name__, e,
+                    )
+                    sub_ok = False
+                    break
+
+            ok = sub_ok
+
+            if ok:
+                sent_urls.extend(item.url for item in group_items)
+                sent_groups.append((msg, group_items))
+                logger.debug(
+                    "Дайджест msg[%d/%d]: ok (%d sub_msgs, %d items)",
+                    i, n_groups, len(sub_messages), len(group_items),
+                )
+            else:
+                logger.warning(
+                    "Дайджест msg[%d/%d]: send_digest=False — "
+                    "%d items остаются deferred",
+                    i, n_groups,
+                    len(group_items),
+                )
+                # continue: остальные сообщения дайджеста должны уйти
         except Exception as e:
             logger.warning(
                 "Дайджест msg[%d/%d]: исключение при отправке (%s): %s — "
@@ -610,24 +801,6 @@ def _send_digest_with_targets(
                 e, len(group_items),
             )
             continue
-
-        if ok:
-            sent_urls.extend(item.url for item in group_items)
-            sent_groups.append((msg, group_items))
-            logger.debug(
-                "Дайджест msg[%d/%d]: ok (%d items)",
-                i, n_groups, len(group_items),
-            )
-        else:
-            logger.warning(
-                "Дайджест msg[%d/%d]: send_digest=False — "
-                "%d items остаются deferred",
-                i, n_groups,
-                sum(len(it) for _, it in groups[i - 1:]),
-            )
-            # continue: остальные сообщения дайджеста должны уйти
-            # (at-least-once: отправленные → digested, этот item → deferred,
-            # retry в следующем окне)
 
     if not sent_urls:
         logger.info("Дайджест: ни одно сообщение не доставлено.")
@@ -745,47 +918,51 @@ def run_digest(
         # MAJOR 2-фикс: per-message try/except — исключение на одном сообщении
         # НЕ прерывает цикл отправки остальных. Остальные сообщения дайджеста
         # уходят; битый item отмечается на уровне pipeline (по returned failed_urls).
+        # Minor-2-фикс: нарезаем oversized-msg на подсообщения ≤ 4096 UTF-16 units
+        # (аналогично send_digest-ветке — защита от edge case при кривых данных).
         for i, (msg, group_items) in enumerate(groups, 1):
             if not msg.strip():
                 continue
+
             if _utf16_units(msg) > _TG_MESSAGE_MAX:
                 logger.warning(
-                    "Дайджест msg[%d]: %d UTF-16 units (>%d лимит)",
-                    i, _utf16_units(msg), _TG_MESSAGE_MAX,
+                    "Дайджест msg[%d/%d]: %d UTF-16 units (>%d лимит) — "
+                    "нарезаем на подсообщения",
+                    i, len(groups), _utf16_units(msg), _TG_MESSAGE_MAX,
                 )
-            try:
-                ok = delivery.send_text(msg)
-            except PermanentDeliveryError as e:
-                # M3-фикс: content-level 400 в send_text-ветке (feedback off).
-                # url этого сообщения → all_failed_urls → pipeline → state='failed'.
-                failed_urls_here = [item.url for item in group_items]
-                for url in failed_urls_here:
-                    if url not in all_failed_urls:
-                        all_failed_urls.append(url)
-                logger.warning(
-                    "Дайджест msg[%d]: PermanentDeliveryError (%s) — "
-                    "%d items → failed, остальные отправляются",
-                    i, e, len(group_items),
-                )
-                continue
-            except Exception as e:
-                logger.warning(
-                    "Дайджест msg[%d]: исключение при отправке: %s — "
-                    "%d items остаются deferred, остальные отправляются",
-                    i, e, len(group_items),
-                )
-                continue
+
+            sub_messages = _split_message(msg)
+            sub_ok = True
+            for sub_i, sub_msg in enumerate(sub_messages):
+                try:
+                    sub_ok = delivery.send_text(sub_msg) and sub_ok
+                except PermanentDeliveryError as e:
+                    failed_urls_here = [item.url for item in group_items]
+                    for url in failed_urls_here:
+                        if url not in all_failed_urls:
+                            all_failed_urls.append(url)
+                    logger.warning(
+                        "Дайджест msg[%d/%d] sub[%d/%d]: PermanentDeliveryError (%s) — "
+                        "%d items → failed, остальные sub-сообщения пропущены",
+                        i, len(groups), sub_i + 1, len(sub_messages), e, len(group_items),
+                    )
+                    sub_ok = False
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "Дайджест msg[%d/%d] sub[%d/%d]: исключение (%s): %s — "
+                        "sub-сообщения пропущены",
+                        i, len(groups), sub_i + 1, len(sub_messages),
+                        type(e).__name__, e,
+                    )
+                    sub_ok = False
+                    break
+
+            ok = sub_ok
+
             if ok:
                 sent_urls.extend(item.url for item in group_items)
-            else:
-                logger.warning(
-                    "Дайджест msg[%d]: send_text=False — "
-                    "%d items остаются deferred",
-                    i, sum(len(it) for _, it in groups[i - 1:]),
-                )
-                # continue: остальные сообщения дайджеста должны уйти
-                # (at-least-once сохраняется)
-        sent_count = len(sent_urls)
+            sent_count = len(sent_urls)
 
     if not sent_urls:
         # M3-фикс: всегда 4-tuple (backwards-compatible — вызывающие unpack 3)

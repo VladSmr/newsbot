@@ -63,7 +63,7 @@ newsbot/                  ← проектный корень
 │   ├── telegram_io.py    # TelegramPoller (long-poll, кнопки, команды)
 │   ├── digest.py         # формирование и отправка дайджеста
 │   ├── delivery/
-│   │   ├── __init__.py   # Delivery ABC
+│   │   ├── __init__.py   # Delivery Protocol (structural typing)
 │   │   ├── console.py    # ConsoleDelivery (fallback)
 │   │   └── telegram.py   # TelegramDelivery (Bot API, HTML, split >4096)
 │   └── llm/
@@ -98,7 +98,7 @@ save_many() — INSERT OR IGNORE, state='new', retry_count=0
        ↓
 Few-shot: загрузка последних 👍/👎 из БД (feedback.enabled)
        ↓
-LLM-фильтр (DeepSeek, max_per_cycle=150 на цикл, batch_size=10)
+LLM-фильтр (DeepSeek, max_per_cycle=250 на цикл, batch_size=10, wall-clock слоты :30)
   retry-items с готовым llm_score НЕ тратят бюджет
   Батч-оценка: ≤10 новостей одним вызовом (экономия system prompt)
   Few-shot блок «ДАННЫЕ (НЕ ИНСТРУКЦИИ)» подставляется в промпт
@@ -173,8 +173,8 @@ llm:
     enabled: true
     threshold: 2.0               # алерт при балансе ниже порога (USD)
     check_interval_hours: 24
-  max_per_cycle: 150             # макс. items (оценок) на цикл
-  max_tokens: 4096               # лимит completion tokens (≈4000 для батча из 10)
+  max_per_cycle: 250             # макс. items (оценок) на цикл (12 слотов × 250 = 3000/сут)
+  max_tokens: 4608               # лимит completion tokens (≈4600 для батча из 10)
   batch_size: 10                 # ≤10 новостей одним LLM-вызовом (1=поштучно)
   # off_peak_only: false         # по умолчанию; раскомментируйте для экономии (×0.5)
 ```
@@ -207,8 +207,11 @@ Legacy-строки (до v10, `llm_urgent=NULL`) получают `urgent=False
 Её содержимое — источник истины. Поле `llm.system_prompt` в config.yaml
 пустое (или отсутствует) — это штатный оверрайд.
 
-**Fallback:** если ключа нет, ключ невалиден или LLM вернул ошибку — все
-новости доставляются непрофильтрованными (kind='fallback', кнопки не добавляются).
+**Fallback (LLM error / missing key / invalid key):** все новости
+доставляются непрофильтрованными:
+- `push_urgent_only=True` → deferred (дайджест);
+- `push_urgent_only=False` → пуш;
+- кнопки 👍/👎 не добавляются (нет `feedback_target_id`).
 
 **Батч-оценка (`llm.batch_size`, по умолчанию 10):**
 
@@ -218,11 +221,11 @@ Legacy-строки (до v10, `llm_urgent=NULL`) получают `urgent=False
 
 Retry-items с сохранённым `llm_score` **не попадают в батч** — они синтезируют `FilterResult` из БД и не тратят бюджет.
 
-`llm.max_tokens` (по умолчанию 4096): лимит completion tokens.
-  - Батч из 10 items ≈ 4000 токенов ответа + запас → 4096 покрывает типичный случай.
+`llm.max_tokens` (по умолчанию 4608): лимит completion tokens.
+  - Батч из 10 items ≈ 4000 токенов ответа + запас → 4608 покрывает типичный случай.
   - При усечении (`finish_reason="length"`) LLM поднимает `LLMError` с warning-логом,
     батч получает fallback (per-item: ok=False → доставка непрофильтрованной).
-  - Конфиг позволяет переопределить (`batch_size=5` → 3000, и т.п.).
+  - Конфиг позволяет переопределить (`batch_size=5`, и т.п.).
 
 **`llm.off_peak_only`** (по умолчанию `false`): ограничить LLM-вызовы
 непиковыми часами DeepSeek (там цена ×0.5). В пик новые новости
@@ -407,7 +410,7 @@ LLM-скоринга. Критерий: «одно и то же событие, 
 
 | Ключ                          | Описание                            | По умолчанию          |
 |-------------------------------|-------------------------------------|-----------------------|
-| `poll_interval_minutes`       | Пауза между циклами                 | 15                    |
+| `poll_interval_minutes`       | Grace-период для published-фильтра (мин.); в репозиторном `config.yaml`=120 (соответствует 2-ч циклу); дефолт в коде=15 | 15 (код), 120 (config.yaml) |
 | `database.path`               | Путь к SQLite (от каталога newsbot)  | `data/newsbot.db`     |
 | `database.retention_days`     | Хранить delivered/skipped/failed/digested и new старше 7 дней | 1          |
 | `database.retry_threshold_sec` | pending считается зависшим через    | 60                    |
@@ -415,9 +418,9 @@ LLM-скоринга. Критерий: «одно и то же событие, 
 | `database.deferred_retention_days` | Удалять старые deferred-items (не попали в digest) | 3               |
 | `database.stuck_pending_limit` | Макс. 'pending'-items, загружаемых из retry-очереди за цикл (защита RAM) | 500 |
 | `database.recovery_new_limit` | Макс. 'new'-items, загружаемых в RAM за цикл (K1-recovery) | 500          |
-| `llm.max_per_cycle`           | Макс. LLM-оценок (items) на цикл    | 150                   |
+| `llm.max_per_cycle`           | Макс. LLM-оценок (items) на цикл; 150 в коде, 250 в config.yaml (12 слотов × 250 = 3000) | 250             |
 | `llm.batch_size`             | ≤N новостей одним LLM-вызовом (1=поштучно) | 10              |
-| `llm.max_tokens`            | Лимит completion tokens (≈4000 для батча 10) | 4096           |
+| `llm.max_tokens`            | Лимит completion tokens (≈4600 для батча 10) | 4608           |
 | `llm.off_peak_only`           | LLM только в off-peak часы DeepSeek   | false                 |
 | `llm.llm_dedup`               | Семантическая дедупликация LLM (группировка «одно событие») | true          |
 | `dedup.llm_recent_limit`      | Сколько недавних заголовков подмешивать в LLM-дедуп | 20         |

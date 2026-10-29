@@ -452,7 +452,10 @@ class TestNormalizeCapKey(unittest.TestCase):
         self.assertEqual(self._key("Stavropol krai"), "stavropol")
         self.assertEqual(self._key("Primorsky district"), "primorsky")
         self.assertEqual(self._key("Catalonia province"), "catalonia")
-        self.assertEqual(self._key("Bavaria area"), "bavaria")
+        self.assertEqual(self._key("Bavaria area"), "bavaria area")  # area — НЕ generic-суффикс, "Bay Area" не схлопывается
+        # Bay Area — независимый регион, не схлопывается
+        self.assertNotEqual(self._key("Bay Area"), "bay")
+        self.assertEqual(self._key("Bavaria region"), "bavaria")
 
     def test_russian_generic_suffixes_stripped(self):
         """Russian generic-суффиксы убираются."""

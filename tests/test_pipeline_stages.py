@@ -91,12 +91,20 @@ def _insert_deferred_item(db_path, title, url, published, fetched_at, score=6,
     conn.close()
 
 
-def _mk_pipeline(db_path, digest_cfg=None):
+def _mk_pipeline(db_path, digest_cfg=None, poll_interval_minutes=None):
+    """
+    poll_interval_minutes: Major-4-фикс — передаётся через конфиг (НЕ post-patch).
+    При None используется 120 (grace-тесты).
+    """
     cfg = {
         "sources": [],
         "database": {"path": db_path},
         "telegram": {"token": "", "chat_id": ""},
-        "poll_interval_minutes": 15,  # default grace period
+        "poll_interval_minutes": (
+            poll_interval_minutes
+            if poll_interval_minutes is not None
+            else 120
+        ),
         "digest": digest_cfg or {
             "enabled": True, "max_items": 100, "max_items_per_message": 20,
             "max_per_location": 2,
@@ -178,19 +186,24 @@ class TestInferCategoryNormalization(unittest.TestCase):
 # =============================================================================
 
 class TestGracePublishedFilter(unittest.TestCase):
-    """M2: published-фильтр с грейсом на poll_interval."""
+    """
+    M2/Major-4: published-фильтр с грейсом на poll_interval.
+
+    Major-4: poll_interval_minutes задаётся через _mk_pipeline (НЕ post-patch),
+    чтобы фикстура создавала pipeline с правильным конфигом.
+    """
 
     def test_grace_published_passes_grace_window(self):
         """
         Item с published на (poll_interval - 1 мин) РАНЬШЕ window_start —
         попадает в окно (грейс).
-        poll_interval=15 мин, published старше window на 14 мин.
+        poll_interval=120 мин, published старше window на 14 мин.
         """
         with _tmp_db() as db_path:
             # Граница: 2026-10-21T12:00:00 UTC
             # published: 2026-10-21T11:46:00 UTC (на 14 мин раньше)
-            # При poll_interval=15 мин → published >= 12:00 - 15:00 = 11:45
-            # 11:46 >= 11:45 → ДОЛЖЕН попасть
+            # При poll_interval=120 мин → published >= 12:00 - 120:00 = 10:00
+            # 11:46 >= 10:00 → ДОЛЖЕН попасть
             s = Storage(db_path)
             s.set_meta("digest_window_started_at", "2026-10-21T12:00:00+00:00")
             s.close()
@@ -209,29 +222,29 @@ class TestGracePublishedFilter(unittest.TestCase):
                 digest_cfg={
                     "enabled": True, "max_items": 100, "max_items_per_message": 20,
                 },
+                poll_interval_minutes=120,  # Major-4: через конфиг, не post-patch
             )
-            p.config["poll_interval_minutes"] = 15
             delivery = MagicMock()
             delivery.send_text.return_value = True
             p.delivery = delivery
 
             count = p.run_digest(force=True)
 
-            # Item должен попасть в digest (within grace)
-            self.assertEqual(count, 1, "Item within grace window должен попасть в digest")
+            # Item должен попасть в digest (within grace=120 мин)
+            self.assertEqual(count, 1, "Item within grace=120 мин должен попасть в digest")
             p.storage.close()
             p.close()
 
     def test_too_old_published_filtered_despite_grace(self):
         """
         Item с published раньше window_start - poll_interval — НЕ попадает.
-        poll_interval=15 мин, published старше window на 20 мин.
+        poll_interval=120 мин, published старше window на 200 мин (заведомо за grace).
         """
         with _tmp_db() as db_path:
             # Граница: 2026-10-21T12:00:00 UTC
-            # published: 2026-10-21T11:40:00 UTC (на 20 мин раньше)
-            # При poll_interval=15 → published >= 12:00 - 15:00 = 11:45
-            # 11:40 >= 11:45 → FALSE → отфильтрован
+            # published: 2026-10-21T09:20:00 UTC (на 200 мин раньше)
+            # При poll_interval=120 → published >= 12:00 - 120:00 = 10:00
+            # 09:20 >= 10:00 → FALSE → отфильтрован
             s = Storage(db_path)
             s.set_meta("digest_window_started_at", "2026-10-21T12:00:00+00:00")
             s.close()
@@ -240,7 +253,7 @@ class TestGracePublishedFilter(unittest.TestCase):
                 db_path,
                 title="TooOld",
                 url="https://ex.com/tooold",
-                published="2026-10-21T11:40:00+00:00",
+                published="2026-10-21T09:20:00+00:00",
                 fetched_at="2026-10-21T12:00:00+00:00",
                 score=8,
             )
@@ -265,16 +278,94 @@ class TestGracePublishedFilter(unittest.TestCase):
             p.storage.close()
             p.close()
 
+    def test_grace_dead_zone_60min(self):
+        """
+        Major-4: кейс в 'мёртвой зоне' — published на 60 мин раньше окна.
+
+        При poll_interval=120 мин: 12:00 - 120 мин = 10:00 (grace start).
+        published=11:00 — попадает (11:00 >= 10:00).
+
+        При poll_interval=15 мин: 12:00 - 15 мин = 11:45 (grace start).
+        published=11:00 — НЕ попадает (11:00 < 11:45).
+        Один item, два конфига → разный результат → регресс ловится.
+        """
+        # Item на 60 мин раньше window (published=11:00, window=12:00)
+        base_item = dict(
+            title="DeadZoneItem",
+            url="https://ex.com/deadzone",
+            published="2026-10-21T11:00:00+00:00",
+            fetched_at="2026-10-21T12:00:00+00:00",
+            score=8,
+        )
+
+        # Случай 1: poll_interval=120 → внутри grace → попадает
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2026-10-21T12:00:00+00:00")
+            s.close()
+            _insert_deferred_item(db_path, **base_item)
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 100, "max_items_per_message": 20,
+                },
+                poll_interval_minutes=120,
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+            self.assertEqual(
+                count, 1,
+                "Item на 60 мин раньше окна при grace=120 мин должен попасть",
+            )
+            p.storage.close()
+            p.close()
+
+        # Случай 2: poll_interval=15 → за пределами grace → НЕ попадает
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2026-10-21T12:00:00+00:00")
+            s.close()
+            _insert_deferred_item(db_path, **base_item)
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 100, "max_items_per_message": 20,
+                },
+                poll_interval_minutes=15,  # Major-4: задаём через конфиг
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+            self.assertEqual(
+                count, 0,
+                "Item на 60 мин раньше окна при grace=15 мин должен быть отфильтрован",
+            )
+            # Item остался в deferred
+            deferred = {it.url for it in p.storage.get_all_by_state("deferred")}
+            self.assertIn("https://ex.com/deadzone", deferred)
+            p.storage.close()
+            p.close()
+
     def test_grace_with_default_poll_interval(self):
         """
-        При отсутствии poll_interval_minutes в конфиге — default 15 мин.
+        При poll_interval=120 мин grace-окно = 120 мин.
+        Item на 10 мин раньше window — внутри grace → попадает.
         """
         with _tmp_db() as db_path:
             s = Storage(db_path)
             s.set_meta("digest_window_started_at", "2026-10-21T12:00:00+00:00")
             s.close()
 
-            # published на 10 мин раньше window — в пределах default 15 мин
+            # published на 10 мин раньше window — внутри grace=120 мин
+            # grace_delta = 120 мин; ws_grace = 12:00 - 120 мин = 10:00
+            # 11:50 >= 10:00 → попадает
             _insert_deferred_item(
                 db_path,
                 title="DefaultGrace",
@@ -288,7 +379,8 @@ class TestGracePublishedFilter(unittest.TestCase):
                 db_path,
                 digest_cfg={
                     "enabled": True, "max_items": 100, "max_items_per_message": 20,
-                    # poll_interval_minutes берётся из _mk_pipeline default = 15
+                    # poll_interval_minutes=120 из _mk_pipeline fixture
+                    # → grace_period = 120 мин. Item на 10 мин внутри grace.
                 },
             )
             delivery = MagicMock()
@@ -297,8 +389,8 @@ class TestGracePublishedFilter(unittest.TestCase):
 
             count = p.run_digest(force=True)
 
-            # 11:50 >= 11:45 (default 15 мин) → попадает
-            self.assertEqual(count, 1, "Default grace 15 мин должна работать")
+            # 11:50 >= 10:00 (grace=120 мин) → попадает
+            self.assertEqual(count, 1, "Item на 10 мин внутри grace=120 мин должен попасть")
             p.storage.close()
             p.close()
 

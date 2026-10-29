@@ -243,6 +243,26 @@ class PermanentDeliveryError(TelegramDeliveryError):
     pass
 
 
+class BatchAbortedError(ChatIdNotBoundError):
+    """
+    send_batch прерван (ChatIdNotBoundError / BotBlockedError / shutdown).
+
+    Наследник ChatIdNotBoundError — чтобы вызывающий код,
+    уже ловящий ChatIdNotBoundError (pipeline.py:1999), продолжал работать.
+    Дополнительно сохраняет уже накопленные результаты:
+    — successful_urls: items, которые уже доставлены (не потеряются при retry)
+    — permanent_failed_urls: items с PermanentDeliveryError из того же батча
+    """
+
+    def __init__(self, successful_urls: List[str], permanent_failed_urls: List[str]):
+        super().__init__(
+            f"BatchAbortedError({len(successful_urls)} successful, "
+            f"{len(permanent_failed_urls)} permanent_failed)"
+        )
+        self.successful_urls = successful_urls
+        self.permanent_failed_urls = permanent_failed_urls
+
+
 # ── Клиент с lazy init (не умирает после close) ──────────────────────────────
 
 class _LazyClient:
@@ -375,13 +395,16 @@ class TelegramDelivery:
                     "TelegramDelivery: chat_id не привязан. "
                     "Пропускаем оставшиеся items."
                 )
-                raise          # не возвращаем partial — всё останется pending
+                # Major-1-фикс: не теряем partial-успех — упаковываем в
+                # BatchAbortedError, pipeline.py уже ловит ChatIdNotBoundError
+                # и сможет прочитать successful_urls.
+                raise BatchAbortedError(successful_urls, permanent_failed_urls)
             except BotBlockedError:
                 logger.error(
                     "TelegramDelivery: бот заблокирован (HTTP 403). "
                     "Оставшиеся items — pending."
                 )
-                raise          # аналогично
+                raise BatchAbortedError(successful_urls, permanent_failed_urls)
             except PermanentDeliveryError as e:
                 # FIX-1: 400/413/422 — permanent: item никогда не доставится.
                 # permanent_failed_urls → pipeline делает set_state('failed'),
@@ -472,6 +495,10 @@ class TelegramDelivery:
         try:
             self._api_call("sendMessage", payload)
             return True
+        except (ChatIdNotBoundError, BotBlockedError):
+            # Major-4-фикс: permanent-ошибки конфигурации поднимаются дальше —
+            # digest.py ловит и кладёт items в deferred (retry в следующем окне).
+            raise
         except PermanentDeliveryError:
             # M3-фикс: PermanentDeliveryError поднимается дальше — pipeline
             # (digest.py → pipeline) помечает url этого сообщения в state='failed'.
@@ -500,6 +527,10 @@ class TelegramDelivery:
         try:
             self._api_call("sendMessage", payload)
             return True
+        except (ChatIdNotBoundError, BotBlockedError):
+            # Major-4-фикс: аналогично send_digest — permanent-ошибки
+            # конфигурации поднимаются дальше, НЕ молча возвращают False.
+            raise
         except PermanentDeliveryError:
             # M3-фикс: PermanentDeliveryError поднимается дальше —
             # digest.py send_text-ветка ловит его и кладёт url → all_failed_urls.
@@ -568,8 +599,6 @@ class TelegramDelivery:
         # feedback_target_id: транзиентное поле из pipeline (Фаза 2b-1)
         fbtid = getattr(item, "feedback_target_id", None)
 
-        # overhead считается по экранированным компонентам (гарантия ≤4096)
-        overhead = len(title) + len(footer) + 4   # 4 = 2×\n + пустая строка
         part_text = f"{title}\n\n{escaped_summary}\n\n{footer}"
 
         # если влезает в одно сообщение — экранированный текст уже готов
@@ -973,8 +1002,22 @@ class TelegramDelivery:
                     raise PermanentDeliveryError(
                         f"HTTP {status}: {desc}"
                     )
-                # Прочие 4xx (401, 402, 404, 407 …) — транзиентная ошибка,
-                # item остаётся pending (консервативно: не PermanentDeliveryError).
+                # Minor-1-фикс: 401 (Unauthorized) / 404 (Not Found) —
+                # конфигурационная ошибка бота (битый токен, удалённый endpoint
+                # API). Retry с тем же токеном всегда провалится → items НЕ
+                # должны висеть pending вечно. Но это НЕ PermanentDeliveryError:
+                # items не помечаются failed (иначе pipeline мог бы удалить их
+                # при purge), а логируются как ошибка конфигурации.
+                if status in (401, 404):
+                    logger.error(
+                        "TelegramDelivery: конфигурационная ошибка HTTP %d "
+                        "(битый токен?) — пропускаем retry: %s",
+                        status, desc,
+                    )
+                    raise TelegramDeliveryError(
+                        f"HTTP {status} (config): {desc}"
+                    )
+                # Прочие 4xx (402, 407, …) — консервативно transient.
                 raise TelegramDeliveryError(
                     f"HTTP {status}: {desc}"
                 )

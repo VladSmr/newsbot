@@ -6,6 +6,8 @@ DeepSeek API-клиент (OpenAI-compatible).
 import json
 import logging
 import math
+import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -208,6 +210,43 @@ class LLMTruncationError(LLMError):
     pass
 
 
+class LLMFatalError(LLMError):
+    """
+    Фатальная ошибка LLM — вызвана неисправимой HTTP-ошибкой 4xx
+    (кроме 429). Это означает:
+      — 401/403: проблема с авторизацией (ключ, права, ban);
+      — 402: недостаточно средств на аккаунте;
+    При таких ошибках НЕ имеет смысла делать retry — ситуация
+    не изменится сама по себе (баланс не пополнится, ключ не станет
+    валидным). Отличие от LLMError важно для вызывающей стороны:
+    при LLMFatalError НЕ нужно помечать все items батча как ok=False
+    (per-item fallback), достаточно вернуть их в pending для повтора
+    в следующем цикле, когда проблема будет устранена.
+
+    Наследуется от LLMError — существующие ``except LLMError`` продолжают
+    ловить без изменений. Новый код может ловить конкретный подкласс,
+    чтобы отличать фатальную ошибку от транзиентной.
+    """
+
+    pass
+
+
+class LLMContextLengthError(LLMTruncationError):
+    """
+    Контекстная длина превышена (HTTP 400 или finish_reason=length).
+
+    Ключевое отличие от LLMTruncationError: проблема связана с размером
+    входного промпта, а не ограничением вывода. Фильтр при получении
+    этого исключения знает, что нужно делать split по количеству items,
+    а не per-item fallback.
+
+    Наследуется от LLMTruncationError → LLMError — обратная совместимость
+    сохранена.
+    """
+
+    pass
+
+
 class BalanceInfo:
     """Информация о балансе аккаунта."""
 
@@ -223,6 +262,89 @@ class BalanceInfo:
             f"BalanceInfo(is_available={self.is_available}, "
             f"currency={self.currency!r}, total_balance={self.total_balance})"
         )
+
+
+# ─────────────────────────────────────────────────────────────────
+# JSON parsing helpers (Major #2 fix)
+# ─────────────────────────────────────────────────────────────────
+
+
+_JSON_FENCE_RE = re.compile(
+    r"^\s*(?:```(?:json)?\s*\n?|Here(?:'s| is) (?:the )?JSON:?\s*)"  # opening fences / preamble
+    r"|"
+    r"\n?\s*```\s*$",  # closing fences
+    re.IGNORECASE | re.MULTILINE
+)
+
+# NOTE: _BRACE_RE and _LAST_BRACE_RE were removed (dead code, unused).
+
+
+def _strip_json_fences(text: str) -> str:
+    """
+    Major #2-фикс: удаляет markdown-обрамления и преамбулу из LLM-ответа
+    перед передачей в json.loads.
+
+    Убирает (в порядке приоритета):
+      1. ```json … ``` или ``` … ``` (в т.ч. с языковым тегом).
+      2. Here is the JSON: {…} / Here is JSON: {…} / Here's JSON: {…}.
+      3. Here is the response: {…} и аналогичные варианты.
+      4. При неудаче — извлечение JSON по позициям '{' через
+         ``json.JSONDecoder().raw_decode`` (корректный учёт строк:
+         ``{"s": "a } b"}`` не ломается).
+
+    Returns
+    -------
+    str
+        Текст, очищенный от обрамлений. Пустая строка для пустого/None входа.
+    """
+    if not text:
+        return ""
+
+    stripped = _JSON_FENCE_RE.sub("", text).strip()
+
+    # Если после снятия обрамления осталось что-то валидное (начинается с '{')
+    # — возвращаем. Иначе пытаемся вытащить JSON из середины текста.
+    if stripped.startswith("{"):
+        return stripped
+
+    # Rescue: используем json.JSONDecoder().raw_decode по позициям '{',
+    # который корректно учитывает строки (экранированные кавычки,
+    # кавычки внутри строк — ``{"s": "a } b"}`` не ломается).
+    try:
+        decoder = json.JSONDecoder()
+        brace_start = text.find("{")
+        if brace_start != -1:
+            candidate, _ = decoder.raw_decode(text[brace_start:])
+            return json.dumps(candidate)  # serialize back to string for caller
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Ничего не помогло — возвращаем что есть (json.loads сам выдаст ошибку)
+    return stripped
+
+def _safe_price(value: Any, default: float = 0.0) -> float:
+    """
+    Minor #1-фикс: безопасное преобразование цены в float.
+
+    При ошибке — default + warning в лог. Защищает от сбоя при
+    ``float(getattr(stats, "_input_price", 0) or 0)`` когда значение —
+    нечисловая строка или объект без __float__.
+    """
+    try:
+        result = float(value)
+        if not math.isfinite(result):
+            logger.warning(
+                "Невалидная цена %r (не конечное число) → используется %.4f",
+                value, default,
+            )
+            return default
+        return result
+    except (TypeError, ValueError):
+        logger.warning(
+            "Невалидная цена %r (type=%s) → используется %.4f",
+            value, type(value).__name__, default,
+        )
+        return default
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -252,7 +374,7 @@ class DeepSeekClient:
         timeout: float = 60.0,
         max_retries: int = 3,
         temperature: float = 0.0,
-        max_tokens: int = 4096,
+        max_tokens: int = 4608,
         input_price: float = 0.0,
         output_price: float = 0.0,
         input_cache_hit_price: float = 0.0,
@@ -275,9 +397,9 @@ class DeepSeekClient:
         self.temperature = temperature
         # max_tokens: лимит на completion. Батч (≤10 items, ~100-200 токенов/item)
         # требует больше, чем одиночная оценка (~150-300 токенов).
-        # Major #2-фикс: дефолт 4096 (ранее 2048).
+        # Minor #6-фикс: дефолт 4608 (ранее 4096; конфиг позволял 4608).
         # При batch_size=10: ≈400-600 токенов/item × 10 = 4000-6000 токенов ответ,
-        # модель обычно укладывается в 4000, запас до 4096 покрывает типичный
+        # модель обычно укладывается в 4600, запас до 4608 покрывает типичный
         # батч 10 items + погрешность модели. Конфиг позволяет переопределить.
         self.max_tokens = max_tokens
         # один HTTP-клиент на весь жизненный цикл — переиспользуем соединения
@@ -378,9 +500,12 @@ class DeepSeekClient:
                 finish_reason: Any = first_choice.get("finish_reason")
 
                 # ── usage-логирование уже выполнено выше (одно на response) ──
+                # Major #2-фикс: снимаем markdown-обрамление и преамбулу
+                # перед json.loads. Модель может вернуть ```json\n{…}\n``` или
+                # «Here is the JSON: {…}» — оба случая теперь корректно парсятся.
                 try:
                     result: Any = json.loads(
-                        content, parse_constant=_reject_json_constant
+                        _strip_json_fences(content), parse_constant=_reject_json_constant
                     )
                 except (json.JSONDecodeError, TypeError, ValueError):
                     if finish_reason == "length":
@@ -431,25 +556,54 @@ class DeepSeekClient:
                     retry_after = e.response.headers.get("retry-after")
                     if retry_after:
                         try:
-                            wait = int(retry_after)
-                        except ValueError:
+                            wait = float(retry_after)
+                        except (ValueError, TypeError):
+                            logger.warning(
+                                "Невалидный Retry-After %r — используется backoff %d сек",
+                                retry_after, 2 ** attempt,
+                            )
                             wait = 2 ** attempt
+                        else:
+                            if not math.isfinite(wait) or wait <= 0:
+                                logger.warning(
+                                    "Retry-After %r вне допустимого диапазона — "
+                                    "используется backoff %d сек",
+                                    retry_after, 2 ** attempt,
+                                )
+                                wait = 2 ** attempt
                     else:
                         wait = 2 ** attempt
-                    # B8-фикс: cap wait на 120 сек (как в telegram-слое)
-                    wait = min(wait, 120)
-                    logger.warning(
-                        "Попытка %d/%d: 429 Rate Limited, ждём %d сек",
-                        attempt,
-                        self.max_retries,
-                        wait,
-                    )
-                    # Minor-фикс: на ПОСЛЕДНЕЙ попытке не спим —
-                    # sleep впустую тратит до 120 с перед выходом из цикла.
+                    # Major #1-фикс: cap wait на [1, 120] сек.
+                    # max() гарантирует минимум 1 сек (защита от time.sleep(0)
+                    # и edge-case отрицательных значений). min() ограничивает
+                    # верхнюю границу (как в telegram-слое).
+                    wait = min(max(wait, 1), 120)
+                    # Minor #5-фикс: добавляем jitter ±50% к 429-backoff
+                    # (аналогично network-error backoff) для предотвращения
+                    # synchronized retries при одновременном спаде с нескольких
+                    # клиентов.
+                    jitter = random.uniform(-wait * 0.5, wait * 0.5)
+                    actual = max(0.5, wait + jitter)
+                    # Minor-фикс: логируем и спим только если будет retry.
+                    # На последней попытке sleep впустую тратит до 120 с.
                     if attempt < self.max_retries:
-                        time.sleep(wait)
+                        logger.warning(
+                            "Попытка %d/%d: 429 Rate Limited, ждём %.1f сек "
+                            "(base=%d, jitter=%+.1f)",
+                            attempt,
+                            self.max_retries,
+                            actual,
+                            wait,
+                            jitter,
+                        )
+                        try:
+                            time.sleep(actual)
+                        except Exception:
+                            pass
+                        last_exc = e
+                        continue  # retry: переходим к следующей итерации
+                    # Последняя попытка: не спать, выходим из цикла (raise LLMError)
                     last_exc = e
-                    continue
                 elif 500 <= status < 600:
                     last_exc = e
                     logger.warning(
@@ -458,9 +612,59 @@ class DeepSeekClient:
                         self.max_retries,
                         status,
                     )
+                elif status == 400:
+                    # Major #2-фикс: НЕ любой HTTP 400 — контекстная длина.
+                    # CRITICAL-фикс: классификация по телу ответа, чтобы избежать
+                    # сплит-шторма при 400 "invalid_request_error" /
+                    # "unsupported response_format". Проверяем только уточнённые
+                    # маркеры: "context_length", "context_length_exceeded",
+                    # "maximum context", "too long" (по контексту), "reduce the length".
+                    resp_text = ""
+                    try:
+                        resp_text = e.response.text.lower()
+                    except Exception:
+                        pass
+                    ctx_markers = (
+                        "context_length",
+                        "maximum context",
+                        "too long",
+                        "reduce the length",
+                    )
+                    if any(m in resp_text for m in ctx_markers):
+                        raise LLMContextLengthError(
+                            f"HTTP 400: контекстная длина превышена "
+                            f"(max_tokens={self.max_tokens})"
+                        ) from e
+                    # Прочие 400 — общая ошибка, без сплита
+                    body_text = ""
+                    try:
+                        body_text = e.response.text[:200]
+                    except Exception:
+                        body_text = "(тело недоступно)"
+                    raise LLMError(
+                        f"HTTP 400: {body_text}"
+                    ) from e
+                elif status in (401, 402, 403):
+                    # Major #3-фикс: фатальные HTTP-ошибки авторизации/баланса.
+                    # Retry бессмыслен: ситуация не исправится сама по себе.
+                    # Выделяем в отдельный тип — вызывающая сторона знает,
+                    # что items остаются pending, а не ok=False.
+                    body_text = ""
+                    try:
+                        body_text = e.response.text[:200]
+                    except Exception:
+                        body_text = "(тело недоступно)"
+                    raise LLMFatalError(
+                        f"HTTP {status}: {body_text}"
+                    ) from e
                 else:
-                    # 4xx (кроме 429) — безнадёжно
-                    raise LLMError(f"HTTP {status}: {e.response.text[:200]}")
+                    # Прочие 4xx — безнадёжно
+                    body_text = ""
+                    try:
+                        body_text = e.response.text[:200]
+                    except Exception:
+                        body_text = "(тело недоступно)"
+                    raise LLMError(f"HTTP {status}: {body_text}") from e
 
             except httpx.RequestError as e:
                 # ConnectError, ReadError, RemoteProtocolError, UnsupportedProtocol…
@@ -514,8 +718,20 @@ class DeepSeekClient:
             # экспоненциальный backoff между ретраями (если ещё есть попытки)
             if attempt < self.max_retries:
                 backoff = 2 ** (attempt - 1)
-                logger.debug("Backoff %d сек перед следующей попыткой", backoff)
-                time.sleep(backoff)
+                # Minor #5-фикс: добавляем jitter ±50% для предотвращения
+                # synchronized retries при одновременном спаде с нескольких
+                # клиентов или при watchdog-перезапуске.
+                jitter = random.uniform(-backoff * 0.5, backoff * 0.5)
+                actual = max(0.5, backoff + jitter)
+                logger.debug(
+                    "Backoff %.1f сек (base=%d, jitter=%+.1f) перед следующей попыткой",
+                    actual, backoff, jitter,
+                )
+                try:
+                    time.sleep(actual)
+                except Exception:
+                    # Minor #1-фикс: защита от неожиданных исключений при sleep.
+                    pass
 
         # все попытки исчерпаны
         # (ветка last_exc is None больше невозможна — max_retries <= 0

@@ -253,7 +253,9 @@ class TestSplitTextHugeTitle:
             assert len(r["text"]) <= 4096
 
     def test_title_limited_to_200(self):
-        """Проверяем, что _MAX_TITLE_LEN=200 реально ограничивает."""
+        """Проверяем, что _split_text не зацикливается при huge title."""
+        # Minor-6-фикс: убрана ссылка на несуществующий _MAX_TITLE_LEN=200.
+        # Заголовок 300×'X' всё равно должен нарезаться корректно.
         td = TelegramDelivery(token="test_token", chat_id="123")
         huge_title = "X" * 300
         result = td._split_text(huge_title, "B", "F", False, "")
@@ -409,6 +411,26 @@ class Test429Handling:
 
         assert result == ([items[0].url], [])
         assert sent.call_count == 2, "после ошибки батч должен прерваться"
+
+    def test_send_batch_chatid_not_bound_preserves_partial_success(self):
+        """
+        Major-1-фикс: ChatIdNotBoundError поднимается как BatchAbortedError,
+        successful_urls сохраняются (не теряются). batch_continues.
+        """
+        from newsbot.delivery.telegram import BatchAbortedError
+        td = TelegramDelivery(token="tok", chat_id="123")
+        items = [_make_item(i) for i in range(3)]
+        with patch.object(td, "_send_one",
+                          side_effect=[None, ChatIdNotBoundError("not found"), None]) as sent:
+            with pytest.raises(ChatIdNotBoundError) as exc_info:
+                td.send_batch(items)
+
+        # BatchAbortedError — подкласс ChatIdNotBoundError
+        assert isinstance(exc_info.value, BatchAbortedError)
+        # 1-й item доставлен → successful_urls содержит его URL
+        assert exc_info.value.successful_urls == [items[0].url]
+        assert exc_info.value.permanent_failed_urls == []
+        assert sent.call_count == 2, "ChatIdNotBoundError выбрасывается на 2-м item"
 
 
 # ══════════════════════════════════════════════════════════════════

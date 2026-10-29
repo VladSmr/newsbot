@@ -102,7 +102,11 @@ def _stem_word(w: str) -> str:
     if w.endswith('ed') and len(w) > 3 and w[-3] in CONSONANTS:
         base = w[:-2]  # remove 'ed'
         # откатываем удвоение: stopped→stop, attacked→attack
-        if len(base) > 2 and base[-1] == base[-2] and base[-1] not in VOWELS:
+        # НЕ откатываем если основа уже на -ss: passed→pass (не pas),
+        # bypassed→bypas (не bypas — НО: bypassed→bypas не подходит по условию,
+        # проверка ниже; bypassed→bypas→bypas[-2:]='ss'? нет: base='bypas', ends 's' не 'ss').
+        # Главное: base[-2:]!='ss' — passed→base='pass', 'ss'!='ss'→False, НЕ откатываем.
+        if len(base) > 2 and base[-1] == base[-2] and base[-1] not in VOWELS and base[-2:] != 'ss':
             base = base[:-1]
         # восстанавливаем немое -e: raised→raise (rais), used→use (us).
         # Без этого raised→rais, а raise→raise — расходятся по стемам.
@@ -140,7 +144,9 @@ def _stem_word(w: str) -> str:
             return w[:-2]
         return w[:-1]
     # -s: protests, clashes → protest, clash (без e)
-    if w.endswith('s') and len(w) > 2 and w[-2] in CONSONANTS:
+    # НО: основы на -ss не трогаем — иначе classes→clas, processes→proces,
+    # business→busines, а плюралисы идут по -es-ветке → singular ≠ plural.
+    if w.endswith('s') and len(w) > 2 and w[-2] in CONSONANTS and not w.endswith('ss'):
         return w[:-1]
 
     return w

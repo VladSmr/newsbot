@@ -166,9 +166,6 @@ class TestStemmer:
         # удвоение и обычные -ed не сломались
         assert _stem_word("stopped") == "stop"
         assert _stem_word("attacked") == "attack"
-        # NB (вне скоупа 2-волны): passed→'pas' из-за pre-existing rollback
-        # удвоения (pass+ed), тогда как passes→'pass'. Расхождение было
-        # и до фикса, здесь не менялось.
 
     @pytest.mark.parametrize(
         "past, plural, infinitive",
@@ -301,6 +298,60 @@ class TestStemmer:
         assert stem_hash("Central bank raises key rate") == stem_hash(
             "Central bank raises key rates"
         )
+
+    @pytest.mark.parametrize(
+        "singular, plural",
+        [
+            ("class", "classes"),
+            ("process", "processes"),
+            ("address", "addresses"),
+            ("success", "successes"),
+            ("congress", "congresses"),
+            ("press", "presses"),
+            ("kiss", "kisses"),
+            ("pass", "passes"),
+        ],
+    )
+    def test_double_s_stem_preserves_base(self, singular, plural):
+        """
+        Major-1: -s снимается с согласной, но основы на -ss не трогаются.
+        Иначе classes→clas, processes→proces, businesses→business,
+        addresses→addres — а плюралисы идут по -es-ветке (classes→class) →
+        singular и plural дают РАЗНЫЕ стемы.
+        """
+        assert _stem_word(plural) == _stem_word(singular) == singular, (
+            f"{plural} и {singular} должны давать стем {singular!r}, "
+            f"получили {_stem_word(plural)!r} / {_stem_word(singular)!r}"
+        )
+        assert stem_hash(f"New {plural} announced") == stem_hash(
+            f"New {singular} announced"
+        ), f"stem_hash для {plural}/{singular} разошёлся"
+
+    @pytest.mark.parametrize(
+        "past, present, infinitive",
+        [
+            ("passed", "passes", "pass"),
+            ("addressed", "addresses", "address"),
+            ("pressed", "presses", "press"),
+            ("kissed", "kisses", "kiss"),
+            ("guessed", "guesses", "guess"),
+            ("expressed", "expresses", "express"),
+        ],
+    )
+    def test_ed_ss_base_no_rollback(self, past, present, infinitive):
+        """
+        Major-1: -ed на -ss основе не откатывает удвоение.
+        passed→pass (не pas), addressed→address (не addres).
+        Согласованность с плюралисами: passes→pass, classes→class.
+        """
+        stems = {_stem_word(past), _stem_word(present), _stem_word(infinitive)}
+        assert stems == {infinitive}, (
+            f"{past}/{present}/{infinitive} должны давать один стем "
+            f"{infinitive!r}, получили {stems}"
+        )
+        assert stem_hash(f"Meeting {past} at noon") == stem_hash(
+            f"Meeting {infinitive} at noon"
+        ), f"stem_hash для {past}/{infinitive} разошёлся"
 
 
 # TestLocations удалён: locations.py удалён, локация теперь из LLM.

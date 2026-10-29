@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Set, Tuple
 
-from .collector import NewsItem
+from .collector import NewsItem, _strip_source_prefix
 from .storage import Storage, MIN_TITLE_LEN
 
 logger = logging.getLogger("newsbot.dedup")
@@ -61,11 +61,15 @@ logger = logging.getLogger("newsbot.dedup")
 
 
 
-def _domain_recent_duplicate(
+def _domain_recent_duplicate_legacy(
     item: NewsItem,
     prefetch: Optional[Dict[str, Tuple[str, str]]],
 ) -> bool:
     """
+    NOT IN PROD PATH — не используется filter_new; НЕ содержит first-2
+    и within-cycle числовой guard. Не подключать обратно без переноса
+    этих проверок.
+
     Быстрый дедуп по cluster_key: если ОДИН cluster_key (тема+день)
     уже был за последние 2 часа — блокируем. Разные темы от одного
     источника НЕ блокируются.
@@ -271,6 +275,23 @@ _STOP_WORDS = {"the", "and", "for", "that", "this", "with", "from", "were", "was
                "more", "most", "after", "over", "such", "then", "about"}
 
 
+def _first_two_content_tokens(title: str) -> tuple:
+    """
+    Первые два слова заголовка (сырые, без стемминга).
+    Используется для Major-2: быстрая проверка «та же тема» без стемминга.
+    Одинаковые first-2 → дубли; разные → разные темы.
+
+    Фильтрация стоп-слов и слов ≤2 символов НЕ применяется: именно
+    короткие слова часто несут ключевую информацию и должны совпадать
+    для склейки. Пример: «EU and US reach deal» даст ('eu', 'and'), где
+    'and' — информативный коннектор в данном контексте. Без фильтрации
+    сохраняется предсказуемость: first-2 = ровно то, что видит читатель
+    в начале заголовка, без эвристик.
+    """
+    tokens = [w.strip().lower() for w in (title or '').split()]
+    return tuple(tokens[:2])
+
+
 def _number_multiset(text: str) -> Counter:
     r"""
     Мультимножество числовых токенов текста. Жёсткий guard: разные
@@ -346,24 +367,79 @@ def _token_jaccard(a: str, b: str, token_threshold: float) -> bool:
     return (intersection / union) >= token_threshold
 
 
+def _is_containment_duplicate_check(
+    shorter: str,
+    longer: str,
+    nums_shorter: Counter,
+    nums_longer: Counter,
+    meaningful_set_shorter: Set[str],
+    meaningful_set_longer: Set[str],
+    token_threshold: float,
+) -> bool:
+    """
+    Внутренний helper containment-проверки.
+    Major-3: принимает предвычисленные nums и token_sets, чтобы не
+    пересчитывать их в _is_fuzzy_similar (где они уже известны).
+
+    Контракт (вызывающий код гарантирует):
+      1. shorter и longer — нормализованные заголовки.
+      2. len(shorter) <= len(longer).
+      3. Оба ≥ 30 символов.
+      4. nums_shorter == nums_longer (числовой guard уже пройден).
+    """
+    # Числовой guard (повторная проверка — для безопасности).
+    if nums_shorter != nums_longer:
+        return False
+
+    # Token guard: Jaccard значащих токенов.
+    if meaningful_set_shorter and meaningful_set_longer:
+        intersection = len(meaningful_set_shorter & meaningful_set_longer)
+        union = len(meaningful_set_shorter | meaningful_set_longer)
+        if (intersection / union) < token_threshold:
+            return False
+
+    # Containment по границе слова.
+    idx = 0
+    while True:
+        pos = longer.find(shorter, idx)
+        if pos == -1:
+            break
+        left_ok = (pos == 0) or longer[pos - 1].isspace()
+        right_ok = (pos + len(shorter) >= len(longer)) or longer[pos + len(shorter)].isspace()
+        if left_ok and right_ok:
+            return True
+        idx = pos + 1
+    return False
+
+
 def _token_set(text: str) -> Set[str]:
     """Токен-сет нормализованного текста (набор уникальных слов)."""
     return set(text.split())
 
 
-def _quick_filter(norm: str, candidates: List[Tuple]) -> List[Tuple]:
+def _quick_filter(
+    norm: str,
+    candidates: List[Tuple],
+    precomputed_token_sets: Optional[Dict[str, Set[str]]] = None,
+) -> Tuple[List[Tuple], bool]:
     """
     Предфильтр по длине и токен-сету.
-    Возвращает подмножество candidates, прошедших предфильтр.
+    Возвращает (subset, limit_hit) — подмножество candidates и флаг усечения.
     O(N) без SequenceMatcher — быстрый отсев заведомо непохожих.
+
+    MINOR-3: warning об усечении вынесен на уровень filter_new (1 раз за цикл).
+    Major-3: если precomputed_token_sets передан — переиспользует
+    предвычисленные токен-сеты вместо пересчёта на каждый candidate.
     """
-    tokens = _token_set(norm)
-    if not tokens:
-        return []
+    norm_tokens = _token_set(norm)
+    if not norm_tokens:
+        return [], False
 
     norm_words = norm.split()
+    norm_token_count = len(norm_tokens)
 
     filtered: List[Tuple] = []
+    limit_hit = False
     for title_hash, candidate_norm, *_ in candidates:
         if not candidate_norm:
             continue
@@ -374,18 +450,27 @@ def _quick_filter(norm: str, candidates: List[Tuple]) -> List[Tuple]:
         if not (cand_len_range[0] <= len(norm_words) <= cand_len_range[1]):
             continue
 
-        # (2) фильтр по токен-сету
-        cand_tokens = _token_set(candidate_norm)
+        # (2) фильтр по токен-сету: используем предвычисленный или считаем
+        if precomputed_token_sets is not None:
+            cand_tokens = precomputed_token_sets.get(candidate_norm)
+        else:
+            cand_tokens = None
+        if cand_tokens is None:
+            cand_tokens = _token_set(candidate_norm)
         if not cand_tokens:
             continue
-        intersection = len(tokens & cand_tokens)
-        token_ratio = intersection / min(len(tokens), len(cand_tokens))
+        intersection = len(norm_tokens & cand_tokens)
+        token_ratio = intersection / min(norm_token_count, len(cand_tokens))
         if token_ratio < MIN_TOKEN_INTERSECTION:
             continue
 
         filtered.append((title_hash, candidate_norm))
+        if len(filtered) > MAX_FUZZY_CANDIDATES:
+            limit_hit = True
+            filtered = filtered[:MAX_FUZZY_CANDIDATES]
+            break
 
-    return filtered[:MAX_FUZZY_CANDIDATES]
+    return filtered, limit_hit
 
 
 def is_containment_duplicate(title_a: str, title_b: str, token_threshold: float = 0.8) -> bool:
@@ -443,37 +528,26 @@ def is_containment_duplicate(title_a: str, title_b: str, token_threshold: float 
         return False
 
     # ── (3) Containment по границе слова ────────────────────────────
-    # Определяем shorter/longer и проверяем: shorter ∈ longer по границе слова.
     if a_len <= b_len:
         shorter, longer = title_a, title_b
     else:
         shorter, longer = title_b, title_a
 
-    # Ищем ВСЕ вхождения shorter в longer (их может быть ≥1 при повторах,
-    # например "war war" в "war war in war war"). Проверяем каждое:
-    # входящий фрагмент должен начинаться и заканчиваться на границе слова
-    # в контексте longer. Граница слова = начало/конец строки ИЛИ пробел.
-    # NOTE: title_normalized() удаляет пунктуацию, поэтому \b работает
-    # по границе alphanumeric/non-alphanumeric.
-    idx = 0
-    while True:
-        pos = longer.find(shorter, idx)
-        if pos == -1:
-            break
-        # Проверяем word-boundary слева: начало строки ИЛИ пробел/разделитель
-        left_ok = (pos == 0) or longer[pos - 1].isspace()
-        # Проверяем word-boundary справа: конец строки ИЛИ пробел/разделитель
-        right_ok = (pos + len(shorter) >= len(longer)) or longer[pos + len(shorter)].isspace()
-        if left_ok and right_ok:
-            return True
-        # Сдвигаем, чтобы проверить следующее вхождение (при повторах)
-        idx = pos + 1
-
-    return False
+    # Делегируем во внутренний helper: вычисляем token-сеты здесь,
+    # чтобы is_containment_duplicate остался self-contained (вызывается извне).
+    meaningful_shorter = _meaningful_tokens(shorter)
+    meaningful_longer = _meaningful_tokens(longer)
+    return _is_containment_duplicate_check(
+        shorter, longer,
+        nums_a, nums_b,
+        meaningful_shorter, meaningful_longer,
+        token_threshold,
+    )
 
 
 def _is_fuzzy_similar(
     a: str, b: str, threshold: float, token_threshold: float,
+    _precomputed: Optional[dict] = None,
 ) -> bool:
     r"""
     Сравнивает два нормализованных заголовка через SequenceMatcher
@@ -497,26 +571,50 @@ def _is_fuzzy_similar(
         b: нормализованный заголовок кандидата из БД
         threshold: порог SequenceMatcher ratio (дефолт 0.95)
         token_threshold: порог Jaccard значащих токенов (дефолт 0.8)
+        _precomputed: optional dict with precomputed values from filter_new
+                      (nums_a). Used to avoid recomputing item numbers
+                      on every candidate. All other values computed fresh.
     """
     if not a or not b:
         return False
 
     # ── (1) Числовой guard — мультимножество (до SequenceMatcher) ─────
-    # NOTE: на нормализованном тексте [.,] уже удалены, поэтому регекс
-    # \d+(?:[.,]\d+)? по сути ловит только \d+. Counter считает кратности:
-    # "70 70" vs "70" — разные мультимножества, жёсткий отказ.
-    nums_a = _number_multiset(a)
+    # nums_a: предвычислен (один раз за item); nums_b: вычисляется fresh
+    # для каждого candidate (другой candidate → другие nums).
+    if _precomputed is not None and 'nums_a' in _precomputed:
+        nums_a = _precomputed['nums_a']
+    else:
+        nums_a = _number_multiset(a)
     nums_b = _number_multiset(b)
     if nums_a != nums_b:
         return False
 
     # ── (2) Token guard — Jaccard значащих токенов ────────────────────
-    if not _token_jaccard(a, b, token_threshold):
-        return False
+    meaningful_a = _meaningful_tokens(a)
+    meaningful_b = _meaningful_tokens(b)
+    if meaningful_a and meaningful_b:
+        intersection = len(meaningful_a & meaningful_b)
+        union = len(meaningful_a | meaningful_b)
+        if (intersection / union) < token_threshold:
+            return False
+    # empty sets: guard пропускает
 
-    # ── (3) Containment-правило (без ratio) ─────────────────────────
-    if is_containment_duplicate(a, b, token_threshold):
-        return True
+    # ── (3) Containment-правило (без ratio), используя precomputed ───
+    a_len = len(a)
+    b_len = len(b)
+    if a_len >= 30 and b_len >= 30:
+        if a_len <= b_len:
+            shorter, longer = a, b
+        else:
+            shorter, longer = b, a
+        containment_result = _is_containment_duplicate_check(
+            shorter, longer,
+            nums_a, nums_b,
+            meaningful_a, meaningful_b,
+            token_threshold,
+        )
+        if containment_result:
+            return True
 
     # ── (4) SequenceMatcher ratio (дорогой — последним) ───────────────
     ratio = SequenceMatcher(None, a, b).ratio()
@@ -655,6 +753,17 @@ def filter_new(
     _recent_cache: dict = {}
     # Флаг «выборка упёрлась в лимит» — warning один раз за цикл, не на item.
     _recent_limit_hit = False
+    # MINOR-3: флаг усечения fuzzy-пула — warning один раз за цикл, не на item.
+    _fuzzy_limit_hit = False
+    # Major-3: кэш предвычисленных токен-сетов кандидатов по source.
+    # Major-2: within-cycle seen first-2-tokens по cluster_key_suffix.
+    # Строится лениво при первом fuzzy-вызове для каждого source.
+    _token_sets_cache: Dict[str, Dict[str, Set[str]]] = {}
+    # {lookup_key: {first2_tuple → nums_counter_or_None}}
+    # last-write-wins: если третий item пришёл с теми же first-2,
+    # но числами первого item'а в том же цикле — он НЕ распознается как дубль.
+    # Это осознанный компромисс (не баг): экономия памяти и простота реализации.
+    _domain_cycle_seen: Dict[str, Dict[tuple, Optional[Counter]]] = {}
 
     # Предварительно собираем множество source'ов, которые встретятся
     # в цикле, чтобы запросить их ДО начала основного цикла.
@@ -676,13 +785,56 @@ def filter_new(
     # Major#10-фикс: prefetch всех cluster_key для _domain_recent_duplicate.
     # ОДИН запрос вместо N. Ошибка → prefetch=None → fail-open guard (не дубль).
     _prefetch_cache: Optional[Dict[str, Tuple[str, str]]] = None
+    # MINOR-1: предвычисленные (first2, nums) для каждого candidate по title.
+    # Строится ОДИН раз за вызов filter_new, переиспользуется для всех items.
+    _prefetch_metadata: Dict[str, Dict[str, Tuple[tuple, Counter]]] = {}
+    # MAJOR-prefetch-фикс: prefetch_window_hours из конфига (ранее жёстко 2).
+    # dedup.py читает hours из config dedup.prefetch_window_hours, дефолт 2.
+    prefetch_hours = 2  # обратная совместимость
+    if dedup_config and isinstance(dedup_config, dict):
+        raw = dedup_config.get("prefetch_window_hours")
+        if raw is not None:
+            try:
+                f = float(raw)
+                if f == int(f) and 1 <= int(f) <= 48:
+                    prefetch_hours = int(f)
+                else:
+                    logger.warning(
+                        "dedup.prefetch_window_hours=%r вне диапазона [1..48], "
+                        "используется дефолт 2.", raw,
+                    )
+            except (TypeError, ValueError):
+                logger.warning(
+                    "dedup.prefetch_window_hours=%r — ожидалось целое, "
+                    "используется дефолт 2.", raw,
+                )
     try:
-        _prefetch_cache = storage.get_recent_for_dedup(hours=2)
+        _prefetch_cache = storage.get_recent_for_dedup(hours=prefetch_hours)
     except Exception as e:
         logger.warning(
             "Prefetch для доменного дедупа не удался: %s. "
             "Доменный guard пропускает все items (fail-open).", e,
         )
+        _prefetch_cache = None
+    # MINOR-4: отдельный try/except — metadata ошибка не влияет на prefetch-кеш.
+    if _prefetch_cache:
+        try:
+            for lookup_key, candidates in _prefetch_cache.items():
+                meta: Dict[str, Tuple[tuple, Counter]] = {}
+                for c_t, _ in candidates:
+                    if c_t and c_t not in meta:
+                        raw = _strip_source_prefix(c_t)
+                        meta[c_t] = (
+                            _first_two_content_tokens(raw),
+                            _safe_number_multiset(c_t),
+                        )
+                _prefetch_metadata[lookup_key] = meta
+        except Exception as e:
+            logger.warning(
+                "Prefetch metadata build failed: %s. "
+                "Domain guard uses prefetch cache without precomputed metadata (fail-open).", e,
+            )
+            _prefetch_metadata = {}
 
     for item in items:
         # (a) точный URL в БД
@@ -692,6 +844,11 @@ def filter_new(
             continue
 
         normalized = item.title_normalized()
+        # Для Major-2 (domain-дедуп) — вычисляем один раз на item.
+        item_numbers = _safe_number_multiset(getattr(item, 'title', None))
+        item_first2 = _first_two_content_tokens(
+            _strip_source_prefix(getattr(item, 'title', None) or '')
+        )
 
         # (b) title+source в БД — проверено внутри is_duplicate
         # (c) title+source ВНУТРИ цикла
@@ -734,7 +891,79 @@ def filter_new(
 
         # ── Быстрый доменный дедуп: тот же cluster_key за последние 2 часа ──
         # Major#10: prefetch-кеш вместо per-item SQL-запроса.
-        if _domain_recent_duplicate(item, _prefetch_cache):
+        # Major-2: защита от склейки противоположных по смыслу заголовков.
+        # normalize() сортирует слова, поэтому cluster_key нечувствителен
+        # к порядку → «Russia strikes Ukraine» и «Ukraine strikes Russia» дают
+        # один ключ. Подтверждающая дешёвая проверка на first-2-content-tokens
+        # (без стоп-слов, без стемминга): одинаковые первые два информативных
+        # слова → дубли (та же тема); разные → разные темы (не склеиваем).
+        #
+        # Проверяется ДВА источника «уже виденного»:
+        #   (a) prefetch cache — существующие items из БД за 2 часа
+        #   (b) _domain_cycle_seen — items, обработанные в этом цикле (within-cycle)
+        is_domain_dup = False
+        if _prefetch_cache is not None:
+            item_cluster_key = getattr(item, 'cluster_key', None)
+            if item_cluster_key:
+                if '|' in item_cluster_key:
+                    item_lookup_key = item_cluster_key.split('|', 1)[1]
+                else:
+                    item_lookup_key = item_cluster_key
+                item_candidates = _prefetch_cache.get(item_lookup_key)
+                # MINOR-1: используем предвычисленный кэш метаданных candidates.
+                # (item_first2 уже вычислен в начале цикла.)
+
+                def _matches_any_candidate(first2_tokens, candidates_list, item_nums_check, meta_cache):
+                    """Есть ли candidate с теми же first-2 токенами и (опц.) числами?
+
+                    MINOR-1: first2 и nums берутся из предвычисленного meta_cache
+                    (построен один раз за вызов filter_new), а не пересчитываются.
+                    """
+                    for c_t, _ in candidates_list:
+                        entry = meta_cache.get(c_t)
+                        if entry is None:
+                            continue
+                        c_first2, c_nums = entry
+                        if c_first2 == first2_tokens:
+                            if item_nums_check is None:
+                                # Числа не доступны — match без числовой сверки.
+                                return True
+                            if c_nums is None or c_nums == item_nums_check:
+                                return True
+                    return False
+
+                if item_candidates:
+                    if item_numbers is None:
+                        # Числа не разобрались — прежнее поведение: cluster_key
+                        # совпал, числа не проверить → дубль (без Major-2).
+                        is_domain_dup = True
+                    else:
+                        # (a) Совпадает ли с каким-то существующим по first-2 + numbers?
+                        # MINOR-1: используем предвычисленный кэш метаданных.
+                        meta_cache = _prefetch_metadata.get(item_lookup_key, {})
+                        if _matches_any_candidate(
+                                item_first2, item_candidates, item_numbers, meta_cache):
+                            is_domain_dup = True
+                        else:
+                            # (b) Within-cycle: был ли уже обработан item с теми же
+                            # first-2 токенами И числами в этом цикле (lookup_key)?
+                            seen_for_key = _domain_cycle_seen.get(item_lookup_key, {})
+                            item_nums_key = item_numbers if item_numbers is not None else None
+                            if item_first2 in seen_for_key:
+                                seen_nums = seen_for_key[item_first2]
+                                if seen_nums is None or seen_nums == item_nums_key:
+                                    is_domain_dup = True
+                else:
+                    # Нет существующих кандидатов с этим cluster_key.
+                    # (b) Within-cycle: был ли уже обработан item с теми же
+                    # first-2 + numbers?
+                    seen_for_key = _domain_cycle_seen.get(item_lookup_key, {})
+                    item_nums_key = item_numbers if item_numbers is not None else None
+                    if item_first2 in seen_for_key:
+                        seen_nums = seen_for_key[item_first2]
+                        if seen_nums is None or seen_nums == item_nums_key:
+                            is_domain_dup = True
+        if is_domain_dup:
             storage.save_skipped(item)
             dup_count += 1
             logger.debug(
@@ -743,14 +972,46 @@ def filter_new(
             )
             continue
 
+        # Регистрируем first-2 в within-cycle cache (Domain-2).
+        # Вызывается ПОСЛЕ domain dedup (is_domain_dup=False) и ДО fuzzy dedup:
+        # item1 регистрируется сразу, item2 сразу видит её и блокируется.
+        if _prefetch_cache is not None:
+            item_cluster_key_reg = getattr(item, 'cluster_key', None)
+            if item_cluster_key_reg:
+                if '|' in item_cluster_key_reg:
+                    lookup_key_reg = item_cluster_key_reg.split('|', 1)[1]
+                else:
+                    lookup_key_reg = item_cluster_key_reg
+                if lookup_key_reg not in _domain_cycle_seen:
+                    _domain_cycle_seen[lookup_key_reg] = {}
+                _domain_cycle_seen[lookup_key_reg][item_first2] = item_numbers
+
         # ── Уровень 2: fuzzy-дедуп (только при cross_source=true) ──
         fuzzy_duplicate = False
         if fuzzy_enabled and recent:
+            # Major-3: предвычисляем токен-сеты кандидатов один раз за цикл
+            # (для всех items одного source — shared). Строим один раз,
+            # затем переиспользуем в _quick_filter и _is_fuzzy_similar.
+            if item.source not in _token_sets_cache:
+                _token_sets_cache[item.source] = {
+                    cand_norm: _token_set(cand_norm)
+                    for _, cand_norm, *_ in _recent_cache.get(item.source, [])
+                    if cand_norm
+                }
+            cand_token_sets = _token_sets_cache[item.source]
+
             # предфильтр: быстрый отсев по длине и токен-сету
-            filtered = _quick_filter(normalized, recent)
+            filtered, limit_hit = _quick_filter(
+                normalized, recent, precomputed_token_sets=cand_token_sets)
+            if limit_hit:
+                _fuzzy_limit_hit = True
+            # Предвычисляем nums и meaningful для item (один раз за item).
+            item_nums = _number_multiset(normalized)
             for _, cand_norm, *_ in filtered:
+                precomputed = {'nums_a': item_nums}
                 if _is_fuzzy_similar(
                     normalized, cand_norm, threshold, token_threshold,
+                    _precomputed=precomputed,
                 ):
                     fuzzy_duplicate = True
                     break
@@ -772,6 +1033,12 @@ def filter_new(
             "Выборка дедупа усечена лимитом: проверено не более %d заголовков "
             "за окно (dedup.max_seen_titles; 0 = без лимита)",
             max_seen_titles,
+        )
+    if _fuzzy_limit_hit:
+        logger.warning(
+            "Fuzzy-пул усечён: лимит %d кандидатов. "
+            "Увеличьте dedup.max_seen_titles для полного покрытия.",
+            MAX_FUZZY_CANDIDATES,
         )
     if cross_source_skipped:
         logger.info("Дедуп: отфильтровано %d cross-source дублей", cross_source_skipped)

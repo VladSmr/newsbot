@@ -224,16 +224,17 @@ sqlite3 data/newsbot.db ".backup 'data/newsbot.db.backup-$(date +%F)'"
 
 **Изменить часовой пояс:**
 
-```bash
-# в docker-compose.yml:
-environment:
-  TZ: Europe/Moscow   # ← поменяйте на свой, например Europe/Kaliningrad
-```
-
-Или в `.env`:
+В `.env` добавьте строку (переопределит значение из `docker-compose.yml`):
 
 ```bash
 echo "TZ=Europe/Kaliningrad" >> .env
+```
+
+Или отредактируйте `docker-compose.yml` напрямую:
+
+```yaml
+environment:
+  TZ: Europe/Kaliningrad   # ← замените на свой часовой пояс
 ```
 
 Список допустимых значений TZ: `ls /usr/share/zoneinfo/` или
@@ -260,7 +261,7 @@ HTTP(S)-прокси.
 
 ```yaml
 environment:
-  TZ: Europe/Moscow
+  TZ: ${TZ:-Europe/Moscow}
   # ── ПРОКСИ ────────────────────────────────────────────────────────
   HTTPS_PROXY: "http://proxy.example.com:8080"
   HTTP_PROXY:  "http://proxy.example.com:8080"

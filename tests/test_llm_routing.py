@@ -482,19 +482,18 @@ class TestGetBalanceAvailability:
 # ─────────────────────────────────────────────────────────────────
 
 class Test429LastAttemptNoSleep:
-    """429 на последней попытке: sleep НЕ вызывается (break вместо continue)."""
+    """429 на последней попытке: sleep НЕ вызывается (continue вместо sleep)."""
 
     def test_last_attempt_429_no_sleep(self):
         """При 429 на последней попытке time.sleep не вызывается.
 
-        429-sleep вызывается ДО continue, поэтому фиксируем параметр sleep,
-        чтобы отличить 429-wait от backoff (429-wait растёт как 2**attempt,
-        backoff = 2**(attempt-1)). Убеждаемся что на последней попытке
-        429-sleep отсутствует.
+        Реализация: continue в except 429 пропускает else-блок (где был бы
+        backoff). 429-sleep вызывается только если attempt < max_retries.
+        Убеждаемся что на последней попытке sleep отсутствует.
         """
+        import newsbot.llm.client as cm
         from newsbot.llm.client import DeepSeekClient, LLMError
         from unittest.mock import patch, MagicMock
-        import time
 
         client = DeepSeekClient(
             api_key="test-key",
@@ -518,32 +517,31 @@ class Test429LastAttemptNoSleep:
             call_count += 1
             return mock_response
 
-        # Record sleep calls in order: deterministically track which call index
-        # corresponds to which retry attempt.
+        # Record sleep calls: должен быть ровно 1 вызов (attempt=1, attempt<max_retries).
+        # Attempt=2 (последняя) не вызывает sleep.
         sleep_calls: list = []
 
         def fake_sleep(duration):
-            """
-            Deterministic sleep recorder.
-
-            Real client.py: range(1, max_retries+1) with max_retries=2 → attempts [1, 2].
-            No retry-after header → wait = 2**attempt.
-              - attempt 1: wait=2, sleep(2) if 1 < 2 → YES (429-wait)
-              - attempt 2: wait=4, 2 < 2? NO → break, NO sleep (last attempt)
-            Expected: 2 POST calls, 1 sleep call with duration=2.
-            """
             sleep_calls.append(duration)
 
-        with patch.object(client._http, "post", side_effect=fake_post):
-            with patch.object(time, "sleep", fake_sleep):
+        prev_sleep = cm.time.sleep
+        cm.time.sleep = fake_sleep
+        try:
+            with patch.object(client._http, "post", side_effect=fake_post):
                 with pytest.raises(LLMError):
                     client.chat_json(system="sys", user="user")
+        finally:
+            cm.time.sleep = prev_sleep
 
         # 2 POST attempts (range(1, 3))
         assert call_count == 2, f"Expected 2 calls, got {call_count}"
 
         # Only 1 sleep: 429-wait after attempt 1. No sleep after attempt 2 (last).
-        assert sleep_calls == [2], (
-            f"Expected exactly [2] sleep call (429-wait after attempt 1), "
-            f"got {sleep_calls}"
+        # Duration is 429-backoff = 2**attempt + jitter → ~1.0–3.0 (actual value
+        # depends on random, but the key is: exactly 1 call, not 2).
+        assert len(sleep_calls) == 1, (
+            f"Expected exactly 1 sleep call (429-wait after attempt 1), "
+            f"got {len(sleep_calls)}: {sleep_calls}"
         )
+        # Duration must be positive (429-backoff with jitter, never zero)
+        assert sleep_calls[0] > 0, f"sleep duration must be > 0, got {sleep_calls[0]}"

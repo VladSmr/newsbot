@@ -14,8 +14,9 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime as dt_cls, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from .config import load_config
 from .env import telegram_token, deepseek_api_key, telegram_owner_id, _write_env
@@ -29,6 +30,97 @@ from .version import __version__
 # Event работает с threading.Condition/wait(), bool — нет.
 # signal.signal ставится ТОЛЬКО в main thread.
 _shutdown_event = threading.Event()
+
+
+# ── wall-clock slot helpers (wall-clock schedule: :30 every 2 hours) ─────────
+# Slots: 00:30, 02:30, 04:30, … 22:30 (local time).
+# Next slot is always in the future; clock-back / DST → next slot is used.
+
+def _next_slot_seconds(now: dt_cls) -> int:
+    """
+    Seconds from *now* to the next HH:30 slot on an EVEN hour (wall-clock: every 2 hours).
+
+    Slots: 00:30, 02:30, 04:30, … 22:30 (local time). After 22:30 → 00:30 next day.
+    Before :30 → current hour (if even, else next even); at or past :30 → next even hour.
+    If the computed slot is at or before *now* (DST / clock skew) → advance 1 h and retry.
+
+    Returns a guaranteed-positive integer number of seconds.
+    """
+    local_now = now.replace(tzinfo=None)
+    cur_h = local_now.hour
+    cur_m = local_now.minute
+
+    if cur_m < 30:
+        # Before :30 → slot is in current hour (round up hour to next even if needed).
+        target_h = cur_h if cur_h % 2 == 0 else cur_h + 1
+    else:
+        # At or past :30 → next even hour (current + 1, rounded up to even).
+        target_h = cur_h + 1
+        if target_h % 2 != 0:
+            target_h += 1  # 01→02, 03→04, … 23→00 (next day)
+
+    # After 22:30 wrap to next day 00:30.
+    if target_h >= 24:
+        tomorrow = local_now.date() + timedelta(days=1)
+        slot_dt = dt_cls.combine(tomorrow, _SLOT_TIME)
+    else:
+        slot_dt = local_now.replace(hour=target_h, minute=30, second=0, microsecond=0)
+
+    delta_seconds = (slot_dt - local_now).total_seconds()
+    if delta_seconds <= 0:
+        # Clock went backwards or DST shift → advance by 1 hour and retry.
+        slot_dt = slot_dt + timedelta(hours=1)
+        delta_seconds = (slot_dt - local_now).total_seconds()
+    return int(delta_seconds)
+
+
+def _next_wait_seconds(now: dt_cls, after_error: bool = False) -> int:
+    """
+    Seconds to wait before the next cycle.
+
+    - ``after_error=False``: wait until the next slot (wall-clock HH:30).
+    - ``after_error=True``: wait max(backoff, next_slot) — error path ensures
+      a minimum pause before retry, not a full retry cycle at 30 s.
+    """
+    slot = _next_slot_seconds(now)
+    if after_error:
+        return max(_BACKOFF_SECONDS, slot)
+    return slot
+
+
+def _resolve_wait(t0_error: dt_cls, after_error: bool, now: dt_cls) -> int:
+    """
+    Resolve the reference time for wait calculation.
+
+    - after_error=True:  reference = t0_error (moment of the exception)
+    - after_error=False: reference = now  (current moment after successful cycle)
+
+    Exists as a PURE function so it can be unit-tested without threading/main().
+    Used in main() — not only in tests.
+    """
+    return _next_wait_seconds(t0_error if after_error else now, after_error=after_error)
+
+
+def _format_slot_hour(now: dt_cls) -> int:
+    """
+    Hour of the next HH:30 slot on an even hour, for logging.
+    Handles the same rounding logic as _next_slot_seconds.
+    """
+    h = now.hour
+    m = now.minute
+    if m < 30:
+        nxt = h if h % 2 == 0 else h + 1
+    else:
+        nxt = h + 1
+        if nxt % 2 != 0:
+            nxt += 1
+    if nxt >= 24:
+        return 0
+    return nxt
+
+
+# Time object representing the slot minute (:30) for use with datetime.combine.
+_SLOT_TIME = dt_cls(2000, 1, 1, 0, 30).time()
 
 _BACKOFF_SECONDS = 30  # пауза при непойманном исключении в цикле
 
@@ -460,6 +552,12 @@ def _signal_handler(signum, frame):
 
 
 def main():
+    # NIT-фикс: сбросить _shutdown_event при каждом вызове main().
+    # При повторном вызове main() в одном процессе (subprocess / тест)
+    # событие остаётся set() от предыдущего запуска → демон выходит мгновенно.
+    # signal handlers ещё не установлены, сброс безопасен.
+    _shutdown_event.clear()
+
     # Минимальный sanitizer до CLI-ветвления (N4: --check-telegram / --set-chat-id / --check-llm).
     # TokenSanitizer активен даже когда setup_logging ещё не вызван.
     _minimal_sanitizer_handler()
@@ -517,8 +615,7 @@ def main():
         sys.exit(0)
 
     if args.check_telegram:
-        _check_telegram()
-        return
+        sys.exit(_check_telegram())
 
     if args.set_chat_id:
         if args.bind:
@@ -582,22 +679,36 @@ def main():
         try:
             interval_minutes = int(config["poll_interval_minutes"])
         except (KeyError, TypeError, ValueError):
+            interval_minutes = None
+        if interval_minutes != 120:
             logger.warning(
-                "poll_interval_minutes=%r не число — используем 15 мин.",
+                "poll_interval_minutes=%r не влияет на расписание (слоты :30 / 2 ч); "
+                "значение используется только как grace-период",
                 config.get("poll_interval_minutes"),
             )
-            interval_minutes = 15
-        interval = interval_minutes * 60
+        # interval_minutes далее не используется — нужен только для grace-периода
+        # при преждевременном SIGINT до первого цикла.
         logger.info(
-            "Режим: бесконечный цикл, интервал %d мин.",
-            interval_minutes,
+            "Режим: бесконечный цикл, wall-clock слоты :30 каждые 2 ч (локальное время)",
         )
 
         signal.signal(signal.SIGINT, _signal_handler)
         signal.signal(signal.SIGTERM, _signal_handler)
 
+        # Wall-clock bootstrap: первый цикл — сразу (без ожидания до слота).
+        # rationale: при рестарте/развёртывании pending-items НЕ должны
+        # простаивать до 2 ч. Все последующие циклы — строго по слотам :30.
+
+        after_error = False  # True → next wait = max(backoff, slot from error moment)
+        t0 = dt_cls.now()    # момент отсчёта слота; после ошибки = момент ошибки; иначе = now
+
         while not _shutdown_event.is_set():
             try:
+                # MAJOR-фикс: сброс after_error при успешном проходе.
+                # Раньше флаг оставался True после except → пауза считалась от
+                # t0 (момента ошибки) даже на следующих успешных циклах.
+                after_error = False
+
                 # M1: обработка /digest из poller — ДО основного цикла
                 if _digest_requested.is_set():
                     _digest_requested.clear()
@@ -620,38 +731,75 @@ def main():
                                 logger.info("/digest: ничего не отправлено")
                         except Exception as e:
                             logger.error("/digest: ошибка: %s", e, exc_info=True)
+                        # Сбросить триггер, чтобы следующий цикл не попал
+                        # обратно в digest-handler (run_digest выставляет флаг
+                        # для немедленного повторного входа, если не сбросить).
+                        _digest_requested.clear()
 
                 pipeline.run_cycle_with_delivery()
             except Exception as e:
-                # непойманное исключение — логируем, ждём, продолжаем
+                # MAJOR-фикс: фиксируем t0 ДО backoff — слот считается от момента
+                # ошибки, а не от времени после backoff. Иначе при ошибке в 10:29:50
+                # (до слота 10:30 осталось 10 с) backoff спит 30 с, now=10:30:20,
+                # slot_secs=~7200 → слот 10:30 теряется. Теперь слот считается от
+                # момента ошибки: max(backoff=30, slot_from_error_moment=10) = 30 с,
+                # current cycle досыпает и идёт сразу (слот не теряется).
+                t0 = dt_cls.now()  # момент ошибки — от него считается целевой слот
+                after_error = True
+
                 logger.error(
                     "Непойманное исключение в цикле (демон жив, backoff %d с): %s",
                     _BACKOFF_SECONDS, e, exc_info=True,
                 )
-                # ждём backoff с проверкой флага (event.wait — прерываемо)
+                # Прерываемый backoff-сон (шаг ≤ 30 с, проверка флага на каждой итерации).
                 slept = 0
                 while slept < _BACKOFF_SECONDS and not _shutdown_event.is_set():
                     _shutdown_event.wait(1)
                     slept += 1
-                continue
 
-            # C3: slept инициализируется КАЖДУЮ итерацию (в т.ч. после успешного цикла)
-            slept = 0
-            logger.info("Пауза %d мин. до следующего цикла...",
-                        interval_minutes)
-            # M1: event.wait с таймаутом — реагирует на /digest БЫСТРО
-            # (не ждёт 15 мин, просыпается через 30 с или сразу при set)
-            while not _shutdown_event.is_set():
-                # проверяем /digest-requested даже во время паузы
+            # ── wall-clock sleep до следующего слота :30 ────────────────────────
+            # MAJOR-фикс: единая точка вычисления паузы — _resolve_wait.
+            # after_error=True:  пауза = max(backoff, slot) от t0 (момент ошибки).
+            # after_error=False: пауза = slot от now (текущий момент после цикла).
+            # Прерываемость по _shutdown_event / _digest_requested сохранена.
+            # Чистая функция _resolve_wait тестируется без threading/main().
+            now = dt_cls.now()
+            target_secs = _resolve_wait(t0, after_error, now)
+            if target_secs <= 0:
+                # Слот в прошлом (DST / clock skew) — защитный пересчёт.
+                target_secs = _resolve_wait(now, after_error=False, now=now)
+                if target_secs <= 0:
+                    target_secs = 60  # absolute fallback
+
+            # Сбрасываем after_error, чтобы следующий (успешный) цикл
+            # не считал паузу от t0 предыдущей ошибки. Сброс в начале
+            # try-блока (выше) перестраховывает от любых ветвлений.
+            after_error = False
+
+            logger.info(
+                "Следующий цикл: через %d мин. (слот %02d:30 — чётный час, локальное время)",
+                max(1, target_secs // 60),
+                _format_slot_hour(t0),
+            )
+
+            while True:
+                if _shutdown_event.is_set():
+                    break
                 if _digest_requested.is_set():
+                    # /digest прерывает ожидание — цикл запустится сразу
+                    # (следующая итерация while начнётся с /digest handling)
                     break
-                # 30 с — батч ожидания, не слишком долго для быстрой реакции
-                if _digest_requested.wait(timeout=30):
-                    # проснулись по set — выходим из цикла паузы
-                    break
-                # иначе просто проснулись по таймауту — продолжаем паузу
-                slept += 30
-                if slept >= interval:
+
+                # Спим min(target_secs, 30 с) за шаг — прерываемо.
+                step = min(target_secs, 30)
+                # event.wait с таймаутом: просыпаемся каждые 30 с для
+                # проверки shutdown/digest — graceful shutdown реагирует быстро.
+                if _digest_requested.wait(timeout=step):
+                    break  # проснулись по _digest_requested.set()
+
+                target_secs -= step
+                if target_secs <= 0:
+                    # Достигли слота — выходим из ожидания, запускаем цикл.
                     break
     finally:
         # ── graceful shutdown: аккуратное завершение ──────────────────────────
@@ -752,13 +900,16 @@ def _mask_key(key: str) -> str:
     return "...{last4} (len={n})".format(last4=last4, n=n)
 
 
-def _check_telegram() -> None:
-    """Вызывает getMe — проверяет валидность токена."""
+def _check_telegram() -> int:
+    """
+    Вызывает getMe — проверяет валидность токена.
+    Returns 0 on success, 1 on error.
+    """
     import httpx
     token = telegram_token()
     if not token:
         print("ОШИБКА: TELEGRAM_BOT_TOKEN не найден в .env")
-        return
+        return 1
 
     # T2-7: маскируем — длина + последние 4, не первые 6
     print(f"Токен: {_mask_key(token)}")
@@ -777,13 +928,18 @@ def _check_telegram() -> None:
             print(f"   bot_user_id: {result.get('id', '?')}")
         else:
             print(f"❌ getMe вернул ok=false: {data.get('description', resp.text)}")
+            return 1
     except httpx.TimeoutException:
         print("❌ Таймаут при обращении к api.telegram.org")
+        return 1
     except httpx.ConnectError:
         print("❌ Нет соединения: ConnectError")
+        return 1
     except Exception as e:
         # N4: печатаем только тип, не str(e) — может содержать URL с токеном
         print(f"❌ Ошибка: {type(e).__name__}")
+        return 1
+    return 0
 
 
 def _set_chat_id() -> None:
@@ -985,9 +1141,11 @@ def _run_digest_once() -> None:
     """
     Выполняет дайджест один раз (--digest) и выходит.
     Инициализирует pipeline, запускает run_digest(force=True), закрывает.
-    Exit code 0 — всегда успех (даже если deferred пуст или ошибка log-only).
 
-    Minor: при paused=1 CLI --digest тоже пропускает отправку и логирует
+    Exit code: 0 — успех (включая empty deferred, ошибка log-only);
+               1 — исключение при выполнении (включая паузу).
+
+    При paused=1 CLI --digest пропускает отправку и возвращает 0
     (консистентность с daemon-путём и /digest в чате).
     """
     config = load_config()

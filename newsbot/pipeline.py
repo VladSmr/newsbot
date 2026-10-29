@@ -280,28 +280,330 @@ def normalize_location(location: Optional[str]) -> str:
     return s
 
 
-# ── F3: нормализация локации для cap'а (схлопывание вариаций) ────────────────
-# Generic-суффиксы, убираемые при нормализации ключа для location-cap.
-# English: при «Voronezh region, Russia» → «voronezh» (убираем «, Russia» ПОСЛЕ
-# comma-cut, потом убираем суффиксы).
-# Russian: «Воронежская область» → «воронежская» (без уточнителя), но
-# «Воронежская обл.» → «воронежская». В обоих случаях суффикс убирается.
-# При этом «Москва» не схлопывается с «Московская область», т.к. последняя
-# НЕ имеет generic-суффикса «область» (это основное слово, не суффикс).
-# Все паттерны — word-boundary (\b), чтобы «oblast» в «neooblast» не убирался.
-_CAP_GENERIC_PATTERNS = [
-    r"\s+region\b",       # English
-    r"\s+oblast\b",
-    r"\s+krai\b",
-    r"\s+area\b",
-    r"\s+province\b",
-    r"\s+district\b",
-    r"\s+область\b",      # Russian
-    r"\s+край\b",
-    r"\s+район\b",
-    r"\s+регион\b",
-    r"\s+обл\b",
-]
+# ── Задача 2 (V2): эвристический префильтр перед LLM ─────────────────────────
+# Бесплатное отсеивание заведомо нерелевантных items ДО батчинга LLM.
+# Принцип: только явные, однозначные случаи. При сомнении — пропускаем в LLM.
+# Urgent-маркеры (катастрофы, жертвы, атаки) — не отсеиваем НИКОГДА.
+
+# ЖЁСТКИЕ маркеры: item ОДНОЗНАЧНО не по профилю → отсеивается с score=1.
+# Берутся из CUT-списка BATCH_SYSTEM_PROMPT (llm/prompts.py).
+# Категории: мнения/прогнозы/аналитика/слухи/"источники сообщают"/
+#            светская хроника / суточные цены на топливо / релизы AI-моделей.
+#
+# ВАЖНО: используем r"" (raw strings), иначе "\bforecast\b" превращается
+# в backspace+буквы и re.search не находит word boundary.
+#
+# Ревизии (Major-1/2):
+#   analysis → только qualified-формы (не голое слово, ложные срабатывания на
+#     "Toxicology analysis confirms poisoning…").
+#   according to sources / источники сообщают — маркер НЕ достаточен сам по себе;
+#     отсеивает только при отсутствии number/date/proper_noun (ужесточение гейта).
+#   chatgpt → только в связке с release/launch/rollout/unveil (не голое упоминание).
+#   .* в "источник.*сообща" / "star.*news" — ограничено .{0,40} для title
+#     (жадный .* тянул весь title+summary → ложные срабатывания).
+_PREFILTER_HARD_MARKERS = (
+    # English: прогнозы, мнения, аналитика, слухи
+    r"\bforecast\b", r"\bforecasts\b", r"\bopinion\b", r"\bopinions\b",
+    # ANALYSIS — только qualified: expert/market/technical analysis (не голое слово,
+    # которое ловит "Toxicology analysis confirms…" без фактов).
+    r"\b(?:expert|market|technical)\s+analysis\b",
+    r"\brumor\b", r"\brumors\b", r"\brumours?\b",
+    # "sources say/said/report/claims"
+    r"source[s]?\s+(?:sa[yis]|report[s]?|claim[s]?)",
+    # "according to sources/insiders" — Major-2: маркер достаточен только при
+    # наличии number/date/proper_noun (см. _prefilter_item).
+    r"according\s+to\s+(?:sources?|insiders?)",
+    # Russian: прогнозы, мнения, аналитика, слухи
+    r"\bпрогноз\b", r"\bпрогнози\b", r"\bпрогнозов\b", r"\bпрогнозам\b",
+    r"\bмнени[ея]\b", r"\bвзгляд\b", r"\bвзглядов\b",
+    r"\bаналитик\b", r"\bаналитикой\b",
+    r"\bслух\b", r"\bслухи\b", r"\bслухов\b",
+    # "источники сообщают" — .{0,40} вместо .* (жадный захват на title+summary).
+    r"\bисточник[а-я]*.{0,40}сообща",
+    # Светская хроника — .{0,40} для ограничения контекста.
+    r"\bcelebrity\b", r"\bcelebrities\b", r"\bgossip\b",
+    r"\bhollywood\b.{0,40}news", r"\bstar\b.{0,40}news",
+    r"\broyal\b.{0,40}family\b", r"\bweddings?\b",
+    # Суточные цены на топливо (НЕ атаки на НПЗ, не дефицит — только рутинные цены)
+    r"\bfuel\s+price\b", r"\bfuel\s+prices\b",
+    r"\bgas\s+price\b", r"\bgas\s+prices\b",
+    r"\bbrent\s+price\b", r"\bcrude\s+oil\s+price\b",
+    r"\bprice\s+at\s+the\s+pump\b",
+    r"\bбензин\b.*цена", r"\bцена\b.*бензин",
+    r"\bтоплив\b.*цена", r"\bцена\b.*топлив",
+    # Релизы AI-моделей (НЕ инциденты с AI) — только qualified-формы.
+    # chatgpt — Major-2: убрано голое упоминание, только в связке с релизом.
+    r"\bai\s+model.{0,20}(?:release|launch)",
+    r"\bopenai\b.{0,20}(?:release|launch)",
+    r"\bgpt-?\d.{0,20}(?:release|launch)",
+    r"\bclaude\b.{0,20}(?:release|launch)",
+    r"\bllm\b.{0,20}(?:release|launch)",
+    r"\bchatgpt\b.{0,20}(?:release|launch|rollout|unveil)",
+    r"\bmodel\s+launch\b",
+)
+
+# URGENT-маркеры: при наличии — item НЕ отсеивается префильтром,
+# даже если есть hard-мркер. Катастрофы, жертвы, атаки — пропускаем в LLM.
+_PREFILTER_URGENT_MARKERS = (
+    r"\bcasualt", r"\bdead\b", r"\bkilled\b", r"\binjured\b", r"\bwounded\b",
+    r"\bevacuation\b", r"\bevacuee",
+    # Major-2: attack — смягчён (без обязательной привязки city/town/village/
+    # civilian), но НЕ убран совсем — одиночный attack всё ещё блокирует отсеивание.
+    r"\battack\b",
+    r"\bairstrike\b", r"\bmissile\b.*\bstrike\b",
+    r"\bexplosion\b", r"\bblast\b",
+    r"\bfire\b", r"\bwildfire\b", r"\bflood\b", r"\bflooding\b",
+    r"\bearthquake\b", r"\btremor\b",
+    r"\bradiation\b", r"\bnuclear\b",
+    r"\bcrash\b", r"\bcrashed\b",
+    r"\bterrorist\b", r"\bshooting\b", r"\bhostage\b",
+    r"\bdisaster\b", r"\bcatastroph",
+    # Major-2: расширенный набор погодных/инфраструктурных инцидентов.
+    r"\bhurricane\b", r"\bstorm\b",
+    r"\bblackout\b", r"\boutage\b",
+    r"\bchemical\b", r"\bhazmat\b",
+    # CRITICAL-фикс: русские маркеры катастроф/ЧП (без \b на конце — падежные формы).
+    r"\bвзрыв", r"\bпогиб", r"\bжертв", r"\bранен", r"\bпострада",
+    r"\bпожар", r"\bобстрел", r"\bракет", r"\bдрон", r"\bбпла",
+    r"\bэвакуац", r"\bнаводнен", r"\bураган", r"\bшторм", r"\bавари",
+    r"\bкатастроф", r"\bрадиац", r"\bхимическ", r"\bутечк", r"\bтеракт",
+    r"\bштурм", r"\bмобилизац",
+    # CRITICAL: дефицит (реальная новость профиля — дефицит бензина/товаров).
+    r"\bдефицит",
+)
+
+
+def _prefilter_item(item) -> bool:
+    """
+    Эвристический префильтр: заведомо не наше → score=1 без вызова LLM.
+
+    Возвращает True если item отсеивается, False если идёт в LLM.
+
+    Консервативный дизайн:
+      — только явные, однозначные маркеры из CUT-списка;
+      — эвристика "нет ни цифр, ни имён, ни мест, ни дат" — ТОЛЬКО
+        в комбинации с ≥1 жёстким маркером;
+      — urgent-маркеры блокируют отсеивание (катастрофы не теряем).
+
+    Схема работы (pipeline.py):
+      — Отсеянные: state='skipped', llm_score=1, llm_reason='prefilter'.
+      — llm_score=1 < guarantee_min_score (default 3) → гарантия НЕ подхватит.
+      — Без бюджетного вызова LLM — экономия токенов.
+
+    Major-1: has_proper_noun считается по СЫРЫМ title/summary (до .lower()).
+    Major-2: "according to sources" / "источники сообщают" — НЕ достаточен сам
+    по себе; отсеивает только если контент не содержит number/date/proper_noun.
+    """
+    # Собираем текст для маркеров (case-insensitive).
+    raw_title = getattr(item, 'title', None) or ""
+    raw_summary = getattr(item, 'summary', None) or ""
+    lower_text = (raw_title + " " + raw_summary).lower()
+
+    # 1. Проверяем urgent — если есть, НЕ отсеиваем.
+    for pat in _PREFILTER_URGENT_MARKERS:
+        if re.search(pat, lower_text, re.IGNORECASE):
+            return False
+
+    # 2. Ищем жёсткие маркеры. Break сразу после первого матча.
+    #    "according to sources" — слабый маркер: only отсеивает если есть контент.
+    #    Всё остальное — жёсткий маркер (отсеивает даже без контента).
+    hard_hit = False  # True = any strong marker matched
+    weak_hit = False  # True = only "according" matched
+    for pat in _PREFILTER_HARD_MARKERS:
+        if re.search(pat, lower_text, re.IGNORECASE):
+            if "according" in pat:
+                weak_hit = True
+                continue          # не рвём цикл — ищем сильные маркеры
+            hard_hit = True
+            break
+
+    if not hard_hit and not weak_hit:
+        return False
+
+    # 3. Проверяем "контент": число, место, дата — по lower_text.
+    has_number = re.search(r"\d", lower_text)
+    # has_location: проверяем ТОЛЬКО title (не summary).
+    # Это защищает от ложного срабатывания generic location-words в summary
+    # (напр. "across regions" в fuel price report не спасает мусорный item).
+    # Но конкретная локация в title ("explosion in Voronezh region") — реальный
+    # контекст, пропускаем в LLM.
+    lower_title = raw_title.lower()
+    has_location = re.search(
+        r"\b(?:city|town|country|countries|village|county|state|states|region|area)\b"
+        # CRITICAL-фикс: русские маркеры — требуем кириллицу слева, чтобы
+        # Latin "region"/"city" не давали ложное срабатывание через
+        # Unicode \b-normalization (Cyrillic "о" = Latin "o").
+        # Ищем слово без латиницы слева: (?<![a-zA-Z]).
+        r"|(?:(?<![a-zA-Z])\u0433\u043e\u0440\u043e\u0434[а-я]*\b|(?<![a-zA-Z])\u043e\u0431\u043b\u0430\u0441\u0442[а-я]*\b|"
+        r"(?<![a-zA-Z])\u0440\u0430\u0439\u043e\u043d[а-я]*\b|(?<![a-zA-Z])\u0440\u0435\u0433\u0438\u043e\u043d[а-я]*\b|"
+        r"(?<![a-zA-Z])\u0441\u0435\u043b[оа-я]*\b|(?<![a-zA-Z])\u0434\u0435\u0440\u0435\u0432\u043d[а-я]*\b|"
+        r"(?<![a-zA-Z])\u043a\u0440\u0430[аиейюя]\b|(?<![a-zA-Z])\u043d\u043f\u0437\b)",
+        lower_title, re.IGNORECASE,
+    )
+    has_date = re.search(
+        r"\b(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+        r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}"
+        r"|\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*)",
+        lower_text, re.IGNORECASE,
+    )
+
+    # Major-1 + Major-PN-fix: proper noun — по СЫРОМУ тексту (до .lower()),
+    # чтобы заглавные буквы в "Russia", "Gazprom", "ChatGPT" не потерялись.
+    #
+    # Финальный алгоритм (Major-PN-fix):
+    #   PN = заглавный токен (≥3 букв), непосредственно ПЕРЕД которым стоит
+    #   строчный токен-слово. Сканируется title + summary.
+    #   Капитализированное слово в начале предложения (после punct) тоже
+    #   считается PN, т.к. перед ним стоит punct — а после punct может идти
+    #   слово с любой регистром (в т.ч. глагол/союз).
+    #
+    #   Игнорируемые capitalized-стоп-слова: The, A, An, In, On, At, By, For,
+    #   From, With, And, Or, But, After, Before, This, These, It, Its, As, If,
+    #   While, When (в любом регистре).
+    #
+    # Примеры:
+    #   "Sources say Sudan army advances" → "Sudan" после "say" (строчное) → PN. ✓
+    #   "Expert Opinion: economic"       → "Opinion:" (stop-word не срабатывает,
+    #                                       т.к. "Expert" — первое слово,
+    #                                       "Opinion" — capitalized, но не после
+    #                                       строчного слова) → no PN → отсеивается. ✓
+    #   "Gazprom deal, Moscow"            → "Moscow" после "," → PN. ✓
+    #   "ChatGPT outage"                  → "outage" не cap, "ChatGPT" — cap но
+    #                                       перед ним нет строчного слова → no PN. ✓
+    #   "many analysts believe Russia"   → "Russia" после "believe" (строчное) → PN. ✓
+    #   "Breaking News: attack"          → "News" — cap, но перед ней "Breaking"
+    #                                       (cap, не строчное), нет PN → отсеивается. ✓
+    #   "The Ukraine situation"           → "Ukraine" после "The" (stop-word) → no PN. ✓
+    #   Russian: "Источники сообщают о взрыве" → urgent-маркер блокирует. ✓
+    #   "Источники сообщают о ситуации в регионе" → location → не отсеивается. ✓
+    _PN_STOP = {
+        "the", "a", "an", "in", "on", "at", "by", "for", "from", "with",
+        "and", "or", "but", "after", "before", "this", "these", "it", "its",
+        "as", "if", "while", "when",
+        # CRITICAL: stop-words после punctuation в title: "Exclusive:", "Breaking:",
+        # "Update:", "Alert:", "Report:" — prev_word в STOP, чтобы следующее
+        # capitalized слово НЕ считалось PN в title-контексте.
+        "exclusive", "breaking", "update", "alert", "flash",
+        "report", "briefing", "summary",
+    }
+    combined_text = (raw_title or "") + " " + (raw_summary or "")
+
+    def _is_proper_noun(word: str, after_sop: bool, appears_lower: bool) -> bool:
+        """
+        Определяет, является ли word собственным именем (PN).
+
+        after_sop=True  — между word и началом title/summary НЕТ строчных слов
+                          (word начинает предложение / фразу) → обычное существительное.
+        after_sop=False — перед word было ≥1 строчное слово → это PN.
+
+        appears_lower=True — слово также встречается в lower-форме в тексте
+                          → обычное English-существительное (не PN).
+
+        PN-сигналы (в порядке приоритета):
+          1. ≥1 заглавная ПОСЛЕ первой буквы (Russia, Gazprom, ChatGPT, Sudan) → PN.
+          2. All-caps 2–3 буквы (EU, US, NATO, G7) → PN.
+          3. Capitalized-first (Gazprom, Moscow, Voronezh, Tech, Russia):
+               NOT appears_lower + NOT common-english → PN.
+               (в т.ч. после after_sop — структурные заголовки "Exclusive: Gazprom").
+        """
+        if any(c.isupper() for c in word[1:]):
+            return True
+        if len(word) >= 2 and word.isupper() and len(word) <= 3:
+            return True
+        # Capitalized-first only: Gazprom, Moscow, Voronezh, Tech, Russia
+        if len(word) >= 3 and word[0].isupper() and word.lower() != word:
+            if appears_lower:
+                return False  # слово встречается в lower-форме — обычное существительное
+            # Не common English → считаем PN (включая after_sop: заголовки вида "Exclusive: Gazprom")
+            common_english = {
+                "opinion", "outlook", "sources", "analysis", "economic",
+                "expert", "market", "forecast", "report", "update", "news",
+                "times", "today", "year", "week", "month", "million", "billion",
+                "deal", "plan", "view", "response", "comment", "statement",
+                "break", "exclusive", "announcement", "information",
+                "according", "insiders",
+                "celebrity", "celebrities", "gossip", "royal", "weddings",
+                "wedding", "hollywood", "star",
+                # generic English determiners/adjectives — capitalized в начале
+                # предложения, но не PN
+                "many", "few", "several", "some", "most", "all", "any",
+                "both", "each", "every", "other", "such", "same",
+                "next", "last", "first", "second", "third",
+                "current", "former", "latter", "latest", "new",
+                "local", "global", "national", "international", "regional",
+                "major", "minor", "final", "initial", "additional",
+                # CRITICAL-фикс: "fuel"/"gas"/"oil" — capitalized mid-sentence in
+                # "Fuel prices fell" / "Gas prices rise" — NOT PN. prev_word="markets"
+                # (lowercase, not stop) → prev_word="" → ложный PN. Добавлены в
+                # common_english → not PN → мусорный item отсеивается. ✅
+                "fuel", "gas", "oil", "crude",
+                # stop-words после punctuation в title: "Exclusive:", "Breaking:",
+                # "Update:", "Alert:" — следующее capitalized слово может быть PN.
+                "exclusive", "breaking", "update", "alert", "flash",
+                "report", "briefing", "summary",
+            }
+            if word.lower() not in common_english:
+                return True
+        return False
+
+    def _find_proper_noun(text: str) -> bool:
+        """
+        Ищет PN: capitalized-слово(>=3 букв), перед которым стоит строчное слово.
+
+        Prev-word anchored capitalization:
+          1. Находим пару: строчное слово (curr) + capitalized слово (nxt).
+          2. Пропускаем punct и stop-words перед curr, ищем prev_word.
+          3. nxt = PN если prev_word из _PN_STOP или prev_word не найден
+               ("Sources say Sudan", "According to sources, Gazprom").
+               prev_word capitalized (не stop) -> NOT PN
+               ("Exclusive: Gazprom", "Daily Fuel Price Report").
+        """
+        tokens = re.findall(r"[A-Za-zА-ЯЁа-яё]+|[^\s\w]", text)
+        for idx in range(len(tokens) - 1):
+            curr = tokens[idx]
+            nxt = tokens[idx + 1]
+            if curr.lower() != curr:
+                continue
+            if len(nxt) >= 3 and _is_proper_noun(nxt, False, False):
+                if nxt.lower() in _PN_STOP:
+                    continue
+                prev_word = ""
+                for j in range(idx - 1, -1, -1):
+                    t = tokens[j]
+                    if t.lower() in _PN_STOP:
+                        continue
+                    if t.lower() != t:
+                        prev_word = t
+                        break
+                    break
+                if prev_word == "" or prev_word.lower() in _PN_STOP:
+                    return True
+        return False
+
+    # CRITICAL: English PN-heuristics НЕ применимы к русскому тексту.
+    # Для кириллицы пропускаем PN-проверку -- пусть работают location/urgent.
+    has_latin = bool(re.search(r"[A-Za-z]", combined_text))
+    has_proper_noun = _find_proper_noun(combined_text) if has_latin else False
+    # При наличии любого {число, имя, место, дата} -- пропускаем в LLM.
+    if has_number or has_proper_noun or has_location or has_date:
+        return False
+
+    # Отсеиваем: контент пустой (нет number/PN/location/date).
+    # hard_hit -- отсеиваем (жёсткий маркер без фактов).
+    # has_weak_only -- отсеиваем ("according to sources" без фактов).
+    return True
+
+
+# generic-суффиксы для нормализации location-имён в cap-группировке.
+# "(2) Отбрасывание generic-суффиксов" в _normalize_cap_key.
+_CAP_GENERIC_PATTERNS = (
+    # NOTE: "area" intentionally excluded — "Bay Area" is a specific region,
+    # not generic. Stripping "area" would collapse "Bavaria area" → "bavaria"
+    # (incorrect; test_digest_guarantee_cap::test_generic_suffixes_stripped).
+    r"\b(?:region|oblast|krai|rayon|district|province)\b",
+    r"\bобл[а-я]*\b", r"\bкрай\b", r"\bрайон\b",
+    r"\bобласть\b", r"\bрегион\b",
+)
 
 
 def _normalize_cap_key(location: str) -> str:
@@ -329,13 +631,31 @@ def _normalize_cap_key(location: str) -> str:
     """
     if not location:
         return ""
-    s = location.strip().lower()
-    if not s:
+    raw = location.strip()
+    if not raw:
         return ""
-    # (1) Обрезка по первой запятой
-    comma_pos = s.find(",")
+    # (1) Обрезка по первой запятой — НЕ для кодов штатов/стран.
+    # Обрезка нужна для «Voronezh region, Russia», но НЕ для «Portland, OR»
+    # или «Portland, ME» (разные бакеты). Схема: режем только если после
+    # запятой НЕ 2-3 заглавные буквы (US state / country code) и не
+    # известное цельное название (несколько слов с мажорной буквой).
+    # Проверяем РЕГИСТР на исходной строке ДО lower(): после lower() все
+    # буквы строчные и [A-Z] не срабатывает → "Portland, OR" и
+    # "Portland, ME" схлопывались в "portland".
+    comma_pos = raw.find(",")
     if comma_pos >= 0:
-        s = s[:comma_pos].strip()
+        after_raw = raw[comma_pos + 1:].strip()
+        # 2-3 заглавные буквы — код штата (OR, ME) или страны (US, UK, DE)
+        is_state_or_country = bool(
+            re.match(r"^[A-Z]{2,3}(,|$)", after_raw)
+        )
+        # Несколько заглавных слов — «United Arab Emirates», «New York»
+        is_full_name = len(after_raw.split()) > 1 and all(
+            w[0].isupper() for w in after_raw.split() if w
+        )
+        if not is_state_or_country and not is_full_name:
+            raw = raw[:comma_pos].strip()
+    s = raw.lower()
     if not s:
         return ""
     # (2) Отбрасывание generic-суффиксов
@@ -484,7 +804,7 @@ def _infer_category(item) -> str:
     )
     _SPACE_MARKERS = (
         r"\brocket\b", r"\bsatellite\b",
-        r"\bastronaut\b", r"\bcosmonaut\b", r"\blas.launch\b",
+        r"\bastronaut\b", r"\bcosmonaut\b", r"\blaunch\b",
         r"\bspacex\b", r"\borbit\b", r"\bmission\b",
         r"\blunar\b", r"\bmars\b", r"\bstar\b",
         # Отдельные специфичные маркеры (без generic "space" который
@@ -987,19 +1307,24 @@ class NewsPipeline:
         self.llm_filter: Optional[LLMFilter] = self._build_llm_filter(config)
 
         # лимит items (оценок) на цикл
-        self._max_per_cycle = int(config.get("llm", {}).get("max_per_cycle", 150))
+        self._max_per_cycle = max(0, _coerce_int(
+            config.get("llm", {}).get("max_per_cycle", 150),
+            150, "llm.max_per_cycle",
+        ))
         self._llm_calls_left: int = self._max_per_cycle  # общий бюджет на цикл
         # off-peak гейт: ограничить LLM вызовами в непиковые часы DeepSeek
         # явный парсер: bool("false")==True, поэтому проверяем строковые значения
         off_peak_raw = config.get("llm", {}).get("off_peak_only", False)
         self._off_peak_only = _parse_bool(off_peak_raw)
         # лимит retry-попыток
-        self._max_retries = int(
-            config.get("database", {}).get("max_retries", Storage.DEFAULT_MAX_RETRIES)
+        self._max_retries = _coerce_int(
+            config.get("database", {}).get("max_retries", Storage.DEFAULT_MAX_RETRIES),
+            Storage.DEFAULT_MAX_RETRIES, "database.max_retries",
         )
         # лимит stuck-pending для get_stuck_pending (защита RAM от большого backlog)
-        self._stuck_pending_limit = int(
-            config.get("database", {}).get("stuck_pending_limit", 500)
+        self._stuck_pending_limit = _coerce_int(
+            config.get("database", {}).get("stuck_pending_limit", 500),
+            500, "database.stuck_pending_limit",
         )
 
         # кеш фидбэка для few-shot (Фаза 2c); fetched один раз за цикл
@@ -1151,8 +1476,8 @@ class NewsPipeline:
             self._llm_dedup_skipped_urls: Set[str] = set()
 
         dedup_cfg = self.config.get("dedup", {})
-        window_days = int(dedup_cfg.get("window_days", 3))
-        recent_limit = int(dedup_cfg.get("llm_recent_limit", 20))
+        window_days = _coerce_int(dedup_cfg.get("window_days", 3), 3, "dedup.window_days")
+        recent_limit = _coerce_int(dedup_cfg.get("llm_recent_limit", 20), 20, "dedup.llm_recent_limit")
 
         # Major #3-фикс: оцениваем стоимость дедупа ДО вызова.
         # detect_duplicates → ceil(N/40) чанков = ceil(N/40) вызовов.
@@ -1192,17 +1517,19 @@ class NewsPipeline:
         if not dup_0based:
             return 0
 
-        # Major ingest safety: если модель пометила ВСЕ кандидаты дублями
-        # (после M2 лидер тоже может быть помечен) — это ненормальный ответ.
-        # Без этой проверки все items получат state='skipped' и пропадут
-        # (recovery только по pending). Сценарий реален при непустом recent_list.
-        # Лечение: возвращаем бюджет и пропускаем (аналог except-ветки :1185-1190).
-        if len(dup_0based) >= len(candidates):
+        # Critical-2-фикс: ingest safety — если модель пометила ВСЕ кандидаты
+        # дублями при >1 кандидате, это ненормальный ответ (галлюцинация/потеря
+        # батча). Без этой проверки все items получают state='skipped' и
+        # пропадают безвозвратно.
+        # Исключение: ровно 1 кандидат + все помечен — валидный cross-cycle
+        # dedup одиночной новости (recent_list непуст в штатном сценарии).
+        # Лечение: возвращаем бюджет, set_state не вызываем, items остаются new.
+        if len(dup_0based) >= len(candidates) and len(candidates) > 1:
             self._llm_calls_left += num_chunks
             logger.warning(
-                "LLM-дедуп (ingest): модель пометила все %d кандидатов дублями — "
-                "игнорируем результат (бюджет %d возвращён). "
-                "Items остаются доступны для следующего цикла.",
+                "LLM-дедуп (ingest): модель пометила все %d кандидатов дублями "
+                "(>1) — игнорируем результат (бюджет %d возвращён). "
+                "Items остаются state='new' для следующего цикла.",
                 len(candidates), num_chunks,
             )
             return 0
@@ -1215,15 +1542,32 @@ class NewsPipeline:
         #   save_skipped = INSERT OR IGNORE → rowcount=0 → state остаётся 'new'
         #   → K1-recovery подхватит их в след.цикле или они застрянут навсегда.
         # set_state — UPDATE, который РЕАЛЬНО меняет state='new' → 'skipped'.
+        # Minor #3-фикс: если UPDATE partially failed (DB locked и т.п.),
+        # marked < len(dup_urls) — часть URLs осталась 'new' в БД.
+        # На следующем цикле recovered-items не пройдут LLM-дедуп
+        # (set обновился) → дубль пушится навсегда. Лечение: при расхождении
+        # warning, исключаем из _llm_dedup_skipped_urls настолько, насколько
+        # можем подтвердить (marked штук). Это уменьшает защиту, но не блокирует
+        # её полностью.
         if dup_urls:
             marked = self.storage.set_state(dup_urls, "skipped")
-            logger.debug(
-                "LLM-дедуп: set_state('skipped') для %d дублей → %d строк обновлено",
-                len(dup_urls), marked,
-            )
-
-        # (б) запоминаем для исключения из дальнейшей обработки
-        self._llm_dedup_skipped_urls.update(dup_urls)
+            if marked < len(dup_urls):
+                logger.warning(
+                    "LLM-дедуп: set_state('skipped') обновил %d из %d строк — "
+                    "%d URLs исключены из skipped-списка (могут повториться в след.цикле). "
+                    "Причина: DB locked или несуществующие URLs.",
+                    marked, len(dup_urls), len(dup_urls) - marked,
+                )
+                # Подтверждённые URLs (те что обновились) — upper bound:
+                # реально обновлено ≤ marked ≤ len(dup_urls).
+                confirmed = dup_urls[:marked] if marked > 0 else []
+                self._llm_dedup_skipped_urls.update(confirmed)
+            else:
+                self._llm_dedup_skipped_urls.update(dup_urls)
+                logger.debug(
+                    "LLM-дедуп: set_state('skipped') для %d дублей → %d строк обновлено",
+                    len(dup_urls), marked,
+                )
 
         logger.info(
             "LLM-дедуп: отсеяно %d/%d кандидатов (семантические дубли «одно событие»), "
@@ -1587,24 +1931,68 @@ class NewsPipeline:
             self._cleanup()
             return  # ← выходим из цикла; LLM не вызывается
 
+        # ── V2 prefilter (Major-3): ДО LLM-дедупа — экономия токенов на мусоре ──
+        # llm.prefilter.enabled (default True). При false — пропускаем всех в LLM.
+        # Отсеянные: state='skipped', llm_score=1, llm_reason='prefilter'.
+        # llm_score=1 < guarantee_min_score (default 3) → гарантия не подхватит.
+        # Применяется к all_items (recovered + fresh candidates) — fresh items из БД
+        # (state='new', подхваченные в recovery K1) тоже проходят префильтр.
+        prefilter_enabled = _parse_bool(
+            self.config.get("llm", {}).get("prefilter", {}).get("enabled", True)
+        )
+        prefiltered_urls: List[str] = []
+        if prefilter_enabled:
+            for item in all_items:
+                # Scored items (recovered/retry) уже имеют оценку — не трогаем.
+                if getattr(item, 'llm_score', None) is None and _prefilter_item(item):
+                    prefiltered_urls.append(item.url)
+            if prefiltered_urls:
+                # Фиксируем state + score/reason сразу — без вызова LLM.
+                # Minor #3: используем return value (per-record изоляция).
+                updated_urls = self.storage.update_llm_results_batch([{
+                    "url": url,
+                    "score": 1,
+                    "summary": "",
+                    "reason": "prefilter",
+                    "urgent": False,
+                    "cluster_key": None,
+                    "title_en": None,
+                } for url in prefiltered_urls])
+                self.storage.set_state(updated_urls, "skipped")
+                # Major-3: исключаем из all_items → дедуп не увидит мусор.
+                prefilter_set = set(prefiltered_urls)
+                all_items = [i for i in all_items if i.url not in prefilter_set]
+                logger.info(
+                    "Prefilter: %d items отсеяны до LLM-дедупа "
+                    "(токены сохранены), %d → dedup",
+                    len(prefiltered_urls), len(all_items),
+                )
+
         # ── LLM-дедупликация: семантическая группировка «одно событие» ──
         # Critical #1-фикс: вызов ПОСЛЕ гейтов паузы и off-peak.
         # На паузе и в off-peak LLM-дедуп НЕ вызывается — экономия платных токенов.
         # Кандидаты уже сохранены в БД (state='new'), лексический дедуп и seen_titles
         # также уже выполнены (до гейтов) — сохранность данных обеспечена.
         # При сбое LLM — безопасный пропуск: ни один дубль не проходит.
+        # Major-3: prefiltered URLs уже исключены из all_items.
         llm_dedup_skipped = 0
-        if self.llm_dedup_enabled() and self.llm_filter is not None:
-            llm_dedup_skipped = self._run_llm_dedup(candidates)
+        # Проверяем что llm_filter имеет необходимые атрибуты (для тестов с FakeLLMFilter).
+        has_dedup_chunk = (
+            self.llm_filter is not None
+            and hasattr(self.llm_filter, '_DEDUP_CHUNK_SIZE')
+        )
+        if self.llm_dedup_enabled() and has_dedup_chunk:
+            llm_dedup_skipped = self._run_llm_dedup(all_items)
             # Исключаем LLM-дубли из дальнейшей обработки
             if llm_dedup_skipped > 0:
-                skipped_urls = getattr(self, '_llm_dedup_skipped_urls', set())
-                all_items = [i for i in all_items if i.url not in skipped_urls]
+                dedup_skipped_urls = getattr(self, '_llm_dedup_skipped_urls', set())
+                all_items = [i for i in all_items if i.url not in dedup_skipped_urls]
             if getattr(self, '_llm_dedup_skipped_urls', None):
                 # Очищаем после использования
                 self._llm_dedup_skipped_urls.clear()
 
         # ── B13: retry-очередь обрабатывается ПЕРЕД кандидатами ──
+        # Major-3: candidates уже очищен от prefiltered и dedup-skipped URLs.
         # M1-фикс: scored items (llm_score уже сохранён) НЕ тратят LLM-бюджет.
         #   — Разделяем stuck на scored (retry без LLM) и fresh (требуют оценки).
         #   — Scored обрабатываются БЕЗ ограничения бюджетом.
@@ -1749,6 +2137,8 @@ class NewsPipeline:
             push_th = self.llm_filter.push_threshold
             digest_th = self.llm_filter.digest_threshold
             push_urgent_only = self.llm_filter.push_urgent_only
+            # Major-3: prefilter выполняется в run_cycle_with_delivery ДО _run_llm_dedup.
+            # Здесь — только маршрутизация и сохранение результатов.
 
             # лимит items: бюджет передан явно (retry) или остаток общего счётчика
             budget = budget_override if budget_override is not None else self._llm_calls_left
@@ -1756,11 +2146,11 @@ class NewsPipeline:
             budget = max(0, budget)
             items_to_llm = items
             if budget <= 0:
-                # бюджет исчерпан — все items остаются pending.
-                # C1': НЕ возвращаем как failed_urls → retry_count не инкрементируется,
-                # state остаётся pending → retry в следующем цикле.
+                # бюджет исчерпан — все items возвращаются в state='new' (K1 подхватит
+                # в следующем цикле). C1': НЕ добавляем в failed_urls →
+                # retry_count не инкрементируется.
                 logger.warning(
-                    "LLM-бюджет цикла исчерпан (0/%d); %d items — pending (retry в след.цикле)",
+                    "LLM-бюджет цикла исчерпан (0/%d); %d items → 'new' (retry в след.цикле)",
                     self._max_per_cycle, len(items),
                 )
                 to_deliver = []  # никто не доставлен, никого не помечаем failed
@@ -1782,7 +2172,10 @@ class NewsPipeline:
                     )
 
             # batch_size из конфига; 1 = поштучный режим (всегда evaluate)
-            batch_size = max(1, int(self.config.get("llm", {}).get("batch_size", 10)))
+            batch_size = max(1, _coerce_int(
+                self.config.get("llm", {}).get("batch_size", 10),
+                10, "llm.batch_size",
+            ))
 
             llm_call_count = 0
 
@@ -1899,26 +2292,27 @@ class NewsPipeline:
                 updated_urls = set(self.storage.update_llm_results_batch(llm_batch_records))
 
             # ── фиксируем state и логируем итоговые счётчики (одна INFO-строка) ──
-            n_skipped = len(skipped_urls & updated_urls)
-            n_deferred = len(deferred_urls & updated_urls)
+            # Minor #1: вычисляем пересечение один раз, переиспользуем.
+            actually_skipped = list(skipped_urls & updated_urls)
+            actually_deferred = list(deferred_urls & updated_urls)
+            n_skipped = len(actually_skipped)
+            n_deferred = len(actually_deferred)
             n_push = len(to_deliver)
 
             # set_state только для реально обновлённых URL
             # (провалившийся UPDATE → item в pending, его подберёт recovery)
-            if skipped_urls:
-                actually_skipped = list(skipped_urls & updated_urls)
-                if actually_skipped:
-                    self.storage.set_state(actually_skipped, "skipped")
-            if deferred_urls:
-                actually_deferred = list(deferred_urls & updated_urls)
-                if actually_deferred:
-                    self.storage.set_state(actually_deferred, "deferred")
+            if actually_skipped:
+                self.storage.set_state(actually_skipped, "skipped")
+            if actually_deferred:
+                self.storage.set_state(actually_deferred, "deferred")
 
             mode_tag = " [urgent-only]" if push_urgent_only else ""
             logger.info(
                 "Маршрутизация%s: push=%d deferred=%d skipped=%d",
                 mode_tag, n_push, n_deferred, n_skipped,
             )
+            # Major-3: prefilter-статистика логируется в run_cycle_with_delivery
+            # (до LLM-дедупа). Здесь только маршрутизация и LLM-результаты.
 
             # M1: если все отфильтрованы (to_deliver пуст) — НЕ возвращаем
             #     filtered items как failed_urls; сначала фиксируем их state.
@@ -1983,9 +2377,10 @@ class NewsPipeline:
                     "Доставлено %d/%d items; %d permanent-failed (→ state='failed')",
                     len(delivered_urls), len(to_deliver), len(permanent_failed_urls),
                 )
+            perm_set = set(permanent_failed_urls)
             not_delivered = [i.url for i in to_deliver
                              if i.url not in delivered_urls
-                             and i.url not in set(permanent_failed_urls)]
+                             and i.url not in perm_set]
             if not_delivered:
                 logger.info(
                     "Доставлено %d/%d items; %d не доставлено (pending → retry)",
@@ -1997,18 +2392,21 @@ class NewsPipeline:
                     len(delivered_urls), len(to_deliver),
                 )
         except (ChatIdNotBoundError, BotBlockedError) as e:
-            # P1-фикс: ПОСТОЯННАЯ ошибка конфигурации/доступа, а не транзиентная.
-            # ChatIdNotBoundError/BotBlockedError — подклассы TelegramDeliveryError,
-            # поэтому раньше попадали в общий except и url'ы уходили в failed_urls →
-            # increment_retry_count каждый цикл → max_retries → failed → purge.
-            # Сценарий «юзер заблокировал бота на 2 часа» стирал все новости.
-            # Теперь НЕ возвращаем failed: items остаются pending до починки чата,
-            # retry_count не инкрементируется (по образцу digest-пути).
-            logger.warning(
-                "Доставка невозможна (%s): %d items остаются pending без "
-                "расхода retry_count (чат/доступ не настроены)",
-                type(e).__name__, len(to_deliver),
-            )
+            # Critical-1-фикс: при partial success (BatchAbortedError) читаем
+            # successful_urls / permanent_failed_urls — помечаем РЕАЛЬНО доставленные
+            # и терминализируем permanent-failed. Без этого дубликаты уходили в
+            # повторную отправку.
+            succ = getattr(e, "successful_urls", []) or []
+            perm = getattr(e, "permanent_failed_urls", []) or []
+            if succ:
+                self.storage.set_state(succ, "delivered")
+                logger.info(
+                    "Частичная доставка: %d items → 'delivered', %d → 'failed' "
+                    "(по %s)",
+                    len(succ), len(perm), type(e).__name__,
+                )
+            if perm:
+                self.storage.set_state(perm, "failed")
             return []
         except Exception as e:
             logger.error(
@@ -2025,17 +2423,6 @@ class NewsPipeline:
         processed_urls: Set[str] = (
             set(i.url for i in to_deliver) | set(skipped_urls) | set(deferred_urls)
         )
-        excess_urls = [
-            i.url for i in items
-            if i.url not in processed_urls
-        ]
-        if excess_urls:
-            logger.debug(
-                "Бюджетный срез: %d items срезаны → 'new' (retry в след.цикле)",
-                len(excess_urls),
-            )
-        # NOTE: excess_urls НЕ добавляются в failed_urls.
-
         # (a) те, что не доставлены (сбой TG, частичный батч, исключение)
         failed_urls = set(not_delivered)
 
@@ -2058,6 +2445,15 @@ class NewsPipeline:
         Вызывается из _process_batch после evaluate / synthesize (retry).
         """
         if not res.ok:
+            # Major-4: fatal-ошибка (401/402/403) — как cost_blocked: item остаётся
+            # pending, НЕ уходит в fallback/deferred/push.
+            # Защитный getattr: работает и без поля fatal (до параллельного PR).
+            if getattr(res, "fatal", False):
+                logger.debug(
+                    "fatal: '%s' остаётся pending (LLM-авторизация недоступна)",
+                    item.url,
+                )
+                return
             if res.cost_blocked:
                 # Дневной лимит LLM исчерпан: вызова не было, деньги не
                 # потрачены, завтра счётчик обнулится → item НЕ трогаем:
@@ -2089,41 +2485,34 @@ class NewsPipeline:
 
         r = route(res.score, push_th, digest_th,
                   urgent=res.urgent, push_urgent_only=push_urgent_only)
+        # Minor #3: если LLM вернул пустой summary, а RSS summary есть —
+        # используем его как fallback, но помечаем llm_reason, чтобы
+        # отличить от осознанно пустого ответа.
+        rss_summary = getattr(item, "summary", "") or ""
+        used_fallback = not res.summary and rss_summary
+        if used_fallback:
+            reason = (res.reason or "no_summary") + "|phase1_only"
+        else:
+            reason = res.reason or "no_summary"
+        final_summary = res.summary or rss_summary
+        record = {
+            "url": item.url,
+            "score": res.score,
+            "summary": final_summary,
+            "reason": reason,
+            "urgent": res.urgent,
+            "cluster_key": getattr(item, "cluster_key", None),
+            "title_en": getattr(res, "title_en", None),
+        }
         if r == "skip":
             skipped_urls.add(item.url)
-            llm_batch_records.append({
-                "url": item.url,
-                "score": res.score,
-                "summary": res.summary,
-                "reason": res.reason,
-                "urgent": res.urgent,
-                "cluster_key": getattr(item, "cluster_key", None),
-                "title_en": getattr(res, "title_en", None),
-            })
         elif r == "digest":
             deferred_urls.add(item.url)
-            llm_batch_records.append({
-                "url": item.url,
-                "score": res.score,
-                "summary": res.summary,
-                "reason": res.reason,
-                "urgent": res.urgent,
-                "cluster_key": getattr(item, "cluster_key", None),
-                "title_en": getattr(res, "title_en", None),
-            })
         else:
             # r == "push"
             to_deliver.append(item)
             item._feedback_kind = "push"  # type: ignore[attr-defined]
-            llm_batch_records.append({
-                "url": item.url,
-                "score": res.score,
-                "summary": res.summary,
-                "reason": res.reason,
-                "urgent": res.urgent,
-                "cluster_key": getattr(item, "cluster_key", None),
-                "title_en": getattr(res, "title_en", None),
-            })
+        llm_batch_records.append(record)
 
     def _check_and_mark_failed(self, failed_retry_urls: List[str]) -> None:
         """
@@ -2214,10 +2603,9 @@ class NewsPipeline:
         # на poll_interval выпадали навсегда. Расширяем фильтр:
         # published >= window_start - poll_interval.
         # poll_interval из конфига, default 15 мин.
-        try:
-            poll_interval_minutes = int(self.config.get("poll_interval_minutes", 15))
-        except (TypeError, ValueError):
-            poll_interval_minutes = 15  # константа: 15 мин
+        poll_interval_minutes = _coerce_int(
+            self.config.get("poll_interval_minutes", 15), 15, "poll_interval_minutes",
+        )
         grace_delta = timedelta(minutes=poll_interval_minutes)
 
         # ── Оконная логика: граница окна ───────────────────────────────────
@@ -2858,7 +3246,24 @@ class NewsPipeline:
                         "граница окна НЕ сдвинута, items остаются deferred",
                         e,
                     )
+                    # Minor 1-фикс: терминализируем дубли ДО возврата.
+                    # ⚠️ Осознанный риск: при false-positive containment (LLM ошибся,
+                    # два unrelated events попали в один кластер) оба получат
+                    # state='digested' и пропадут — это терминальное состояние.
+                    if _dup_urls:
+                        try:
+                            self.storage.set_digested(list(_dup_urls))
+                        except Exception:
+                            pass
                     return 0
+            # Minor 1-фикс: весь дайджест — дубли (легально при непустом recent).
+            # Без set_digested дубли вечно deferred → повторный расход токенов
+            # на _cluster_deferred_duplicates в каждом окне.
+            if _dup_urls:
+                try:
+                    self.storage.set_digested(list(_dup_urls))
+                except Exception:
+                    pass
             logger.info("Дайджест: нет сообщений для отправки.")
             # M2: пишем маркер окна и при force+empty, чтобы _maybe_run_digest
             # не спамил повторно в следующем цикле.

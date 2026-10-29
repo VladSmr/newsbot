@@ -1047,6 +1047,53 @@ class TestConfigPollInterval:
         assert cfg["poll_interval_minutes"] == 15
 
 
+# ── dedup.prefetch_window_hours: тип/диапазон/кламп ────────────────────────
+
+
+class TestDedupPrefetchWindow:
+    """
+    dedup.prefetch_window_hours управляет prefetch-окном (кэш dedup).
+    Клампится: <2 → 2 (дефолт + warning), >48 → 48 (warning).
+    """
+
+    def test_too_large_is_clamped_to_48_with_warning(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "dedup:\n  prefetch_window_hours: 100\n", encoding="utf-8"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        assert cfg["dedup"]["prefetch_window_hours"] == 48
+        assert any(
+            "prefetch_window_hours" in r.getMessage() for r in caplog.records
+        )
+
+    def test_zero_falls_back_to_default_with_warning(self, tmp_path, caplog):
+        import logging
+
+        from newsbot.config import load_config
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "dedup:\n  prefetch_window_hours: 0\n", encoding="utf-8"
+        )
+
+        with caplog.at_level(logging.WARNING):
+            cfg = load_config(str(cfg_file))
+
+        # дефолт = 2
+        assert cfg["dedup"]["prefetch_window_hours"] == 2
+        assert any(
+            "prefetch_window_hours" in r.getMessage() for r in caplog.records
+        )
+
+
 # ── Task 1: NameError в logger.warning (feed_url → url) + defense-in-depth ──
 
 

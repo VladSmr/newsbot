@@ -204,7 +204,8 @@ class TestDetectDuplicatesParse(unittest.TestCase):
 
     def test_valid_duplicates_response(self):
         """Корректный ответ {duplicates:[2,3]} → 0-based {1,2}.
-        Лидер idx=1 защищён guard (a), не попадает в result.
+        Лидер idx=1 БЕЗ защиты (M2-fix), может быть помечен.
+        Major #4 sanity cap: 2/3 < 50% → применяется.
         """
         mock_client = MagicMock()
         mock_client.chat_json.return_value = {"duplicates": [2, 3]}
@@ -217,16 +218,19 @@ class TestDetectDuplicatesParse(unittest.TestCase):
         ]
 
         result = flt.detect_duplicates(items, [])
-        # idx=1 — лидер чанка — защищён (guard a), не в result.
-        # idx=2 → 1 (0-based), idx=3 → 2 (0-based)
+        # idx=2 → 1 (0-based), idx=3 → 2 (0-based). 2/3 = 67% > 50% (sanity cap).
+        # 67% > 50% → sanity cap ИГНОРИРУЕТ результат.
+        # Для срабатывания cap'а нужен чанк ≥ 4 items. При 3 items cap не применяется.
+        # 2/3 = 67% > cap 0.5, но cap применяется только при chunk_len >= 4.
+        # → результат должен быть {1, 2}.
         self.assertEqual(result, {1, 2})
-        self.assertNotIn(0, result, "Лидер чанка не должен быть помечен")
         mock_client.chat_json.assert_called_once()
 
     def test_string_indices_parsed(self):
         """Строковые индексы парсятся корректно."""
         mock_client = MagicMock()
-        # 2 и 3 — не лидеры (idx=1 защищён), должны пройти
+        # 2 и 3 — могут быть помечены (лидер не защищён).
+        # 2/5 = 40% < 50% (sanity cap не срабатывает).
         mock_client.chat_json.return_value = {"duplicates": ["2", "3"]}
         flt = self._make_filter(mock_client)
 
@@ -277,11 +281,11 @@ class TestDetectDuplicatesParse(unittest.TestCase):
         self.assertEqual(result, set(), "LLMError в первом чанке → пустое множество")
 
     def test_out_of_range_index_ignored(self):
-        """Индексы за пределами чанка игнорируются; лидер (idx=1) НЕ защищён (M2-fix)."""
+        """Индексы за пределами чанка игнорируются; лидер (idx=1) может быть помечен (M2-fix)."""
         mock_client = MagicMock()
         # При 5 items валидные 1-based: 1..5.
         # 6, 999 — вне диапазона → игнорируются.
-        # M2-fix: idx=1 (лидер) БЕЗ защиты — снимается M2-фиксом.
+        # idx=1 (0-based=0) помечен. 1/5 = 20% < 50% → cap не срабатывает.
         mock_client.chat_json.return_value = {"duplicates": [1, 6, 999]}
         flt = self._make_filter(mock_client)
 
@@ -483,6 +487,14 @@ class TestLLMDedupPipeline(unittest.TestCase):
         ]
 
         with _tmp_db() as db_path:
+            # Minor #3-регрессия: candidates ДОЛЖНЫ быть в БД (set_state обновляет
+            # существующие строки). Без save_many → set_state('skipped') → 0,
+            # skipped_urls не пополняется. Добавлено аналогично
+            # test_llm_dedup_marks_duplicates_skipped_in_db.
+            store = Storage(db_path)
+            store.save_many(candidates)
+            store.close()
+
             with patch.object(NewsPipeline, '_build_delivery', return_value=MagicMock()):
                 with patch.object(NewsPipeline, '_build_llm_filter', return_value=flt):
                     with patch.object(NewsPipeline, '_resolve_db_path', return_value=db_path):
@@ -751,19 +763,23 @@ class TestDedupLeaderGuard(unittest.TestCase):
         return _make_filter(mock_client)
 
     def test_leader_may_be_marked_as_duplicate(self):
-        """M2-fix: первый item чанка МОЖЕТ быть помечен как дубль (newer becomes leader)."""
+        """M2-fix: первый item чанка МОЖЕТ быть помечен как дубль (newer becomes leader).
+        Major #4 sanity cap: 4-item chunk, 2 marked = 50% → NOT > cap → применяется."""
         mock_client = MagicMock()
-        mock_client.chat_json.return_value = {"duplicates": [1, 2]}  # лидер + второй помечены
+        # 4 items: лидер (idx=1) + второй (idx=2) помечены = 2/4 = 50% = NOT > cap
+        mock_client.chat_json.return_value = {"duplicates": [1, 2]}
         flt = self._make_filter(mock_client)
 
         items = [
             _mk_item(title="Item A", url="u1"),
             _mk_item(title="Item B", url="u2"),
             _mk_item(title="Item C", url="u3"),
+            _mk_item(title="Item D", url="u4"),
         ]
 
         result = flt.detect_duplicates(items, [])
-        # M2-fix: idx=1→0-based {0}, idx=2→1-based {1} — оба пропускаются
+        # M2-fix: idx=1→{0}, idx=2→{1} — оба пропускаются
+        # 2/4 = 50% = NOT > 50% cap → результат применяется
         self.assertEqual(result, {0, 1})
 
     
@@ -799,23 +815,23 @@ class TestDedupLeaderGuard(unittest.TestCase):
 
     def test_partial_mark_leaves_some_0based_indices(self):
         """
-        M2-fix: модель пометила 9 из 10 items (idx 2..10), лидер (idx=1)
-        НЕ помечен. Это типичный валидный ответ — лидер доставляется,
-        9 остальных скипаются.
+        M2-fix: модель пометила 4 из 10 items (idx 2,4,6,8), лидер (idx=1)
+        НЕ помечен. 4/10=40% < 50% (sanity cap) → результат применяется.
+        Major #4: 9/10 (90%) would be IGNORED by sanity cap.
         """
         mock_client = MagicMock()
-        # Модель пометила все 9 не-лидеров (1-based idx 2..10)
-        mock_client.chat_json.return_value = {"duplicates": [2, 3, 4, 5, 6, 7, 8, 9, 10]}
+        # 4 marked = 40% < 50% cap → применяется
+        mock_client.chat_json.return_value = {"duplicates": [2, 4, 6, 8]}
         flt = self._make_filter(mock_client)
 
         items = [_mk_item(title=f"Дрон #{i}", url=f"u{i}") for i in range(10)]
 
         result = flt.detect_duplicates(items, [])
 
-        # M2-fix: лидер (idx=1→0-based 0) не помечен моделью → отсутствует в result
-        # Остальные (idx 2..10 → 0-based 1..9) → в result
+        # M2-fix: лидер (idx=1→0-based 0) не помечен моделью → отсутствует
+        # 4 помеченных (idx 2,4,6,8 → 0-based 1,3,5,7) → в result
         self.assertNotIn(0, result, "Лидер не помечен моделью — отсутствует в result")
-        self.assertEqual(result, {1, 2, 3, 4, 5, 6, 7, 8, 9})
+        self.assertEqual(result, {1, 3, 5, 7})
 
     def test_budget_refused_when_insufficient(self):
         """
@@ -874,6 +890,9 @@ class TestDedupLeaderGuard(unittest.TestCase):
         Major ingest safety: если модель пометила ВСЕ кандидаты дублями —
         результат игнорируется, бюджет возвращается, items остаются state='new'.
         Это предотвращает тихую потерю батча при невалидном ответе LLM.
+        Major #4 sanity cap: 3/3 = 100% при 3-item chunk (< 4) → cap НЕ срабатывает.
+        Но pipeline upstream invariant срабатывает: set_state(all→skipped)
+        при len(all)==len(items) → возвращает 0, items остаются new.
         """
         from newsbot.pipeline import NewsPipeline
 
@@ -912,9 +931,10 @@ class TestDedupLeaderGuard(unittest.TestCase):
 
                             skipped = pipeline._run_llm_dedup(candidates)
 
-                            # Вернулся 0 — никаких дублей не зафиксировано
+                            # Вернулся 0 — pipeline upstream invariant
+                            # (len(skip_urls)==len(items) → skip_urls обнуляется)
                             self.assertEqual(skipped, 0)
-                            # Бюджет НЕ списан (было 10, стало 10)
+                            # Бюджет НЕ списан (upstream invariant возвращает budget)
                             self.assertEqual(pipeline._llm_calls_left, 10)
                             # LLM всё равно был вызван
                             mock_client.chat_json.assert_called_once()
@@ -1025,6 +1045,8 @@ class TestDedupLeaderGuard(unittest.TestCase):
         Guard (a) срабатывает только для chunk_offset=0.
         Для chunk_offset>0 лидер чанка МОЖЕТ быть помечен дублем
         (кросс-чанковый дубль kept-лидера из предыдущего чанка).
+        Major #4 sanity cap: 1/1 chunk (100%) < min chunk 4 → cap не срабатывает.
+        1/40 chunk1 (2.5%) < cap → cap не срабатывает. Результат {1, 40}.
         """
         mock_client = MagicMock()
         mock_client.chat_json.side_effect = [
@@ -1040,9 +1062,10 @@ class TestDedupLeaderGuard(unittest.TestCase):
 
         # 2 LLM-вызова
         self.assertEqual(mock_client.chat_json.call_count, 2)
-        # item[1] из chunk1 — дубль
+        # item[1] из chunk1 — дубль (1/40 = 2.5% < cap)
         self.assertIn(1, result, "item[1] from chunk1 should be marked dup")
-        # item[40] из chunk2 — лидер тоже дубль (guard(a) не применим для chunk_offset>0)
+        # item[40] из chunk2 — лидер тоже дубль
+        # (1/1 = 100%, но cap не срабатывает при chunk_len < 4)
         self.assertIn(40, result, "item[40] (chunk2 leader) should be marked dup")
         self.assertEqual(len(result), 2)
 
@@ -1133,6 +1156,8 @@ class TestCrossChunkDedup(unittest.TestCase):
         (кросс-чанковый дубль kept-лидера из предыдущего чанка).
         41 items = 2 chunks: [0..39], [40] (chunk_size=40).
         LLM пометил item[1] (chunk1, idx=2) и item[40] (chunk2, лидер) дубликатами.
+        Major #4: 1/1 chunk (100%) < min chunk 4 → cap не срабатывает.
+        Результат: {1, 40}.
         """
         mock_client = MagicMock()
         # chunk1 (0..39): idx=2 1-based → 0-based=1 (item[1] = дубль item[0])
@@ -1151,9 +1176,9 @@ class TestCrossChunkDedup(unittest.TestCase):
 
             # 2 LLM-вызова
             self.assertEqual(mock_client.chat_json.call_count, 2)
-            # item[1] из chunk1 — дубль
+            # item[1] из chunk1 — дубль (1/40 = 2.5% < cap)
             self.assertIn(1, result, "item[1] from chunk1 should be marked dup")
-            # item[40] из chunk2 — лидер тоже помечен (guard(a) не применим для chunk_offset>0)
+            # item[40] из chunk2 — лидер тоже помечен (1/1 = 100%, но cap не срабатывает при < 4 items)
             self.assertIn(40, result, "item[40] (chunk2 leader) should be marked dup")
             self.assertEqual(len(result), 2)
 

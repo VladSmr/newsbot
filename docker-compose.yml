@@ -48,8 +48,9 @@ services:
       - ./config.yaml:/app/config.yaml:ro
     # ── timezone для дайджеста (digest.times — в локальной tz) ───────
     environment:
-      # Europe/Moscow — пример; замените на свой часовой пояс
-      TZ: Europe/Moscow
+      # ${TZ:-Europe/Moscow}: берёт из .env (TZ=Europe/Kaliningrad),
+      # при отсутствии — Europe/Moscow. Переопределите в .env.
+      TZ: ${TZ:-Europe/Moscow}
 
       # ── ПРОКСИ ДЛЯ TELEGRAM / DEEPSEEK (раскомментируйте при необходимости) ──
       # Все HTTP-клиенты бота (collector, telegram_io, delivery, llm) создаются

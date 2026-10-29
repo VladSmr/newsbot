@@ -50,10 +50,10 @@ Python 3.12, feedparser, httpx, PyYAML, SQLite (stdlib).
 **Конвейер:** Collector (RSS/feedparser+httpx) → Dedup (кросс-источниковый,
 двухуровневый) → save_many(state='new') → recovery K1 (подхват 'new')
 → recovery C2 (терминализация зависших 'pending') → few-shot: загрузка
-feedback из БД → LLM-фильтр (DeepSeek, бюджет 150/цикл, retry-items с готовым
-llm_score не тратят бюджет, few-shot блок в промпте) → set_state('pending')
-→ Delivery → set_state('delivered'). Retry: `get_stuck_pending()` — 'pending'
-старше retry_threshold_sec (60 с).
+feedback из БД → LLM-фильтр (DeepSeek, бюджет 250/цикл, wall-clock слоты :30
+каждые 2 ч локального времени; retry-items с готовым llm_score не тратят бюджет,
+few-shot блок в промпте) → set_state('pending') → Delivery → set_state('delivered').
+Retry: `get_stuck_pending()` — 'pending' старше retry_threshold_sec (60 с).
 
 **Кросс-источниковая дедупликация (v9, фикс ложных склеек):**
 - Уровень 1 (глобальный точный): `title_hash` БЕЗ `source` в пределах
@@ -96,15 +96,15 @@ llm_score не тратят бюджет, few-shot блок в промпте) �
     читает оригинальные (не нормализованные) заголовки из `items` table
     (исключая `skipped/failed`), лимит 20 по умолчанию.
 
-**State-машина (v13):** new / pending / delivered / skipped / deferred / failed / digested.
+**State-машина (v16):** new / pending / delivered / skipped / deferred / failed / digested.
 `retry_count` INTEGER DEFAULT 0 в БД. При исчерпании retry_count >= max_retries
 → 'failed' (терминальный). Recovery C2: зависшие 'pending' с retry_count
 >= лимитом → 'failed' на старте цикла.
-Purge: 'new' старше 7 дней + delivered/skipped/failed/digested старше retention_days (1 день).
+Purge: 'new' старше 7 дней + delivered/skipped/failed/digested старше retention_days (7 дней).
 'deferred': отдельное окно `deferred_retention_days` (3 дня) — старые неотправленные
 отложенные удаляются (критично для VPS 1 GB RAM; раньше копились бесконечно).
-**Осознанное решение владельца:** retention_days=1 и deferred_retention_days=3
-(не 90/14) — старые новости не нужны, хранилище экономится.
+**Осознанное решение владельца:** retention_days=7 и deferred_retention_days=3
+— старые новости нужны для few-shot, хранилище контролируется purge.
 'pending' — не удаляется (активный retry).
 K1-recovery ограничен `recovery_new_limit` (500) — при долгой паузе 'new' накапливались
 и загружались в RAM целиком.
@@ -112,15 +112,16 @@ K1-recovery ограничен `recovery_new_limit` (500) — при долго�
 и терминализируются при исчерпании лимита — at-least-once для candidates.
 skipped: LLM-фильтр (score<5) + кросс-источниковые дубли (уровни 1/2).
 
-**Схема БД v14** (SCHEMA_VERSION=14):
+**Схема БД v16** (SCHEMA_VERSION=16):
 - `items`: id, source, url, **url_norm TEXT (v14)**, title, summary, published, fetched_at,
   state, state_at, llm_score, llm_summary, llm_reason, **llm_urgent INTEGER 0/1 (v10/v11)**,
-  filtered_at, retry_count, **tags TEXT (v4), cluster_key TEXT (v12), lang TEXT (v13)**.
+  filtered_at, retry_count, **tags TEXT (v4), cluster_key TEXT (v12), lang TEXT (v13), feedback_target_id INTEGER (v15)**.
   `llm_urgent` — персистентный флаг срочности; восстанавливается на retry.
   Legacy-строки (до v10) с `llm_urgent=NULL` → `urgent=False` (безопасный дефолт).
   `tags` — json-список `<category>` из фида (в `cluster_key` не входит).
   `cluster_key` = `{location}|{stem_hash}|{pub_day}` (fallback: `nostem:{md5(title)}`);
   используется для 2-часового доменного дедупа (всегда включён, не конфигурируется).
+  `feedback_target_id` — id записи обратной связи (для 👍/👎 в дайджесте).
 - `seen_titles`: title_hash, source, fetched_at, expires_at,
   title_normalized (TTL 30 дн.; v9 для fuzzy).
 - `meta`: key TEXT PRIMARY KEY, value TEXT (для llm_balance_last_check,
@@ -156,7 +157,7 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - DeepSeek, model=deepseek-flash (⚠️ проверить id живым ключом; deepseek-v4-pro — альтернатива).
 - system_prompt = SYSTEM_PROMPT из prompts.py (источник истины; поле
   llm.system_prompt в config.yaml пустое = штатный оверрайд).
-- **Батч-оценка** (`llm.batch_size=10`, `llm.max_tokens=4096`):
+- **Батч-оценка** (`llm.batch_size=10`, `llm.max_tokens=4608`):
   - ≤10 новостей одним LLM-вызовом — system prompt платится раз на батч (экономия input-токенов).
   - `BATCH_SYSTEM_PROMPT` + `build_batch_user_message` в prompts.py: items нумеруются индексами 1..N, маркировка `<|данные:ID|>` — injection-safe.
   - Формат ответа: `{"results": [{"id":1,"score":0-10,"urgent":bool,"summary":"...","reason":"..."},...]}`.
@@ -171,9 +172,11 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
   `urgent AND score>=7` → пуш (delivered); `score 5–6` → deferred (дайджест); ≤ 4 → skipped.
   `urgent AND score<7` → deferred (НЕ пуш; вторичная защита от перестарания модели).
 - Маршрутизация (`push_urgent_only=false`, обратная совместимость): прежнее поведение — score ≥ 7 → пуш.
-- Конфиг: `llm.push_urgent_only` (bool, дефолт True), `llm.push_threshold` (7), `llm.digest_threshold` (5), `llm.batch_size` (10), `llm.max_tokens` (4096).
+- Конфиг: `llm.push_urgent_only` (bool, дефолт True), `llm.push_threshold` (7), `llm.digest_threshold` (5), `llm.batch_size` (10), `llm.max_tokens` (4608).
 - Fallback при сбое/отсутствии ключа: всё доставляется непрофильтрованным (kind='fallback').
-- `max_per_cycle=150` — единый бюджет на цикл (candidates + retry ≤ 150).
+- `max_per_cycle=250` — единый бюджет на цикл (candidates + retry ≤ 250;
+  значение из config.yaml; в коде по умолчанию 150; 12 слотов/сут × 250 = 3000
+  items/сут — покрывает реальный поток при 2-ч цикле).
 - Retry-items с готовым llm_score не тратят бюджет; **urgent восстанавливается из llm_urgent (v10/v11)**.
   Legacy-строки с `llm_urgent=NULL` → `urgent=False`.
 - Balance-алерт: при total_balance < threshold отправляется в Telegram
@@ -290,7 +293,9 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 ## Текущая сессия: важные поведения (отражены в коде)
 
 **Telegram-доставка:**
-- Постоянные 4xx → `PermanentDeliveryError` → item сразу `state='failed'` (без retry_count), батч продолжается. `send_batch` возвращает `(delivered, permanent_failed)`.
+- `BatchAbortedError` (наследник `ChatIdNotBoundError`) — partial success при abort: `successful_urls` сохраняются, батч прерывается, не потерянные items retry в следующем цикле.
+- Постоянные 4xx (content-level) → `PermanentDeliveryError` → item сразу `state='failed'` (без retry_count), батч продолжается. `send_batch` возвращает `(delivered, permanent_failed)`.
+- Oversized-дайджесты (>4096 UTF-16 units) нарезаются на подсообщения через `_split_message` (по \\n\\n, без повторного экранирования, `_hard_slice` ищет безопасную границу > / \\n / пробел).
 - 429 на последней попытке retry НЕ спит (нет смысла — бюджет исчерпан).
 
 **Retry-очередь:**
@@ -304,6 +309,10 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 - deepseek-flash верифицированы: off-peak input $0.15/output $0.60 за 1M токенов.
 - deepseek-v4-pro НЕ верифицированы (placeholder input $0.50/output $2.00).
 - Off-peak окна подтверждены официальным прайсом DeepSeek (peak 01–04 и 06–10 UTC будни; выходные целиком off-peak).
+
+**Расписание (wall-clock слоты :30, цикл 2 ч):**
+- Дайджест `digest.times=["08:00","20:00"]` фактически срабатывает на слотах `08:30/20:30` — задержка ≤30 мин (демон ждёт до слота :30, затем запускает цикл). Это **не баг**, а архитектура.
+- Retry упавшей доставки: `retry_threshold_sec=60` + цикл 2 ч → повтор не чаще раза в 2 ч; `max_retries=8` → до ~16 ч до перехода в `failed`.
 
 ## Фиксы по ревью (краткий список)
 
@@ -362,6 +371,8 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 | R1    | Major #1-фикс: бюджет max_per_cycle считается в items (не в вызовах); списание = len(fresh_batch); B13-резервация согласована; бюджет<0 клампится в 0 |
 | R2    | Major #2-фикс: max_tokens=4096 (ранее 2048); finish_reason=length → LLMError+warning; JSONDecodeError → честный 1 retry (не break); batch_size=1 → evaluate(ok) не падает на finish_reason |
 | M1-INJ | M1-фикс: sanitize_item_field() — санитизация title/summary/source + нейтрализация делимитеров (<\|>/|>) в обоих путях: одиночном (LLMFilter.evaluate) и батчевом (build_batch_user_message) |
+| M1-split | Major-1-фикс: _split_message НЕ переэкранирует (msg уже экранирован); _hard_slice возвращает List[str] (не теряет хвост); граница по > / \\n / пробелу (HTML-сущности целы) |
+| M2-TZ   | Major-2-фикс: TZ в docker-compose — ${TZ:-Europe/Moscow} (читает .env); DEPLOY.md §10 приведён в соответствие (устаревшая «Или в .env»-инструкция удалена) |
 | 2a     | deferred_retention_days: purge deferred по возрасту (3 дня, конфиг); new включён в основной purge; DEFAULT_DEFERRED_RETENTION_DAYS=3 (ранее 14; обоснование: 2 дайджеста/день + запас; критично для VPS 1 GB RAM) |
 | 2b     | recovery_new_limit: K1-recovery ограничен лимитом (500, конфиг); get_all_by_state(state, limit=...) не грузит неограниченный объём в RAM при долгой паузе |
 | 2c     | candidates remainder → increment_retry_count + _check_and_mark_failed (at-least-once для кандидатов; раньше retry_count не инкрементировался при сбое TG API) |
@@ -430,6 +441,8 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
   не реализуется.
 - Риск at-least-once (digest): крэш между отправкой и set_digested →
   item остаётся 'deferred', retry в следующем окне (не потеряется).
+- Покрытие `main()` / shutdown / lock в `__main__.py` отсутствует —
+  регресс демона CI не увидит (осознанный долг).
 - ТГ-каналы нельзя читать Bot API напрямую; путь — свой RSSHub (этап 3).
 - Землетрясения USGS — GeoJSON, отдельный парсер (этап 3).
 - Few-shot: feedback.enabled=1 блокирует few-shot; при disabled — фильтр

@@ -499,6 +499,7 @@ class TestPipelinePausedGate(unittest.TestCase):
             fake_balance.total_balance = 10.0
             fake_balance.currency = "USD"
             fake_filter.get_balance.return_value = fake_balance
+            fake_filter._DEDUP_CHUNK_SIZE = 40  # для budget-чека в _run_llm_dedup
             pipeline.llm_filter = fake_filter
             pipeline.storage = st
 
