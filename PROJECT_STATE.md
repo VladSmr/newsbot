@@ -100,11 +100,11 @@ Retry: `get_stuck_pending()` — 'pending' старше retry_threshold_sec (60 
 `retry_count` INTEGER DEFAULT 0 в БД. При исчерпании retry_count >= max_retries
 → 'failed' (терминальный). Recovery C2: зависшие 'pending' с retry_count
 >= лимитом → 'failed' на старте цикла.
-Purge: 'new' старше 7 дней + delivered/skipped/failed/digested старше retention_days (7 дней).
+Purge: 'new' старше 7 дней + delivered/skipped/failed/digested старше retention_days (1 день).
 'deferred': отдельное окно `deferred_retention_days` (3 дня) — старые неотправленные
 отложенные удаляются (критично для VPS 1 GB RAM; раньше копились бесконечно).
-**Осознанное решение владельца:** retention_days=7 и deferred_retention_days=3
-— старые новости нужны для few-shot, хранилище контролируется purge.
+**Осознанное решение владельца:** retention_days=1 и deferred_retention_days=3
+— хранилище контролируется purge; deferred_retention_days=3 — запас на пропуски дайджестов.
 'pending' — не удаляется (активный retry).
 K1-recovery ограничен `recovery_new_limit` (500) — при долгой паузе 'new' накапливались
 и загружались в RAM целиком.
@@ -282,7 +282,7 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 
 | Что | Решение | Где |
 |-----|---------|-----|
-| Retention: 7 дней (временно), deferred: 3 дня | Временно для отладки, откат одной строкой (было 1) | config.yaml |
+| Retention: 1 день, deferred: 3 дня | Осознанный дефолт; 7 дней было временно для отладки (откат 29.10.2026) | config.yaml |
 | Ночные сводки БПЛА без разрушений | Намеренно получают score 1–3, фильтруются | LLM-скоринг, SYSTEM_PROMPT |
 | Off-peak окна (01–04 и 06–10 UTC будни, выходные целиком) | Соответствуют официальному прайсу DeepSeek от 10.09.2026 | config.yaml, llm/offpeak.py |
 | Summary всегда на английском | Решение владельца: summary ВСЕГДА EN, независимо от языка статьи | newsbot/llm/prompts.py (SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT) |
@@ -441,6 +441,11 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
   не реализуется.
 - Риск at-least-once (digest): крэш между отправкой и set_digested →
   item остаётся 'deferred', retry в следующем окне (не потеряется).
+- Fallback-пуши мимо push-cap: при ok=False и push_urgent_only: false fallback-ветка
+  (pipeline.py ~:2574-2578) кладёт items в to_deliver без лимита — латентно
+  (в prod push_urgent_only: true). Фикс: применять cap в fallback-ветке
+  (over-limit → deferred) + ассерт доставки в test_ok_false_no_crash.
+  Решение владельца: отложено (29.10.2026).
 - Покрытие `main()` / shutdown / lock в `__main__.py` отсутствует —
   регресс демона CI не увидит (осознанный долг).
 - ТГ-каналы нельзя читать Bot API напрямую; путь — свой RSSHub (этап 3).

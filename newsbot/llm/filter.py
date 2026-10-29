@@ -248,6 +248,18 @@ class LLMFilter:
             two_phase_cfg, "phase2_min_score", 4
         )
 
+        # Task 2: dedup_chunk_size из конфига (дефолт 40, валидатор 5..80 в config.py).
+        # Inline range-check: валидатор config.py работает при load_config(),
+        # но при прямом создании LLMFilter с config dict — нужен guard здесь.
+        _raw_chunk = self._parse_int_field(config_llm, "dedup_chunk_size", 40)
+        if not (5 <= _raw_chunk <= 80):
+            logger.warning(
+                "llm.dedup_chunk_size=%r вне диапазона [5..80], используется дефолт 40",
+                _raw_chunk,
+            )
+            _raw_chunk = 40
+        self._DEDUP_CHUNK_SIZE = _raw_chunk
+
         # ── Task 3: cost guard config ────────────────────────────────
         self._pricing: Dict[str, Dict[str, float]] = {}
         pricing_conf = config_llm.get("pricing", {})
@@ -1725,6 +1737,9 @@ class LLMFilter:
     # ── detect_duplicates ─────────────────────────────────────────────────────────
 
     # Порог чанкования: не более 40 кандидатов на один LLM-вызов
+    # Task 2: _DEDUP_CHUNK_SIZE теперь в __init__ из llm.dedup_chunk_size (default 40).
+    # Fallback class attribute — для обратной совместимости с тестами
+    # и кодом, использующим LLMFilter._DEDUP_CHUNK_SIZE напрямую.
     _DEDUP_CHUNK_SIZE = 40
 
     # Major #3-фикс: sanity cap на долю помеченных дублей в одном чанке.
@@ -1817,6 +1832,11 @@ class LLMFilter:
         # Каждый следующий чанк видит ВСЕ результаты предыдущих чанков.
         all_ctx: BuildDedupContext = BuildDedupContext(kept=[], dup=[])
 
+        # Task 1: статистика для агрегатного лога
+        _total_chunks = (len(items) + self._DEDUP_CHUNK_SIZE - 1) // self._DEDUP_CHUNK_SIZE
+        _processed_chunks = 0
+        _skipped_chunks = 0
+
         # Чанкование: не более _DEDUP_CHUNK_SIZE кандидатов на вызов
         for chunk_start in range(0, len(items), self._DEDUP_CHUNK_SIZE):
             chunk = items[chunk_start: chunk_start + self._DEDUP_CHUNK_SIZE]
@@ -1839,31 +1859,177 @@ class LLMFilter:
                 # _check_daily_cost уйдёт в else-ветку, сбросит _fresh, а meta-флаг
                 # уже "1" → WARNING за день не появится ни разу (только DEBUG).
                 self._log_cost_blocked_pending()
+                # Оставшиеся чанки не считаем обработанными (они не пошли в LLM)
+                _skipped_chunks += (_total_chunks - _processed_chunks)
                 break
 
-            user_message = build_dedup_user_message(chunk, recent, ctx=all_ctx)
+            # Task 1: обработка ошибки чанка — retry halves, затем пропуск чанка.
+            # Ошибка одного чанка НЕ прерывает весь проход.
+            _chunk_error: Optional[str] = None
+            raw: Optional[Dict[str, Any]] = None
 
             usage_before = self._usage_totals()
             try:
+                user_message = build_dedup_user_message(chunk, recent, ctx=all_ctx)
                 raw = self._client.chat_json(
                     system=DEDUP_SYSTEM_PROMPT,
                     user=user_message,
                 )
             except LLMError as e:
                 self._record_usage(usage_before)
-                logger.warning(
-                    "LLM-ошибка при дедупликации чанка [%d:%d] из %d items: %s "
-                    "→ прерываем, сохраняем уже найденные дубли (%d шт.)",
-                    chunk_start,
-                    chunk_start + len(chunk),
-                    len(items),
-                    e,
-                    len(all_dup_indices),
-                )
-                # m1-фикс: НЕ сбрасываем all_dup_indices — сохраняем находки
-                # предыдущих чанков. Токены уже списаны, информация не потеряна.
-                break
+                _chunk_error = str(e)
 
+            if _chunk_error is not None:
+                # Task 1: пробуем retry половинами.
+                # NOTE: ПОВТОРНЫЙ вызов _check_daily_cost после успешного вызова
+                # в top-of-loop: безопасен (guard уже списал budget за этот чанк).
+                # Если лимит исчерпался после первого вызова этого чанка —
+                # retry не делаем, сразу пропускаем чанк.
+                _half_tried = 0
+                _half_failed = 0
+                half_dup_indices: Set[int] = set()
+                _half_classified: Set[int] = set()  # abs indices already in all_ctx
+
+                if self._check_daily_cost():
+                    mid = len(chunk) // 2
+                    first_half = chunk[:mid]
+                    second_half = chunk[mid:]
+
+                    # half #1: chunk_offset=0 (parser returns 0-based inside half).
+                    # abs = chunk_start + local_idx (local is 0-based).
+                    if first_half:
+                        h1_usage = self._usage_totals()
+                        _half_tried += 1
+                        try:
+                            h1_raw = self._client.chat_json(
+                                system=DEDUP_SYSTEM_PROMPT,
+                                user=build_dedup_user_message(first_half, recent, ctx=all_ctx),
+                            )
+                        except LLMError:
+                            self._record_usage(h1_usage)
+                            _half_failed += 1
+                        else:
+                            self._record_usage(h1_usage)
+                            h1_parsed = self._parse_dedup_response(h1_raw, len(first_half), 0, recent=recent)
+                            if h1_parsed is not None:
+                                for local_idx in range(len(first_half)):
+                                    abs_idx = chunk_start + local_idx
+                                    item = items[abs_idx]
+                                    if local_idx in h1_parsed:
+                                        half_dup_indices.add(abs_idx)
+                                        all_ctx.dup.append({
+                                            "id": abs_idx,
+                                            "title": item.title,
+                                            "source": getattr(item, "source", ""),
+                                        })
+                                    else:
+                                        all_ctx.kept.append({
+                                            "id": abs_idx,
+                                            "title": item.title,
+                                            "source": getattr(item, "source", ""),
+                                        })
+                                    _half_classified.add(abs_idx)
+                            else:
+                                _half_failed += 1
+
+                    # half #2: chunk_offset=0 (parser returns 0-based inside half).
+                    # abs = chunk_start + len(first_half) + local_idx (local is 0-based).
+                    if second_half:
+                        h2_usage = self._usage_totals()
+                        _half_tried += 1
+                        try:
+                            h2_raw = self._client.chat_json(
+                                system=DEDUP_SYSTEM_PROMPT,
+                                user=build_dedup_user_message(second_half, recent, ctx=all_ctx),
+                            )
+                        except LLMError:
+                            self._record_usage(h2_usage)
+                            _half_failed += 1
+                        else:
+                            self._record_usage(h2_usage)
+                            h2_parsed = self._parse_dedup_response(
+                                h2_raw, len(second_half), 0, recent=recent,
+                            )
+                            if h2_parsed is not None:
+                                for local_idx in range(len(second_half)):
+                                    abs_idx = chunk_start + len(first_half) + local_idx
+                                    item = items[abs_idx]
+                                    if local_idx in h2_parsed:
+                                        half_dup_indices.add(abs_idx)
+                                        all_ctx.dup.append({
+                                            "id": abs_idx,
+                                            "title": item.title,
+                                            "source": getattr(item, "source", ""),
+                                        })
+                                    else:
+                                        all_ctx.kept.append({
+                                            "id": abs_idx,
+                                            "title": item.title,
+                                            "source": getattr(item, "source", ""),
+                                        })
+                                    _half_classified.add(abs_idx)
+                            else:
+                                _half_failed += 1
+
+                # Логируем результат retry. Fix 3: require _half_tried > 0 to
+                # distinguish "all OK" from "retry skipped due to cost (_half_tried=0)".
+                if _half_tried > 0 and _half_failed == 0:
+                    # Все halves прошли (OK или cap-hit без дублей — не failure)
+                    all_dup_indices.update(half_dup_indices)
+                    _processed_chunks += 1
+                    logger.warning(
+                        "LLM-ошибка чанка [%d:%d]: retry halves OK (%d/%d), "
+                        "найдено %d дублей",
+                        chunk_start, chunk_start + len(chunk),
+                        _half_tried, _half_tried,
+                        len(half_dup_indices),
+                    )
+                    continue  # ← CRITICAL: не дать общему циклу дописать повторно
+                elif len(half_dup_indices) > 0:
+                    # Некоторые halves прошли (partial success) — сохраняем что нашли.
+                    # Failed half items are not in _half_classified → add to kept.
+                    # Dup and kept from successful halves already in all_ctx (via
+                    # _half_classified tracking) — skip them to avoid double-append.
+                    all_dup_indices.update(half_dup_indices)
+                    _processed_chunks += 1
+                    for abs_idx in range(chunk_start, chunk_start + len(chunk)):
+                        if abs_idx not in _half_classified:
+                            item = items[abs_idx]
+                            all_ctx.kept.append({
+                                "id": abs_idx,
+                                "title": item.title,
+                                "source": getattr(item, "source", ""),
+                            })
+                    logger.warning(
+                        "LLM-ошибка чанка [%d:%d]: retry halves partial (%d/%d OK, %d failed), "
+                        "найдено %d дублей",
+                        chunk_start, chunk_start + len(chunk),
+                        _half_tried - _half_failed, _half_tried, _half_failed,
+                        len(half_dup_indices),
+                    )
+                    continue  # ← CRITICAL: не дать общему циклу дописать повторно
+                else:
+                    # Все halves упали или retry не делался (лимит) — skip
+                    _skipped_chunks += 1
+                    logger.warning(
+                        "LLM-ошибка чанка [%d:%d] из %d items: %s "
+                        "→ чанк пропущен (retry %d halves, %d failed), "
+                        "сохраняем уже найденные дубли (%d шт.)",
+                        chunk_start,
+                        chunk_start + len(chunk),
+                        len(items),
+                        _chunk_error,
+                        _half_tried,
+                        _half_failed,
+                        len(all_dup_indices),
+                    )
+                    continue  # ← CRITICAL: НЕ break — продолжаем остальные чанки
+                # Task 1: НЕ break — продолжаем со следующего чанка
+                # NOTE: контекст (all_ctx) не обновляется для пропущенного чанка
+                # (не было успешного ответа) — это приемлемый компромисс.
+                continue
+
+            # Успешный ответ — записываем usage
             self._record_usage(usage_before)
 
             # Парсим ответ: {"duplicates": [1, 3, ...]}
@@ -2018,10 +2184,12 @@ class LLMFilter:
                     # CRITICAL-фикс: halves записали в all_ctx напрямую;
                     # пропускаем общий цикл ниже, чтобы не было двойного append.
                     chunk_dup_set = set()
+                    _processed_chunks += 1  # Task 1: успешный чанк (cap-retry ok)
                     continue  # ← CRITICAL: не дать общему циклу дописать items второй раз
             else:
                 all_dup_indices.update(dup_indices)
                 chunk_dup_set = dup_indices  # Set[int] 0-based within full list
+                _processed_chunks += 1  # Task 1: успешный чанк
 
                 # ── Cross-chunk context accumulation ─────────────────────────────────
                 # После успешной обработки чанка накапливаем его результаты
@@ -2068,9 +2236,17 @@ class LLMFilter:
                         # MAJOR 3-фикс: summary/url не выводятся в промпт.
                     })
 
-        logger.debug(
-            "LLM-дедуп: %d/%d кандидатов помечены дубликатами",
-            len(all_dup_indices), len(items),
+        # Task 1: агрегатный лог (один раз за вызов detect_duplicates).
+        # Успешные = всего минус пропущенные (skip при повторном фейле чанка
+        # или break по cost-guard).
+        _successful_chunks = _total_chunks - _skipped_chunks
+
+        _log_level = logging.WARNING if _skipped_chunks > 0 else logging.DEBUG
+        logger.log(
+            _log_level,
+            "LLM-дедуп: обработано %d/%d чанков, пропущено %d (fail-open), "
+            "найдено %d дублей",
+            _successful_chunks, _total_chunks, _skipped_chunks, len(all_dup_indices),
         )
         return all_dup_indices
 

@@ -751,10 +751,10 @@ def filter_new(
     # Таблица seen_titles не меняется в этом цикле — результат стабилен.
     # Один запрос на уникальный exclude_source (а не O(N) запросов).
     _recent_cache: dict = {}
-    # Флаг «выборка упёрлась в лимит» — warning один раз за цикл, не на item.
-    _recent_limit_hit = False
-    # MINOR-3: флаг усечения fuzzy-пула — warning один раз за цикл, не на item.
-    _fuzzy_limit_hit = False
+    # Task 3: счётчик усечений выборки — агрегированный warning один раз за цикл
+    _recent_limit_count = 0
+    # MINOR-3: счётчик усечений fuzzy-пула — агрегированный warning один раз за цикл
+    _fuzzy_limit_count = 0
     # Major-3: кэш предвычисленных токен-сетов кандидатов по source.
     # Major-2: within-cycle seen first-2-tokens по cluster_key_suffix.
     # Строится лениво при первом fuzzy-вызове для каждого source.
@@ -780,7 +780,7 @@ def filter_new(
                     )
                     _recent_cache[src] = rows
                     if max_seen_titles and len(rows) >= max_seen_titles:
-                        _recent_limit_hit = True
+                        _recent_limit_count += 1
 
     # Major#10-фикс: prefetch всех cluster_key для _domain_recent_duplicate.
     # ОДИН запрос вместо N. Ошибка → prefetch=None → fail-open guard (не дубль).
@@ -1004,7 +1004,7 @@ def filter_new(
             filtered, limit_hit = _quick_filter(
                 normalized, recent, precomputed_token_sets=cand_token_sets)
             if limit_hit:
-                _fuzzy_limit_hit = True
+                _fuzzy_limit_count += 1
             # Предвычисляем nums и meaningful для item (один раз за item).
             item_nums = _number_multiset(normalized)
             for _, cand_norm, *_ in filtered:
@@ -1028,17 +1028,17 @@ def filter_new(
 
         new_items.append(item)
 
-    if _recent_limit_hit:
+    if _recent_limit_count > 0:
         logger.warning(
-            "Выборка дедупа усечена лимитом: проверено не более %d заголовков "
-            "за окно (dedup.max_seen_titles; 0 = без лимита)",
-            max_seen_titles,
+            "Выборка дедупа усечена лимитом %d: %d раз за цикл "
+            "(проверено не более %d заголовков за окно; 0 = без лимита)",
+            max_seen_titles, _recent_limit_count, max_seen_titles,
         )
-    if _fuzzy_limit_hit:
+    if _fuzzy_limit_count > 0:
         logger.warning(
-            "Fuzzy-пул усечён: лимит %d кандидатов. "
+            "Fuzzy-пул усечён: лимит %d кандидатов, %d раз за цикл. "
             "Увеличьте dedup.max_seen_titles для полного покрытия.",
-            MAX_FUZZY_CANDIDATES,
+            MAX_FUZZY_CANDIDATES, _fuzzy_limit_count,
         )
     if cross_source_skipped:
         logger.info("Дедуп: отфильтровано %d cross-source дублей", cross_source_skipped)

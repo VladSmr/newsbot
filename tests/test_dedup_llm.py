@@ -2,10 +2,12 @@
 Тесты LLM-дедупликации: семантическая группировка «одно событие».
 Запускать: python -m pytest tests/test_dedup_llm.py -v
 """
+import logging
 import os
 import sys
 import tempfile
 import unittest
+import pytest
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -237,33 +239,34 @@ class TestDetectDuplicatesParse(unittest.TestCase):
         items = [_mk_item(title=str(i), url=f"u{i}") for i in range(5)]
         result = flt.detect_duplicates(items, [])
         self.assertEqual(result, {1, 2})
-
     def test_llm_error_preserves_previous_chunks(self):
         """
-        m1-фикс: LLMError во 2-м чанке сохраняет дубли 1-го чанка.
-        Без фикса: return set() терял все находки предыдущих чанков.
+        m1-fix: LLMError in 2nd chunk preserves 1st chunk dups.
+        Task 1: LLMError triggers retry halves; all halves fail -> chunk skipped.
         """
         from newsbot.llm.client import LLMError
 
-        # chunk 1 (items 0-39, offset=0): возвращает дубли
-        # chunk 2 (items 40-49, offset=40): LLMError
+        # chunk 1: idx=2 -> 0-based=1
+        # chunk 2: LLMError -> retry halves (both fail)
         mock_client = MagicMock()
         mock_client.chat_json.side_effect = [
-            {"duplicates": [2]},       # chunk 1: idx=2 → 0-based=1
-            LLMError("fake LLM error in chunk 2"),
+            {"duplicates": [2]},         # chunk 1 ok
+            LLMError("fake LLM error in chunk 2"),   # chunk 2 fail
+            LLMError("half 1 fail"),      # half-retry 1 fail
+            LLMError("half 2 fail"),      # half-retry 2 fail
         ]
         flt = self._make_filter(mock_client)
 
-        # 50 items = 2 чанка (40 + 10)
+        # 50 items = 2 chunks (40 + 10)
         items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(50)]
         result = flt.detect_duplicates(items, [])
 
-        # Дубли первого чанка должны быть сохранены
-        self.assertIn(1, result, "Дубль первого чанка должен быть сохранён")
-        # Второй чанк не добавил ничего (LLMError), но и не сломал первое
-        self.assertEqual(result, {1}, "Только дубли первого чанка")
-        self.assertEqual(mock_client.chat_json.call_count, 2,
-                         "Должно быть ровно 2 вызова (по одному на чанк)")
+        # Dup from chunk 1 must be preserved
+        self.assertIn(1, result, "Chunk 1 dup must be saved")
+        # Chunk 2 skipped (retry halves failed)
+        self.assertEqual(result, {1}, "Only chunk 1 dups")
+        self.assertEqual(mock_client.chat_json.call_count, 4,
+                         "4 calls: chunk1 + chunk2-fail + 2 halves-fail")
 
     def test_llm_error_in_first_chunk_returns_empty(self):
         """
@@ -1300,8 +1303,222 @@ class TestCrossChunkDedup(unittest.TestCase):
             self.assertEqual(len(result), 0, "No duplicates expected")
 
 
+class TestTask1ChunkErrorResilience(unittest.TestCase):
+    """Task 1: отказоустойчивость чанка — ошибка одного чанка не прерывает весь проход."""
+
+    def _make_filter(self, mock_client) -> "LLMFilter":
+        """Creates LLMFilter with provided mock client."""
+        cfg = {
+            "enabled": True, "api_key": "test-key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+        }
+        return LLMFilter(cfg, client=mock_client)
+
+    def test_chunk2_fails_retry_halves_ok_others_processed(self):
+        """Task 1a: chunk 1 of 2 fails, retry halves partially OK, chunk 2 processed."""
+        # 50 items = 2 chunks (chunk_size=40). chunk 1 (items 0-39) fails -> retry.
+        # half 1 (items 0-19) ok: idx=2 (1-based) -> item index 1 (0-based).
+        # half 2 (items 20-39) fail.
+        # chunk 2 (items 40-49) ok.
+        mock_client = MagicMock()
+        mock_client.chat_json.side_effect = [
+            LLMError("empty content"),   # chunk 1 fail
+            {"duplicates": [2]},         # half 1 ok: idx=2->abs_idx=2
+            LLMError("content"),        # half 2 fail
+            {"duplicates": [2]},         # chunk 2 ok
+        ]
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(50)]
+        result = flt.detect_duplicates(items, [])
+        # Dup from half-retry: idx=2 (1-based) -> abs_idx = chunk_offset(0) + (2-1) = 1
+        self.assertIn(1, result, "Dup from half-retry: idx=2 -> abs_idx=chunk_offset+idx-1=0+2-1=1")
+        self.assertEqual(mock_client.chat_json.call_count, 4,
+                         "4 calls: chunk1-fail + 2 halves + chunk2-ok")
+
+    def test_chunk_fails_both_halves_fail_skip_continue(self):
+        """Task 1b: retry halves both fail, chunk skipped, others processed."""
+        mock_client = MagicMock()
+        # 8 items, chunk fails -> both halves fail
+        mock_client.chat_json.side_effect = [
+            LLMError("content"),  # chunk fail
+            LLMError("content"),  # half 1 fail
+            LLMError("content"),  # half 2 fail
+        ]
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(8)]
+        result = flt.detect_duplicates(items, [])
+        self.assertEqual(result, set(), "No dups when all calls fail")
+        self.assertEqual(mock_client.chat_json.call_count, 3)
+
+    def test_cost_limit_between_chunks_skips_remaining(self):
+        """Task 1c: cost guard blocks 2nd chunk, 1st chunk processed."""
+        class _BudgetExhaustedFilter(LLMFilter):
+            def _check_daily_cost(self):
+                if not hasattr(self, "_cost_call_count"):
+                    self._cost_call_count = 0
+                self._cost_call_count += 1
+                # Allow: initial(1) + before chunk1(2). Block chunk2(3)
+                return self._cost_call_count <= 2
+
+        mock_client = MagicMock()
+        mock_client.chat_json.return_value = {"duplicates": []}
+
+        cfg = {
+            "enabled": True, "api_key": "key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+        }
+        # 50 items -> 2 chunks with default chunk_size=40
+        flt = _BudgetExhaustedFilter(cfg, client=mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(50)]
+        result = flt.detect_duplicates(items, [])
+        # Only chunk 1 (cost guard blocks before chunk 2's LLM call)
+        self.assertEqual(mock_client.chat_json.call_count, 1)
+        self.assertEqual(len(result), 0)
+
+    def test_half2_returns_dup_at_correct_index(self):
+        """Fix 1: half-2 dup index must map to correct absolute index.
+
+        50 items: chunk1 (0-39) fails -> half1 ok no dups, half2 ok with dup idx=3.
+        8 items: chunk (0-7) fails -> half1 ok no dups, half2 ok with dup idx=3.
+        abs = chunk_start + mid + (3-1) = 0 + 4 + 2 = 6.
+        """
+        mock_client = MagicMock()
+        # 8 items -> chunk size 40 -> single chunk
+        # chunk fails, half1 ok no dups, half2 ok with dup at local idx=3 (1-based=4)
+        mock_client.chat_json.side_effect = [
+            LLMError("content"),           # chunk fail
+            {"duplicates": []},            # half 1 ok, no dups
+            {"duplicates": [4]},          # half 2 ok, dup at idx=4 (1-based) -> abs=0+4+(4-1)=7
+        ]
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(8)]
+        result = flt.detect_duplicates(items, [])
+        # idx=4 (1-based) -> abs = chunk_start(0) + mid(4) + (4-1) = 7
+        self.assertIn(7, result, "Dup from half2: idx=4 -> abs=0+4+3=7")
+        self.assertNotIn(5, result, "Half2 dup must not map to wrong index 5")
+
+    def test_half1_ok_half2_ok_with_dup(self):
+        """Both halves return a dup each, at correct absolute indices."""
+        mock_client = MagicMock()
+        # 8 items: chunk fails -> half1 ok with dup at idx=2, half2 ok with dup at idx=3
+        mock_client.chat_json.side_effect = [
+            LLMError("content"),           # chunk fail
+            {"duplicates": [2]},            # half1: idx=2(1-based)->abs=0+(2-1)=1
+            {"duplicates": [3]},            # half2: idx=3(1-based)->abs=0+4+(3-1)=6
+        ]
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(8)]
+        result = flt.detect_duplicates(items, [])
+        self.assertIn(1, result, "Half1 dup: idx=2 -> abs=1")
+        self.assertIn(6, result, "Half2 dup: idx=3 -> abs=6")
+        self.assertEqual(len(result), 2)
+
+    def test_partial_half_no_double_append(self):
+        """Partial: half-1 OK (no dups), half-2 fail → kept must have half-1 once."""
+        import newsbot.llm.filter as filter_mod
+        saved_messages = []
+        _orig_build = filter_mod.build_dedup_user_message
+
+        def _capture(*args, **kwargs):
+            saved_messages.append((args, kwargs))
+            return _orig_build(*args, **kwargs)
+
+        mock_client = MagicMock()
+        # 50 items → 2 chunks. Chunk1 partial: half1 ok WITH dup, half2 fail.
+        # half_dup_indices non-empty → partial-ветка исполняется.
+        # Chunk2 uses ctx from chunk1.
+        mock_client.chat_json.side_effect = [
+            LLMError("content"),           # chunk1 fail
+            {"duplicates": [2]},           # half1: ok, dup idx=2(1-based)->abs=1
+            LLMError("content"),            # half2: fail → partial
+            {"duplicates": []},            # chunk2: ctx must have half-1 items once
+        ]
+
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(50)]
+
+        with patch.object(filter_mod, "build_dedup_user_message", _capture):
+            result = flt.detect_duplicates(items, [])
+
+        # Partial-сохранение: dup из half-1 сохраняется.
+        self.assertIn(1, result, "Dup from half1: idx=2(1-based)->abs=1")
+        self.assertEqual(len(saved_messages), 4, "4 LLM calls: chunk1 + 2 halves + chunk2")
+
+        # Last call = chunk2 → extract ctx from kwargs
+        last_ctx = saved_messages[-1][1]["ctx"]
+        kept_ids = [e["id"] for e in last_ctx.kept]
+        # half-1 items kept (0,2-19) appear ONCE each in kept (main anti-double-check)
+        self.assertEqual(kept_ids.count(0), 1, "Item0 appears once in kept")
+        self.assertEqual(kept_ids.count(2), 1, "Item2 appears once in kept (kept from half1)")
+        self.assertEqual(kept_ids.count(19), 1, "Item19 appears once in kept")
+        # Item1 is a dup from half1 → must NOT be in kept
+        self.assertNotIn(1, kept_ids, "Item1 (dup from half1) not in kept")
+        # Item21 is in chunk0 half-2 (failed): 20..39 → correctly goes to kept.
+        # Chunk0 covered indices 0-39; chunk1 (40-49) kept after 4th call.
+        # Total kept: 39 from chunk0 (0-39 minus 1) + 10 from chunk1 = 49 items.
+        # Chunk0 kept: all items 0-39 except 1 (dup from half1).
+        # Chunk1 kept: all items 40-49 (no dups in 4th call).
+        self.assertIn(21, kept_ids, "Item21 is in chunk0 half-2 (failed) → kept")
+
+
+
+
+class TestTask2DedupChunkSizeConfig(unittest.TestCase):
+    """Task 2: dedup_chunk_size из конфига."""
+
+    def _filter_with_chunk_size(self, chunk_size):
+        cfg = {
+            "enabled": True, "api_key": "test-key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+            "dedup_chunk_size": chunk_size,
+        }
+        mock_client = MagicMock()
+        mock_client.chat_json.return_value = {"duplicates": []}
+        return LLMFilter(cfg, client=mock_client)
+
+    def test_dedup_chunk_size_from_config(self):
+        """dedup_chunk_size=20 в конфиге → 80 items = 4 чанка (не 2)."""
+        mock_client = MagicMock()
+        mock_client.chat_json.return_value = {"duplicates": []}
+        cfg = {
+            "enabled": True, "api_key": "test-key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+            "dedup_chunk_size": 20,
+        }
+        flt = LLMFilter(cfg, client=mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(80)]
+        result = flt.detect_duplicates(items, [])
+        self.assertEqual(mock_client.chat_json.call_count, 4,
+                         "80 items / 20 per chunk = 4 вызова, не 2")
+        self.assertEqual(flt._DEDUP_CHUNK_SIZE, 20)
+
+    def test_default_chunk_size_is_40(self):
+        """Без dedup_chunk_size в конфиге — дефолт 40."""
+        cfg = {
+            "enabled": True, "api_key": "test-key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+            # dedup_chunk_size НЕ задан
+        }
+        mock_client = MagicMock()
+        mock_client.chat_json.return_value = {"duplicates": []}
+        flt = LLMFilter(cfg, client=mock_client)
+        self.assertEqual(flt._DEDUP_CHUNK_SIZE, 40)
+
+    def test_invalid_chunk_size_falls_back_to_40(self):
+        """dedup_chunk_size=999 → валидатор отклоняет, дефолт 40."""
+        cfg = {
+            "enabled": True, "api_key": "test-key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+            "dedup_chunk_size": 999,  # вне диапазона 5..80
+        }
+        mock_client = MagicMock()
+        mock_client.chat_json.return_value = {"duplicates": []}
+        flt = LLMFilter(cfg, client=mock_client)
+        self.assertEqual(flt._DEDUP_CHUNK_SIZE, 40)
+
+
 class TestBuildDedupContextMessage(unittest.TestCase):
-    """Тесты построения кросс-чанкового контекста."""
+    """Тесты построения кросс-канкового контекста."""
 
     def test_empty_context_returns_empty_string(self):
         """Пустой контекст — пустая строка."""
@@ -1638,3 +1855,57 @@ class TestBuildDedupContextMessage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# =============================================================================
+# pytest-native functions (caplog fixture works here, not in unittest.TestCase)
+# =============================================================================
+import pytest
+
+
+def _make_pytest_filter(mock_client):
+    """Creates LLMFilter for pytest-native tests."""
+    cfg = {
+        "enabled": True, "api_key": "test-key", "model": "deepseek-flash",
+        "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+    }
+    return LLMFilter(cfg, client=mock_client)
+
+
+def _mk_pytest_item(title, url=None):
+    """Quick NewsItem factory for pytest functions."""
+    if url is None:
+        url = f"https://example.com/{hash(title) & 0xFFFF:05d}"
+    return NewsItem(
+        source="TestSrc",
+        url=url,
+        title=title,
+        summary="summary",
+        published="01.01.2025 12:00 UTC",
+        published_parsed=None,
+    )
+
+
+def test_llm_aggregate_log_one_warning_per_cycle(caplog):
+    """Task 1d: multiple skipped chunks -> exactly 1 aggregate WARNING (pytest-native)."""
+    mock_client = MagicMock()
+    # 80 items = 2 chunks. chunk 2 fails -> retry halves both fail -> skipped
+    mock_client.chat_json.side_effect = [
+        {"duplicates": []},          # chunk 1 ok
+        LLMError("fail"),            # chunk 2 fail
+        LLMError("fail"),            # half 1 fail
+        LLMError("fail"),            # half 2 fail
+    ]
+    flt = _make_pytest_filter(mock_client)
+    items = [_mk_pytest_item(f"Item {i}", f"u{i}") for i in range(80)]
+    with caplog.at_level(logging.WARNING):
+        result = flt.detect_duplicates(items, [])
+    chunk_warnings = [
+        r for r in caplog.records
+        if r.getMessage().startswith("LLM-\u0434\u0435\u0434\u0443\u043f:") and "\u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d" in r.getMessage()
+    ]
+    assert len(chunk_warnings) == 1, (
+        f"Expected 1 aggregate WARNING, got {len(chunk_warnings)}: "
+        f"{[r.getMessage() for r in chunk_warnings]}"
+    )
+
+

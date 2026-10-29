@@ -7,6 +7,8 @@ import re
 import tempfile
 import time
 import unittest
+import logging
+import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2136,3 +2138,63 @@ class TestContainmentDedupIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+# =============================================================================
+# pytest-native functions (caplog fixture works here, not in unittest.TestCase)
+# =============================================================================
+import pytest
+from newsbot.dedup import filter_new
+
+
+def test_dedup_aggregate_recent_limit_warning(caplog, tmp_path):
+    """Task 3: 1 WARNING about recent-limit truncation per filter_new call."""
+    from datetime import datetime, timezone, timedelta
+    from newsbot.storage import Storage
+    from newsbot.collector import NewsItem
+
+    path = str(tmp_path / "test.db")
+    cfg = {
+        "cross_source": True, "fuzzy": False,
+        "window_days": 3, "max_seen_titles": 2,
+    }
+    st = Storage(path, dedup_config=cfg)
+
+    # Use recent dates so rows are within window_days=3 (filtered by fetched_at).
+    now = datetime.now(timezone.utc)
+    recent_pub = (now - timedelta(days=1)).strftime("%d.%m.%Y %H:%M UTC")
+
+    # Prefetch counter increments when get_recent_normalized_titles(exclude_source=src)
+    # returns >= max_seen_titles rows. Since all saved items are from one source (Lenta),
+    # we need OTHER sources to populate the cache — otherwise exclude_source="Lenta"
+    # finds nothing and the counter stays 0.
+    other_sources = ["Meduza", "Kommersant"]
+    for i in range(10):
+        src = other_sources[i % len(other_sources)]
+        item = NewsItem(
+            source=src, url=f"https://{src.lower()}.ru/{i}",
+            title=f"News {i}", summary="sum",
+            published=recent_pub, published_parsed=None,
+        )
+        st.save(item)
+
+    # Candidate from Lenta — after prefetch, _recent_cache["Lenta"] will have
+    # 0 rows from itself but >=max_seen_titles from other sources (Meduza+Kommersant).
+    candidate = NewsItem(
+        source="Lenta", url="https://lenta.ru/new",
+        title="New news from Lenta", summary="sum",
+        published=recent_pub, published_parsed=None,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        filter_new([candidate], st, dedup_config=cfg)
+
+    limit_warnings = [
+        r for r in caplog.records
+        if "Выборка дедупа усечена" in r.getMessage()
+    ]
+    assert len(limit_warnings) == 1, (
+        f"Expected 1 WARNING about truncation, got {len(limit_warnings)}: "
+        f"{[r.getMessage() for r in limit_warnings]}"
+    )
+    st.close()
+

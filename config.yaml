@@ -123,7 +123,7 @@ poll_interval_minutes: 120
 # --- База данных ---
 database:
   path: data/newsbot.db
-  retention_days: 7        # временно для отладки, откат одной строкой (было 1)
+  retention_days: 1            # срок хранения processed/delivered/failed-items (сутки)
   retry_threshold_sec: 60 # pending считается зависшим через N секунд
   max_retries: 8           # лимит retry попыток → state=failed
   deferred_retention_days: 3  # удалять старые deferred-items старше N дней (не попали в digest).
@@ -235,6 +235,7 @@ llm:
   #   межъязыковых дублей, разных формулировок чисел.
   #   При сбое LLM — безопасный пропуск (безопасно: ни один дубль не проходит).
   llm_dedup: true
+  # dedup_chunk_size: 20  # если дедуп падает по пустому ответу (LLMError "Пустой content") — уменьшить с 40 до 20
   base_url: https://api.deepseek.com
   model: deepseek-flash          # ⚠️ проверить id живым ключом: python -m newsbot --check-llm
                                   #   При 4xx/404 — fallback (все новости без фильтра).
@@ -250,6 +251,9 @@ llm:
   push_urgent_only: true           # пуш ТОЛЬКО срочные (urgent=true, score>=7); остальное → дайджест
                                    # ВАЖНО: при отсутствии ключа в конфиге — warning + дефолт True (urgent-only).
                                    # Legacy-поведение (все push) → явно задайте push_urgent_only: false.
+  # max_pushes_per_cycle: лимит urgent-pushей за цикл; всё сверх лимита уходит в дайджест.
+  #   0 = без лимита (обратно-совместимо). Пример: 3 пуша за цикл при частых срочных.
+  max_pushes_per_cycle: 3
   balance:
     enabled: true
     threshold: 2.0
@@ -257,13 +261,10 @@ llm:
   max_per_cycle: 250            # макс. LLM-оценок (items) на цикл (12 слотов/сут × 250 = 3000 — покрывает поток при 2-часовом цикле)
   max_tokens: 4608             # лимит completion tokens (v15: title_en +25-50 токенов/item × 10 = +250-500; поднят с 4096)
   batch_size: 10              # оценка ≤10 новостей одним LLM-вызовом (1=поштучно)
-  # off_peak_only: ограничить LLM-вызовы непиковыми часами DeepSeek (×0.5).
-  #   По умолчанию false (текущее поведение — без ограничений).
-  #   Пиковые часы UTC (Пн–Пт): 01:00–03:59 и 06:00–09:59.
-  #   MSK (UTC+3): 04:00–06:59 и 09:00–12:59, Пн–Пт.
-  #   В пик новые новости остаются pending, доставляются в off-peak.
-  #   Китайские гос. праздники НЕ учитываются (консервативно = пик).
-  # off_peak_only: false
+  # Пиковые часы DeepSeek (будни МСК): 04:00–06:59 и 09:00–12:59.
+  # LLM-вызовы блокируются; RSS-слоты (04:30/06:30/10:30/12:30) работают без скоринга.
+  # Выходные — без пика, LLM вызывается свободно.
+  off_peak_only: true
   # summary_max_chars: макс. длина summary в символах (от LLM-фильтра).
   #   Ограничивает output-токены и снижает стоимость.
   summary_max_chars: 240

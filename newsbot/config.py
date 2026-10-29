@@ -115,8 +115,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "off_peak_only": False,
         "batch_size": 10,
         "max_tokens": 4608,  # v15: title_en +25-50 токенов/item × 10 batch = +250-500; поднят с 4096
+        "dedup_chunk_size": 40,  # Task 2: размер чанка для LLM-дедупа (5..80); уменьшить если падает по пустому ответу
         "llm_dedup": True,
         "push_urgent_only": True,
+        "max_pushes_per_cycle": 0,  # Push-cap: лимит urgent-pushей за цикл (0=без лимита)
         # Pricing: USD per 1M tokens (DeepSeek-V4.1-Flash, verified from official price page, effective 10.09.2026)
         # NOTE: структура flat {input, output} — peak/off-peak не поддерживается cost-guard'ом filter.py.
         # deepseek-v4-pro: цена не верифицирована (прайс-картинка покрывает только Flash).
@@ -316,6 +318,10 @@ def _validate_llm_numeric_fields(cfg: Dict[str, Any]) -> None:
         (("daily_cost_limit",), float, 0, 100000),
         (("batch_size",), int, 1, 1000),
         (("max_per_cycle",), int, 0, 100000),
+        # Task 2: валидатор dedup_chunk_size
+        (("dedup_chunk_size",), int, 5, 80),
+        # Push-cap: лимит urgent-pushей за цикл (0=без лимита)
+        (("max_pushes_per_cycle",), int, 0, 50),
         (("balance", "threshold"), float, 0, 1e9),
         (("balance", "check_interval_hours"), int, 1, 8760),
     )

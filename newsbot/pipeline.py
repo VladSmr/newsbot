@@ -1808,6 +1808,11 @@ class NewsPipeline:
                 if usage_stats is not None:
                     usage_stats.reset()
 
+        # Push-cap: счётчик на весь цикл (суммарно по всем _process_batch).
+        # Сбрасывается в начале каждого цикла. Список [count] — shared ref
+        # через все вызовы _process_batch → _apply_result.
+        self._push_count_ref: List[int] = [0]
+
         collector = FeedCollector(self.sources)
 
         # ── K1: подхватываем 'new'-items из прошлого цикла (recovery) ──
@@ -2023,7 +2028,8 @@ class NewsPipeline:
                     self._llm_calls_left, self._max_per_cycle,
                 )
                 failed_retry_scored = self._process_batch(
-                    stuck_scored, budget_override=len(stuck_scored)
+                    stuck_scored, budget_override=len(stuck_scored),
+                    push_count_ref=self._push_count_ref,
                 )
                 if failed_retry_scored:
                     self.storage.increment_retry_count(failed_retry_scored)
@@ -2046,7 +2052,10 @@ class NewsPipeline:
                         "B13: retry fresh %d items — бюджет %d/%d",
                         len(stuck_fresh), retry_budget, self._llm_calls_left,
                     )
-                failed_retry_fresh = self._process_batch(stuck_fresh, budget_override=retry_budget)
+                failed_retry_fresh = self._process_batch(
+                    stuck_fresh, budget_override=retry_budget,
+                    push_count_ref=self._push_count_ref,
+                )
                 if failed_retry_fresh:
                     self.storage.increment_retry_count(failed_retry_fresh)
                     self._check_and_mark_failed(failed_retry_fresh)
@@ -2069,7 +2078,8 @@ class NewsPipeline:
             # инкрементируют retry_count и терминализируются при исчерпании лимита.
             # Это распространяет at-least-once на candidates, а не только на retry-очередь.
             failed_candidate_urls = self._process_batch(
-                all_items, budget_override=remaining_budget
+                all_items, budget_override=remaining_budget,
+                push_count_ref=self._push_count_ref,
             )
             if failed_candidate_urls:
                 self.storage.increment_retry_count(failed_candidate_urls)
@@ -2090,6 +2100,7 @@ class NewsPipeline:
         self,
         items: List[NewsItem],
         budget_override: Optional[int] = None,
+        push_count_ref: Optional[List[int]] = None,
     ) -> List[str]:
         """
         new/pending → pending → LLM-фильтр (если активен) → route →
@@ -2104,6 +2115,8 @@ class NewsPipeline:
             items: список NewsItem для обработки
             budget_override: если указано — использовать этот бюджет вместо
                              остатка общего счётчика (для retry с резервацией).
+            push_count_ref: shared cycle-level push counter [count] (Mutable).
+                            If max_pushes_per_cycle > 0 and count >= limit → overflow → deferred.
 
         Бюджет (max_per_cycle):
             — Единица учёта: **items** (НЕ LLM-вызовы).
@@ -2137,6 +2150,10 @@ class NewsPipeline:
             push_th = self.llm_filter.push_threshold
             digest_th = self.llm_filter.digest_threshold
             push_urgent_only = self.llm_filter.push_urgent_only
+            max_pushes_per_cycle: int = _coerce_int(
+                self.config.get("llm", {}).get("max_pushes_per_cycle"), 0,
+                "llm.max_pushes_per_cycle",
+            )
             # Major-3: prefilter выполняется в run_cycle_with_delivery ДО _run_llm_dedup.
             # Здесь — только маршрутизация и сохранение результатов.
 
@@ -2276,13 +2293,90 @@ class NewsPipeline:
                             res.score = int(best_score)
 
             # ── теперь route(): применяем результаты ко ВСЕМ items ──────────
-            for item in items_to_llm:
-                res = getattr(item, "_batch_result", None)
-                if res is None:
-                    continue
-                self._apply_result(item, res, push_th, digest_th,
-                                   push_urgent_only, skipped_urls, deferred_urls,
-                                   to_deliver, llm_batch_records)
+            # push_cap: накапливаем push-eligible items, сортируем по score desc,
+            # fetched_at asc (детерминированный порядок отбора), применяем лимит.
+            # Top-N → push, остаток → deferred. При push_count_ref=None — штатный путь.
+            _n_overflow: int = 0  # сверх-лимитные push-eligible items (для лога)
+            if push_count_ref is not None:
+                _push_eligible: List[tuple] = []  # (item, res, fetched_at)
+                _pushed_urls: Set[str] = set()   # отслеживаем обработанные push-items
+                for item in items_to_llm:
+                    res = getattr(item, "_batch_result", None)
+                    if res is None:
+                        continue
+                    # Critical: route() требует int score, ok=False даёт score=None → TypeError.
+                    # Штатно ok=False обрабатывается ВНУТРИ _apply_result — вызываем напрямую.
+                    # ok=False НЕ считается push → НЕ передаём ref (не инкрементируем счётчик).
+                    if not res.ok:
+                        self._apply_result(item, res, push_th, digest_th,
+                                          push_urgent_only, skipped_urls, deferred_urls,
+                                          to_deliver, llm_batch_records)
+                        continue
+                    # предварительная route — проверяем только push/digest/skip
+                    r = route(res.score, push_th, digest_th,
+                              urgent=res.urgent, push_urgent_only=push_urgent_only)
+                    if r == "push":
+                        # Fix 3: fetched_at может быть datetime или str — нормализуем в str
+                        _fetched_at = getattr(item, "fetched_at", None)
+                        if _fetched_at is None:
+                            _fetched_at = ""
+                        else:
+                            # datetime → iso-строка для консистентного сравнения
+                            _fetched_at = _fetched_at.isoformat() if hasattr(
+                                _fetched_at, "isoformat"
+                            ) else str(_fetched_at)
+                        _push_eligible.append((item, res, _fetched_at))
+                        item._batch_result = res  # уже установлен
+                # Fix 5: сортировка только при активном cap (> 0)
+                if max_pushes_per_cycle > 0:
+                    # Сортировка: score desc (newer higher), при равном score —
+                    # fetched_at asc (старые раньше). Детерминированный порядок отбора.
+                    _push_eligible.sort(key=lambda x: (-(x[1].score or 0), x[2]))
+                for _idx, (_item, _res, _fa) in enumerate(_push_eligible):
+                    _is_overflow = max_pushes_per_cycle > 0 and push_count_ref[0] >= max_pushes_per_cycle
+                    if _is_overflow:
+                        _n_overflow += 1
+                    # force_deferred=True → _apply_result отправляет в deferred без counter check
+                    self._apply_result(_item, _res, push_th, digest_th,
+                                       push_urgent_only, skipped_urls, deferred_urls,
+                                       to_deliver, llm_batch_records,
+                                       push_count_ref=push_count_ref,
+                                       max_pushes_per_cycle=max_pushes_per_cycle,
+                                       force_deferred=_is_overflow)
+                    # counter инкрементируется ВНУТРИ _apply_result (когда not force_deferred)
+                    _pushed_urls.add(_item.url)
+                # Не-push items (digest/skip) — штатно, с тем же ref (счётчик не меняется)
+                # Skip items already processed in the push-eligible loop above
+                for item in items_to_llm:
+                    res = getattr(item, "_batch_result", None)
+                    if res is None:
+                        continue
+                    if item.url in _pushed_urls:
+                        continue
+                    if not res.ok:
+                        # ok=False: штатная обработка, вызываем напрямую (route НЕ нужен).
+                        # ok=False НЕ считается push → без ref чтобы не инкрементировать счётчик.
+                        self._apply_result(item, res, push_th, digest_th,
+                                          push_urgent_only, skipped_urls, deferred_urls,
+                                          to_deliver, llm_batch_records)
+                        continue
+                    r = route(res.score, push_th, digest_th,
+                              urgent=res.urgent, push_urgent_only=push_urgent_only)
+                    if r != "push":
+                        self._apply_result(item, res, push_th, digest_th,
+                                          push_urgent_only, skipped_urls, deferred_urls,
+                                          to_deliver, llm_batch_records,
+                                          push_count_ref=push_count_ref,
+                                          max_pushes_per_cycle=max_pushes_per_cycle)
+            else:
+                # Без ref — штатная обработка (без push-cap)
+                for item in items_to_llm:
+                    res = getattr(item, "_batch_result", None)
+                    if res is None:
+                        continue
+                    self._apply_result(item, res, push_th, digest_th,
+                                       push_urgent_only, skipped_urls, deferred_urls,
+                                       to_deliver, llm_batch_records)
 
             # сохраняем все llm-результаты батчем (push + deferred + skipped)
             # Per-record изоляция: возвращается список успешно обновлённых URL.
@@ -2307,10 +2401,17 @@ class NewsPipeline:
                 self.storage.set_state(actually_deferred, "deferred")
 
             mode_tag = " [urgent-only]" if push_urgent_only else ""
-            logger.info(
-                "Маршрутизация%s: push=%d deferred=%d skipped=%d",
-                mode_tag, n_push, n_deferred, n_skipped,
-            )
+            # overflow-log: только когда cap активен (max>0) и ref есть
+            if max_pushes_per_cycle > 0 and push_count_ref is not None and _n_overflow > 0:
+                logger.info(
+                    "Маршрутизация%s: push=%d deferred=%d skipped=%d [%d push сверх лимита %d → дайджест]",
+                    mode_tag, n_push, n_deferred, n_skipped, _n_overflow, max_pushes_per_cycle,
+                )
+            else:
+                logger.info(
+                    "Маршрутизация%s: push=%d deferred=%d skipped=%d",
+                    mode_tag, n_push, n_deferred, n_skipped,
+                )
             # Major-3: prefilter-статистика логируется в run_cycle_with_delivery
             # (до LLM-дедупа). Здесь только маршрутизация и LLM-результаты.
 
@@ -2439,6 +2540,9 @@ class NewsPipeline:
         deferred_urls: Set[str],
         to_deliver: List["NewsItem"],
         llm_batch_records: List[dict],
+        push_count_ref: Optional[List[int]] = None,
+        max_pushes_per_cycle: int = 0,
+        force_deferred: bool = False,
     ) -> None:
         """
         Применяет FilterResult к одному item: маршрутизация + сбор record.
@@ -2510,8 +2614,25 @@ class NewsPipeline:
             deferred_urls.add(item.url)
         else:
             # r == "push"
-            to_deliver.append(item)
-            item._feedback_kind = "push"  # type: ignore[attr-defined]
+            # Push-cap: если лимит достигнут и это не принудительный deferred →
+            # принудительно уводим overflow в дайджест.
+            if force_deferred:
+                deferred_urls.add(item.url)
+            else:
+                _ok_to_push = True
+                if max_pushes_per_cycle > 0 and push_count_ref is not None:
+                    # Cap active: проверяем и инкрементируем
+                    if push_count_ref[0] >= max_pushes_per_cycle:
+                        deferred_urls.add(item.url)
+                        _ok_to_push = False
+                    else:
+                        push_count_ref[0] += 1
+                elif push_count_ref is not None:
+                    # Unlimited (cap=0): считаем pushи (для отладки/тестов)
+                    push_count_ref[0] += 1
+                if _ok_to_push:
+                    to_deliver.append(item)
+                    item._feedback_kind = "push"  # type: ignore[attr-defined]
         llm_batch_records.append(record)
 
     def _check_and_mark_failed(self, failed_retry_urls: List[str]) -> None:
