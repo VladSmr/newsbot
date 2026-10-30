@@ -399,6 +399,24 @@ class Storage:
         conn.execute("PRAGMA user_version = %d" % self.SCHEMA_VERSION)
         conn.commit()
 
+        # FIX 6: verify critical indexes exist after _create_indexes.
+        # _create_indexes глотает OperationalError/IntegrityError → PRAGMA
+        # user_version ставится БЕЗУСЛОВНО. Если критический индекс не создан,
+        # все последующие старты делают ранний return (:741) → UNIQUE-дедуп
+        # по url_norm потерян навсегда.
+        # Проверяем ПОСЛЕ PRAGMA commit — гарантированно достигается,
+        # даже если _migrate сделал early return.
+        existing_indexes = {str(r[1]) for r in conn.execute(
+            "SELECT type, name FROM sqlite_master WHERE type='index'"
+        ).fetchall()}
+        required = {"idx_items_url_norm", "idx_items_state_state_at"}
+        missing = required - existing_indexes
+        if missing:
+            raise RuntimeError(
+                f"Storage: required indexes missing after _create_indexes: {missing}. "
+                f"Fix: drop and recreate DB, or manually run CREATE INDEX."
+            )
+
         # ── 5. Определить наличие title_normalized в seen_titles (v9) ──
         # Проверяем ПОСЛЕ всех миграций (включая v9), после коммита.
         # Для старых БД (v<9) — колонки нет; для свежих v9 и после миграции — есть.
@@ -1922,6 +1940,32 @@ class Storage:
             params.append(since_iso)
         sql += " ORDER BY llm_score DESC, fetched_at ASC"
         sql += f" LIMIT {int(limit)}"
+        rows = conn.execute(sql, params).fetchall()
+        return self._rows_to_items(rows)
+
+    def get_new_items_for_fallback(
+        self,
+        since_iso: str,
+        limit: int = 200,
+    ) -> List[NewsItem]:
+        """
+        Возвращает items со state='new' и fetched_at >= since_iso.
+
+        Нескоренные items окна для fallback-добора гарантии категорий
+        (llm_score IS NULL по определению state='new').
+        Сортировка: fetched_at DESC (свежайшие первыми).
+        """
+        conn = self._connect()
+        params: list = [since_iso, int(limit)]
+        sql = """
+            SELECT source, url, title, summary, published, tags, cluster_key, lang,
+                   fetched_at, state_at, llm_score, llm_summary, llm_reason, llm_urgent, llm_title
+            FROM items
+            WHERE state = 'new'
+              AND fetched_at >= ?
+            ORDER BY fetched_at DESC
+            LIMIT ?
+        """
         rows = conn.execute(sql, params).fetchall()
         return self._rows_to_items(rows)
 

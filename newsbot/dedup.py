@@ -50,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Set, Tuple
 
-from .collector import NewsItem, _strip_source_prefix
+from .collector import NewsItem, _NON_WORD_CHARS, _strip_source_prefix
 from .storage import Storage, MIN_TITLE_LEN
 
 logger = logging.getLogger("newsbot.dedup")
@@ -824,8 +824,10 @@ def filter_new(
                 for c_t, _ in candidates:
                     if c_t and c_t not in meta:
                         raw = _strip_source_prefix(c_t)
+                        # Нормализуем тем же способом что item_first2: lowercase + delete [^\w\s]
+                        norm_for_first2 = _NON_WORD_CHARS.sub("", raw.lower())
                         meta[c_t] = (
-                            _first_two_content_tokens(raw),
+                            _first_two_content_tokens(norm_for_first2),
                             _safe_number_multiset(c_t),
                         )
                 _prefetch_metadata[lookup_key] = meta
@@ -845,10 +847,11 @@ def filter_new(
 
         normalized = item.title_normalized()
         # Для Major-2 (domain-дедуп) — вычисляем один раз на item.
-        item_numbers = _safe_number_multiset(getattr(item, 'title', None))
-        item_first2 = _first_two_content_tokens(
-            _strip_source_prefix(getattr(item, 'title', None) or '')
-        )
+        # Числа — по сырому title (как prefetch :831), чтобы "2,5" давало
+        # {'25'} в обоих сравнениях и guard склеивал корректно.
+        raw_title_for_numbers = getattr(item, "title", "") or ""
+        item_numbers = _safe_number_multiset(raw_title_for_numbers)
+        item_first2 = _first_two_content_tokens(normalized)
 
         # (b) title+source в БД — проверено внутри is_duplicate
         # (c) title+source ВНУТРИ цикла
@@ -873,9 +876,19 @@ def filter_new(
         # при срабатывании сохранить item как skipped.
         is_cross_source_dup = False
         if cross_source and recent:
-            # предфильтр по title_hash (точный) — быстрая проверка O(N)
-            for title_hash, *_ in recent:
-                if title_hash == normalized:
+            # FIX 1: order-sensitive second key (first-2 content tokens).
+            # normalize()+sorted() = "word bag" — «Russia strikes Ukraine» и
+            # «Ukraine strikes Russia» дают один хеш. Без second key вторая
+            # новость молча save_skipped (тихая потеря данных).
+            for title_hash, title_norm, *_ in recent:
+                if title_hash != normalized:
+                    continue
+                # Совпал title_hash. Проверяем first-2 tokens в исходном порядке:
+                # одинаковые → дубли; разные → разные темы ( НЕ дропаем).
+                stored_first2 = _first_two_content_tokens(
+                    _strip_source_prefix(title_norm)
+                )
+                if stored_first2 == item_first2:
                     is_cross_source_dup = True
                     break
 

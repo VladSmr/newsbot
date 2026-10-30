@@ -360,6 +360,108 @@ class TestCrossSourceExactDedup(unittest.TestCase):
         finally:
             _cleanup_db(path)
 
+    def test_cross_source_different_word_order_not_duplicate(self):
+        """
+        FIX 1: level-1 cross-source dedup с разным порядком слов — НЕ дубль.
+        normalize()+sorted() даёт один хеш («мешок слов»). Без order-sensitive
+        second key вторая новость молча save_skipped.
+        FIX: first-2 tokens в исходном порядке разные → пропускаем.
+        """
+        path = _tmp_db()
+        try:
+            cfg = {"cross_source": True, "fuzzy": False, "window_days": 3}
+            st = Storage(Path(path), dedup_config=cfg)
+
+            item1 = _mk_item(
+                title="Russia strikes Ukraine with missiles",
+                source="SourceA",
+                url="https://a.com/russia-ukraine-missiles",
+            )
+            item2 = _mk_item(
+                title="Ukraine strikes Russia with missiles",
+                source="SourceB",
+                url="https://b.com/ukraine-russia-missiles",
+            )
+
+            st.save(item1)
+            # FIX 1: first-2 ('russia', 'strikes') != ('ukraine', 'strikes') → не дубль
+            new_items, total, dup = filter_new([item2], st, dedup_config=cfg)
+            self.assertEqual(dup, 0,
+                "FIX 1: different word order → NOT a duplicate")
+            self.assertEqual(len(new_items), 1,
+                "FIX 1: item with different order must pass prefilter")
+
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_cross_source_same_order_is_duplicate(self):
+        """
+        FIX 1: level-1 cross-source dedup с идентичным порядком слов — дубль.
+        """
+        path = _tmp_db()
+        try:
+            cfg = {"cross_source": True, "fuzzy": False, "window_days": 3}
+            st = Storage(Path(path), dedup_config=cfg)
+
+            item1 = _mk_item(
+                title="Russia and Ukraine negotiate peace deal",
+                source="SourceA",
+                url="https://a.com/peace-deal",
+            )
+            item2 = _mk_item(
+                title="Russia and Ukraine negotiate peace deal",
+                source="SourceB",
+                url="https://b.com/peace-deal2",
+            )
+
+            st.save(item1)
+            # first-2 идентичны ('russia', 'and') → дубль
+            new_items, total, dup = filter_new([item2], st, dedup_config=cfg)
+            self.assertEqual(dup, 1,
+                "FIX 1: identical order + hash → duplicate")
+            self.assertEqual(len(new_items), 0)
+
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_cross_source_normalization_asymmetry_us_strikes(self):
+        """
+        FIX C regression: 'U.S. strikes...' vs 'US strikes...' — дубль.
+        item_first2 равен stored_first2 только при одинаковой нормализации.
+        Без фикса: item_first2=('u.s.', 'strikes'), stored_first2=('us', 'strikes')
+        → не совпадают → level-1 дубль пропущен → двойной push.
+        """
+        path = _tmp_db()
+        try:
+            cfg = {"cross_source": True, "fuzzy": False, "window_days": 3}
+            st = Storage(Path(path), dedup_config=cfg)
+
+            # Item1: "U.S." (с точками) — title_normalized() убирает точки → "us"
+            item1 = _mk_item(
+                title="U.S. strikes target infrastructure in key regions",
+                source="SourceA",
+                url="https://a.com/us-strikes",
+            )
+            # Item2: "US" (без точек) — title_normalized() то же → "us"
+            item2 = _mk_item(
+                title="US strikes target infrastructure in key regions",
+                source="SourceB",
+                url="https://b.com/us-strikes-2",
+            )
+
+            st.save(item1)
+            new_items, total, dup = filter_new([item2], st, dedup_config=cfg)
+            self.assertEqual(dup, 1,
+                f"FIX C: 'U.S. ...' vs 'US ...' must be detected as duplicate. "
+                f"got dup={dup}, new_items={len(new_items)}")
+            self.assertEqual(len(new_items), 0)
+
+            st.close()
+        finally:
+            _cleanup_db(path)
+
     def test_cross_source_disabled(self):
         """
         cross_source=false: заголовок из разных source — НЕ дубликат.

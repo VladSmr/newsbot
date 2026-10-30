@@ -485,6 +485,31 @@ def _prefilter_item(item) -> bool:
         # capitalized слово НЕ считалось PN в title-контексте.
         "exclusive", "breaking", "update", "alert", "flash",
         "report", "briefing", "summary",
+        # "according to sources/insiders" — weak маркер. Все токены
+        # этой конструкции должны быть в _PN_STOP, чтобы последующие PN
+        # детектились по их собственному контексту, а не по "according".
+        "according",
+        # FIX 2 (conservative): русские generic-слова, которые могут
+        # капитализироваться в заголовках, но не являются PN.
+        # "Рубля" после "курс" — обычное существительное (genitive case),
+        # NOT PN. Без списка → false positive → item проходит префильтр →
+        # LLM-бюджет на мусор.
+        "рубля", "рубль", "рубли", "доллара", "доллар", "евро",
+        "банка", "банк", "рынка", "рынок", "цены", "цена",
+        "страны", "страна", "города", "город", "компании", "компания",
+        "мира", "мир", "власти", "власть", "лидера", "лидер",
+        "плана", "план", "计划",  # китайский дубликат (если попадёт)
+        "daily", "fuel", "price",
+        # FIX 2 (conservative): русские стоп-слова — generic capitalized русские
+        # существительные/прилагательные в начале фразы, не PN.
+        # Без списка → capitalized-русское слово в начале фразы детектится как PN
+        # в comma/punct-backtrack (для смешанных заголовков с латиницей).
+        "экспертное", "эксперт", "мнение", "мнений",
+        "источник", "источники", "сообщают", "говорят",
+        "данные", "данных", "информация", "новости",
+        # Generic English words in comma-backtrack: "sources" after comma
+        # (e.g., "Gazprom, sources say...") should not be a PN.
+        "sources",
     }
     combined_text = (raw_title or "") + " " + (raw_summary or "")
 
@@ -562,28 +587,163 @@ def _prefilter_item(item) -> bool:
         for idx in range(len(tokens) - 1):
             curr = tokens[idx]
             nxt = tokens[idx + 1]
-            if curr.lower() != curr:
+            # Skip punctuation/non-alpha tokens: "Exclusive:" has ':' as curr.
+            # Without this, ':' passes the STOP-check (':'.lower()=' ': not in STOP)
+            # and Gazprom is tested as PN-candidate with prev_word=''.
+            # Comma as curr: check if prev (alpha) token is a PN.
+            # Handles "Gazprom, according to sources" — backtrack for comma
+            # reaches "Gazprom" before the STOP-word "according" can block it.
+            if curr == ',' and idx > 0:
+                # Backtrack: skip punctuation AND non-PN non-STOP words until
+                # we find a PN-candidate or a STOP word.
+                # "Gazprom, nears, deal, according...":
+                #   j=4: t='deal' not-STOP, not-PN → continue (don't break)
+                #   j=3: t='nears' not-STOP, not-PN → continue
+                #   j=2: t='Gazprom' not-STOP, IS PN → prev_word_comma='Gazprom', break
+                #   → return True
+                # Genre-prefix check: if first alpha after punctuation is in _PN_STOP → NOT PN.
+                # Example: "Gazprom, nears, deal" → ',' at idx, backtrack finds "nears"
+                # not in _PN_STOP → continue to PN-check.
+                # (FIX B: "sources" и др. латинские стоп-слова УБРАНЫ из _PN_STOP.)
+                _first_alpha_after_comma = ""
+                for _j in range(idx - 1, -1, -1):
+                    _t = tokens[_j]
+                    if not _t.isalpha():
+                        _pcount = 1
+                        while _j > 0:
+                            _j -= 1
+                            _t = tokens[_j]
+                            if _t.isalpha():
+                                break
+                            _pcount += 1
+                            if _pcount > 2:
+                                _t = ""
+                                break
+                    if _t.isalpha():
+                        _first_alpha_after_comma = _t
+                        break
+                if _first_alpha_after_comma:
+                    _stripped_first = _first_alpha_after_comma.lower().strip(":,!?.…—–-")
+                    if _stripped_first in _PN_STOP:
+                        # Genre prefix — capitalized STOP before PN → NOT PN.
+                        continue
+                prev_word_comma = ""
+                for j in range(idx - 1, -1, -1):
+                    t = tokens[j]
+                    if not t.isalpha():
+                        # Skip punctuation — max 2 consecutive punct
+                        punct_count = 1
+                        while j > 0:
+                            j -= 1
+                            t = tokens[j]
+                            if t.isalpha():
+                                break
+                            punct_count += 1
+                            if punct_count > 2:
+                                t = ""
+                                break
+                        if not t or not t.isalpha():
+                            break
+                    t_stripped = t.lower().strip(":,!?.…—–-")
+                    if t_stripped in _PN_STOP:
+                        prev_word_comma = ""
+                        break
+                    # Non-STOP word: check if it's a PN candidate
+                    if _is_proper_noun(t, False, False):
+                        prev_word_comma = t
+                        break
+                    # Not STOP, not PN → skip it and continue searching
+                if prev_word_comma:
+                    return True
+            # Handles "word (PN)" — opening paren is followed by a PN candidate.
+            # Backtrack: check if the word before '(' is a PN.
+            if curr == '(' and idx > 0:
+                prev_word_comma = ""
+                for j in range(idx - 1, -1, -1):
+                    t = tokens[j]
+                    if not t.isalpha():
+                        punct_count = 1
+                        while j > 0:
+                            j -= 1
+                            t = tokens[j]
+                            if t.isalpha():
+                                break
+                            punct_count += 1
+                            if punct_count > 2:
+                                t = ""
+                                break
+                        if not t or not t.isalpha():
+                            break
+                    t_stripped = t.lower().strip(":,!?.…—–-")
+                    if t_stripped in _PN_STOP:
+                        prev_word_comma = ""
+                        break
+                    # Check PN first (same priority as comma-backtrack).
+                    if _is_proper_noun(t, False, False):
+                        prev_word_comma = t
+                        break
+                if prev_word_comma:
+                    return True
+            if not curr.isalpha():
                 continue
+            if curr.lower() in _PN_STOP:
+                continue
+            # curr — alpha, not in _PN_STOP. Check if nxt is PN candidate.
             if len(nxt) >= 3 and _is_proper_noun(nxt, False, False):
-                if nxt.lower() in _PN_STOP:
-                    continue
+                # nxt — capitalized candidate. backtrack ищет предшествующее слово.
+                # Правило: останавливаемся на первом alpha-токене.
+                # STOP-words пропускаются (ищем дальше). non-PN alpha тоже останавливает
+                # (это prev_word). PN-alpha пропускается (продолжаем).
                 prev_word = ""
                 for j in range(idx - 1, -1, -1):
                     t = tokens[j]
-                    if t.lower() in _PN_STOP:
+                    if not t.isalpha():
+                        # Skip punctuation — "Gazprom, according" and "Gazprom: situation".
+                        # Skipping ',' (depth=1) and ':' (depth=2) reaches "Gazprom".
+                        # Limit: max 2 consecutive punct to avoid skipping too far.
+                        punct_count = 1
+                        while j > 0:
+                            j -= 1
+                            t = tokens[j]
+                            if t.isalpha():
+                                break
+                            punct_count += 1
+                            if punct_count > 2:
+                                t = ""
+                                break
+                        if not t.isalpha():
+                            break
+                    t_stripped = t.lower().strip(":,!?.…—–-")
+                    if t_stripped in _PN_STOP:
+                        # STOP-word — пропускаем, ищем дальше.
                         continue
-                    if t.lower() != t:
-                        prev_word = t
-                        break
+                    # First alpha-not-STOP word. Проверяем: это PN-токен?
+                    if _is_proper_noun(t, False, False):
+                        # PN-токен — пропускаем (считаем его "фоном"), ищем дальше.
+                        continue
+                    # non-PN alpha → это prev_word. Останавливаемся.
+                    prev_word = t
                     break
-                if prev_word == "" or prev_word.lower() in _PN_STOP:
-                    return True
+                # curr alpha (lowercase/non-STOP) перед PN → prev_word найден.
+                # Контракт (docstring :585-587):
+                #   prev_word в _PN_STOP или prev_word="" → PN подтверждён.
+                #   prev_word capitalized (не stop) → NOT PN ("Exclusive: Gazprom").
+                if prev_word and prev_word[0].isupper():
+                    stripped = prev_word.lower().strip(":,!?.…—–-")
+                    if stripped not in _PN_STOP:
+                        # capitalized non-STOP prev_word → NOT PN, continue searching.
+                        continue
+                return True
         return False
 
-    # CRITICAL: English PN-heuristics НЕ применимы к русскому тексту.
-    # Для кириллицы пропускаем PN-проверку -- пусть работают location/urgent.
-    has_latin = bool(re.search(r"[A-Za-z]", combined_text))
-    has_proper_noun = _find_proper_noun(combined_text) if has_latin else False
+    # FIX 2: PN детектится по capitalized-after-lowercase паттерну.
+    # Для чисто русских заголовков (без латиницы) _find_proper_noun сканирует
+    # title на кириллические PN ("Газпром", "Россия") mid-sentence.
+    # Ограничение: capitalized-слово в начале фразы ("Экспертное")
+    # не считается PN (no lowercase before it), поэтому item отсекается.
+    # PN-детект делается ТОЛЬКО по raw_title (НЕ combined_text):
+    # summary-упоминания — фоновый контекст, не новостной факт.
+    has_proper_noun = _find_proper_noun(raw_title)
     # При наличии любого {число, имя, место, дата} -- пропускаем в LLM.
     if has_number or has_proper_noun or has_location or has_date:
         return False
@@ -1133,9 +1293,16 @@ def _category_guarantee(
     items: List[NewsItem],
     category_min: Dict[str, int],
     pool: Optional[List[NewsItem]] = None,
-) -> List[NewsItem]:
+    new_fallback: Optional[List[NewsItem]] = None,
+) -> Tuple[List[NewsItem], Set[str]]:
     """
     Гарантирует минимум новостей по категориям.
+
+    Returns:
+        Tuple[result_items, guarantee_added_urls]:
+        - result_items: модифицированный список items
+        - guarantee_added_urls: URLs items, добавленных из pool или new_fallback
+          (все, кто закрывает минимум; не включает исходные items или evict'нутые)
 
     Алгоритм:
     1. Считаем текущее покрытие по категориям в items.
@@ -1145,21 +1312,29 @@ def _category_guarantee(
        EVICTABLE = item, чья категория НЕ в category_min
        ИЛИ cat_counts[c] > category_min[c] (покрыта с запасом).
     3. После каждого swap инкрементально обновляем cat_counts.
-    4. При пустом pool или None — legacy-режим: ничего не меняется
+    4. Fallback (new_fallback): если после шага 2–3 категория всё ещё ниже min —
+       берём недостающее из нескоренных (state='new', llm_score=NULL).
+       Это последний резерв; скоренные всегда приоритетнее.
+    5. При пустом pool и None new_fallback — legacy-режим: ничего не меняется
        (swap невозможен, гарантия остаётся no-op).
 
     category_min нормализуется в Dict[str, int] (_normalize_category_min):
     строковые значения из YAML не должны давать TypeError в сравнении
     (Minor 1-фикс, wave 2).
 
+    new_fallback сортирован fetched_at DESC (свежие первыми) вызывающей
+    стороной (storage.get_new_items_for_fallback).
+
     Сорт вывода — по llm_score DESC вызывающей стороной после вызова.
     """
     category_min = _normalize_category_min(category_min)
     if not category_min or not items:
-        return items
+        return items, set()
 
     result = list(items)
     used_ids: Set[int] = {id(it) for it in items}
+    guarantee_added_urls: Set[str] = set()
+    original_ids: Set[int] = {id(it) for it in items}
 
     # Считаем текущее покрытие по категориям
     cat_counts: Dict[str, int] = {}
@@ -1223,7 +1398,31 @@ def _category_guarantee(
             result.append(candidate)
             used_ids.add(id(candidate))
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            if id(candidate) not in original_ids:
+                guarantee_added_urls.add(getattr(candidate, 'url', None) or id(candidate))
             added += 1
+
+    # Шаг 4: new_fallback для оставшихся дефицитов.
+    # new_fallback уже отсортирован fetched_at DESC (свежие первыми).
+    if new_fallback:
+        for cat, min_count in category_min.items():
+            current = cat_counts.get(cat, 0)
+            if current >= min_count:
+                continue
+            needed = min_count - current
+            added = 0
+            for candidate in new_fallback:
+                if added >= needed:
+                    break
+                if id(candidate) in used_ids:
+                    continue
+                if _infer_category(candidate) != cat:
+                    continue
+                result.append(candidate)
+                used_ids.add(id(candidate))
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                guarantee_added_urls.add(getattr(candidate, 'url', None) or id(candidate))
+                added += 1
 
     # Финальный warning по невыполненным категориям
     for cat, min_count in category_min.items():
@@ -1234,7 +1433,7 @@ def _category_guarantee(
                 cat, current, min_count,
             )
 
-    return result
+    return result, guarantee_added_urls
 
 
 def _iso_dt(value: str):
@@ -2311,6 +2510,9 @@ class NewsPipeline:
                         self._apply_result(item, res, push_th, digest_th,
                                           push_urgent_only, skipped_urls, deferred_urls,
                                           to_deliver, llm_batch_records)
+                        # FIX 3: добавляем url в processed-set → второй проход
+                        # (:2389+) пропустит этот item (не двойной _apply_result).
+                        _pushed_urls.add(item.url)
                         continue
                     # предварительная route — проверяем только push/digest/skip
                     r = route(res.score, push_th, digest_th,
@@ -2771,6 +2973,38 @@ class NewsPipeline:
                 hour=anchor_hour, minute=anchor_min, second=0, microsecond=0,
             )
             window_start_iso = window_start_local.astimezone(tz.utc).isoformat()
+            # FIX 4: min(anchor, meta_boundary) — берём более СТАРУЮ/широкую границу.
+            # Если digest_slot был пропущен, meta boundary осталась от
+            # предыдущего окна и более свежая (=более узкая). min() берёт её,
+            # чтобы покрыть items из пропущенного слота.
+            if raw_boundary:
+                from datetime import datetime as dt, timezone as tz_dummy
+                try:
+                    meta_dt_raw = dt.fromisoformat(raw_boundary.replace('Z', '+00:00'))
+                    if meta_dt_raw.tzinfo is None:
+                        # naive — считаем UTC
+                        meta_dt = meta_dt_raw.replace(tzinfo=tz_dummy.utc)
+                    else:
+                        meta_dt = meta_dt_raw.astimezone(tz_dummy.utc)
+                    anchor_dt = dt.fromisoformat(window_start_iso.replace('Z', '+00:00'))
+                    if anchor_dt.tzinfo is None:
+                        anchor_dt = anchor_dt.replace(tzinfo=tz_dummy.utc)
+                    # FIX 4/F: min(anchor, meta) покрывает пропущенный слот.
+                    # Freshness guard: meta применяется только если она не старше
+                    # bootstrap_window_hours ОТ anchor (а не от now). Это защищает
+                    # от слишком старых meta (ручные правки, миграция, пропущенный
+                    # слот давно в прошлом) — они игнорируются, окно берётся от anchor.
+                    bootstrap_hours = digest_cfg.get("bootstrap_window_hours", 24)
+                    try:
+                        bootstrap_hours = float(bootstrap_hours)
+                    except (TypeError, ValueError):
+                        bootstrap_hours = 24.0
+                    # FIX F: freshness measured from anchor, not from now.
+                    # stale_if: meta_dt < anchor_dt - bootstrap_hours → игнорировать meta.
+                    if meta_dt >= anchor_dt - timedelta(hours=bootstrap_hours):
+                        window_start_iso = (meta_dt if meta_dt < anchor_dt else anchor_dt).isoformat()
+                except (TypeError, ValueError):
+                    pass  # fallback к anchor
             if not raw_boundary:
                 logger.info(
                     "Дайджест (anchor=%s): bootstrap → %s",
@@ -2866,7 +3100,7 @@ class NewsPipeline:
                         pub_dt_norm = pub_dt.astimezone(tz.utc).replace(tzinfo=None)
                     else:
                         pub_dt_norm = pub_dt
-                    if pub_dt_norm >= ws_grace_naive:
+                    if pub_dt_norm > ws_grace_naive:
                         filtered.append(it)
             deferrable_post_published = filtered
         n_published = len(deferrable_post_published)
@@ -3081,6 +3315,18 @@ class NewsPipeline:
             for it in skipped_candidates:
                 if it.url not in _all_excluded and it.url not in _skipped_dup_urls:
                     category_pool.append(it)
+            # Fallback: нескоренные (state='new') из того же окна — последний резерв.
+            # Передаются отдельным параметром в _category_guarantee (new_fallback),
+            # чтобы скоренные (pool, score DESC) всегда были приоритетнее new
+            # (score=NULL → 0). _check_against_shown: новые items не были
+            # в digested/delivered → не в _recent_shown → не фильтруются.
+            # Major-фикс: new-кандидаты проходят префильтр — мусор/реклама
+            # (напр. off-peak-пауза без LLM в цикле) не попадает в гарантию.
+            _raw_new = self.storage.get_new_items_for_fallback(
+                since_iso=window_start_iso,
+                limit=max(200, max_items * 4),
+            )
+            _new_candidates = [it for it in _raw_new if not _prefilter_item(it)]
         # Minor 1-фикс: max_per_location вычисляется ДО блока гарантии —
         # от него зависит квота защиты (Minor 2-фикс). Невалидное значение
         # → documented default (2), а не отключение cap'а.
@@ -3104,8 +3350,12 @@ class NewsPipeline:
         # категории (до min_count на категорию, лучшие по score). Сюда входят
         # и items, уже бывшие в топе, и добавленные _category_guarantee из pool.
         guarantee_protected_urls: Set[str] = set()
+        guarantee_added_urls: Set[str] = set()
         if category_min:
-            deferred_items = _category_guarantee(deferred_items, category_min, pool=category_pool)
+            deferred_items, guarantee_added_urls = _category_guarantee(
+                deferred_items, category_min, pool=category_pool,
+                new_fallback=_new_candidates if category_min else None,
+            )
             _by_cat: Dict[str, List[NewsItem]] = {}
             for _it in deferred_items:
                 _by_cat.setdefault(_infer_category(_it), []).append(_it)
@@ -3260,8 +3510,30 @@ class NewsPipeline:
 
         # Финальный сорт — по llm_score DESC (состав уже зафиксирован гарантийными
         # свапами; сорт только порядок вывода). Финальный slice ПОСЛЕ гарантии.
-        deferred_items.sort(key=lambda x: x.llm_score or 0, reverse=True)
-        deferred_items = deferred_items[:max_items]
+        # Critical-фикс (wave 2): резервируем слоты под ВСЕ защищённые items.
+        # guarantee_added_urls защищает только ДОБАВЛЕННЫЕ гарантией.
+        # guarantee_protected_urls ⊇ guarantee_added_urls: включает ТАКЖЕ исходные
+        # deferred-items, которые САМИ закрывают часть category_min.
+        # Без этого исходный cinema-item с низким score вырезается [:max_items]
+        # → категория ниже минимума, несмотря на new-fallback.
+        # Используем guarantee_protected_urls — минимальный корректный надмножество.
+        _protected_item_ids: Set[int] = set()
+        for _it in deferred_items:
+            _key = getattr(_it, 'url', None) or id(_it)
+            if _key in guarantee_protected_urls:
+                _protected_item_ids.add(id(_it))
+        _non_protected = [
+            _it for _it in deferred_items if id(_it) not in _protected_item_ids
+        ]
+        _non_protected.sort(key=lambda x: x.llm_score or 0, reverse=True)
+        _slots = max(0, max_items - len(_protected_item_ids))
+        _final = _non_protected[:_slots]
+        _final_urls = {getattr(_it, 'url', None) for _it in _final}
+        for _it in deferred_items:
+            if id(_it) in _protected_item_ids:
+                if getattr(_it, 'url', None) not in _final_urls:
+                    _final.append(_it)
+        deferred_items = _final[:max_items]
         n_final = len(deferred_items)
 
         # F: наблюдаемость — DEBUG-дамп финального состава.
@@ -3492,21 +3764,29 @@ class NewsPipeline:
             failure_count = 0
 
         if failure_count >= 3:
-            # C1-фикс: 3-strike НЕ сдвигает границу окна и не теряет items.
-            # Границу двигает ТОЛЬКО успешное закрытие окна (см. ниже).
-            # Иначе неотправленный deferred-бэклог оставался бы позади новой
-            # границы, отсекался published-фильтром и молча вымывался
-            # purge_items (deferred_retention_days). Items остаются deferred
-            # и повторятся; цикл ограничен digest_failure_count + retention.
+            # FIX 5: 3-strike сдвигает границу окна СОВМЕСТНО со слотом.
+            # Если сдвигать только last_digest_at (слот обработан), но не
+            # digest_window_started_at — следующий слот считает границу от
+            # anchor и отсечёт published-фильтром (:2908) все items старше
+            # этой границы. FIX 5 обновляет ОБЕ мета-поля → следующий слот
+            # получает корректное покрытие. При shutdown — last_digest_at
+            # НЕ пишется, boundary не двигается.
             sample_urls = [it.url for _, grp in groups for it in grp][:5]
             logger.warning(
                 "Дайджест: пропущен (%d неудачных попыток подряд) — "
-                "%d items остаются deferred, граница окна НЕ сдвинута, "
+                "%d items остаются deferred, граница сдвинута, "
                 "счётчик сброшен; примеры url: %s",
                 failure_count, total_to_send, ", ".join(sample_urls) or "—",
             )
             self.storage.set_meta("digest_failure_count", "0")
             self.storage.set_meta("last_digest_at", digest_started_iso)
+            # FIX 5: сдвигаем границу окна вместе со слотом.
+            # Раньше last_digest_at обновлялся (слот "обработан"), а
+            # digest_window_started_at — нет → следующий слот получал
+            # 12-часовое окно от anchor, items старше границы отсекались
+            # published-фильтром (:2908) → тихая потеря целого окна.
+            # Обновляем ОБЕ мета-поля синхронно.
+            self.storage.set_meta("digest_window_started_at", digest_started_iso)
             # P2-фикс: 3-strike ветка возвращалась ДО терминализации
             # poison-pill items (битый feedback-target / падение рендеринга) —
             # они вечно циклятся в 'deferred', каждый раз исключаясь из groups.

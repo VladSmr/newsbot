@@ -227,12 +227,22 @@ class TestPrefilterUnit:
         assert _prefilter_item(it) is False, "Catastrophe with casualties should NOT be filtered"
 
     def test_pure_russian_opinion_forecast(self):
-        """Мнение/прогноз на русском без фактов — отсеивается."""
+        """
+        FIX 2: русский заголовок с hard-маркером без фактов отсеивается.
+        NOTE: FIX 2 включает кириллический PN-детект (убран латинский гейт).
+        Капитализированное "Экспертное" в начале фразы — after_sop=True → NOT PN,
+        поэтому hard-marker's "мнение" срабатывает → item отсеивается.
+        Если бы "Экспертное" было в СЕРЕДИНЕ фразы — оно бы детектилось
+        как PN и item прошёл бы (что и есть цель FIX 2).
+        """
         it = self._item(
             "Экспертное мнение: ситуация ухудшится в ближайшие месяцы",
             summary="Многие эксперты прогнозируют ухудшение",
         )
-        assert _prefilter_item(it) is True, "Russian opinion/forecast without facts should be filtered"
+        assert _prefilter_item(it) is True, (
+            "FIX 2: capitalized 'Экспертное' в начале фразы → after_sop=True "
+            "(not PN). hard-marker \\bмнени[ея]\\b + no facts → filtered"
+        )
 
     def test_empty_title_summary(self):
         """Пустой title+summary без маркеров — пропускается в LLM."""
@@ -385,6 +395,47 @@ class TestPrefilterUnit:
         )
         # "Sudan" с upper-after-first (Su) — true PN → НЕ отсеивается
         assert _prefilter_item(it) is False, "English proper noun (Sudan) should bypass prefilter"
+
+    def test_proper_noun_cyrillic_mid_sentence(self):
+        """FIX 2: чисто русский заголовок с PN в середине фразы — проходит префильтр."""
+        # «Газпром» — capitalized-кириллица, не в начале фразы, не в стоп-словах.
+        # has_latin=False → old code отключал PN-детект → item отсеивался (тихая потеря).
+        # FIX 2: _find_proper_noun работает без латинского гейта → PN обнаруживается.
+        it = self._item(
+            "Источники сообщают о задержании главы Газпрома",
+            summary="Газпром — крупнейшая энергетическая компания России",
+        )
+        assert _prefilter_item(it) is False, (
+            "FIX 2: Russian title with mid-sentence PN (Газпром) must bypass prefilter"
+        )
+
+    def test_proper_noun_cyrillic_no_false_positive(self):
+        """FIX 2: русский заголовок БЕЗ PN — отсеивается префильтром (консервативность)."""
+        # Нет латиницы, нет цифр, нет location, нет даты, нет capitalized-кириллицы
+        # в середине → hard-маркер «источники сообщают» отсекает.
+        it = self._item(
+            "Источники сообщают о ситуации на рынке",
+            summary="according to sources without specifics",
+        )
+        assert _prefilter_item(it) is True, (
+            "FIX 2: Russian title without PN (soft signal) must be filtered"
+        )
+
+    def test_comma_backtrack_sources_say_not_filtered(self):
+        """
+        FIX B regression: 'Gazprom, sources say, cuts fuel supplies' НЕ фильтруется.
+        Backtrack от ',' находит "sources" → prev_word. "sources" не в STOP
+        (убран костыль прошлой сессии), capitalized, not-STOP → continue.
+        Backtrack продолжает, находит "Gazprom" → PN подтверждён → item проходит.
+        Break-check: если sources/fuel/price вернутся в _PN_STOP → тест падает.
+        """
+        it = self._item(
+            "Gazprom, sources say, cuts fuel supplies amid price war",
+            summary="Energy giant reduces output as markets decline",
+        )
+        assert _prefilter_item(it) is False, (
+            "FIX B: 'Gazprom, sources say' with comma-backtrack must NOT be filtered (Gazprom=PN)"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────

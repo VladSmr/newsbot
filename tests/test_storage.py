@@ -843,6 +843,114 @@ class TestV16Migration:
             f"idx_items_fetched_at должен существовать после полной миграции: {indexes}"
         )
 
+    def test_dropped_index_self_heals_on_reinit(self, tmp_path):
+        """
+        FIX A: dropped critical index самовосстанавливается при новом Storage().
+        _create_indexes использует CREATE INDEX IF NOT EXISTS — recreate
+        индекс, даже если он был дропнут. verify-блок (post-_create_indexes)
+        подтверждает наличие. No RuntimeError.
+        Break-check: без IF NOT EXISTS — RuntimeError. С IF NOT EXISTS — зелёный.
+        """
+        db_path = tmp_path / "idx_heal.db"
+
+        # (1) Создаём свежую БД с индексом
+        s1 = Storage(db_path=db_path)
+        indexes_before = {str(r["name"]) for r in s1._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()}
+        assert "idx_items_url_norm" in indexes_before, "index must exist after init"
+        s1.close()
+
+        # (2) Дропаем индекс и создаём новый Storage()
+        s2 = Storage(db_path=db_path)
+        s2._conn.execute("DROP INDEX IF EXISTS idx_items_url_norm")
+        s2._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        s2._conn.commit()
+        s2.close()
+
+        # (3) Третий Storage() — должен самовосстановить индекс (без RuntimeError)
+        s3 = Storage(db_path=db_path)
+        indexes_after = {str(r["name"]) for r in s3._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()}
+        assert "idx_items_url_norm" in indexes_after, (
+            "FIX A: dropped index must self-heal on Storage() reinit"
+        )
+        s3.close()
+
+    def test_verification_block_catches_missing_index(self, tmp_path, monkeypatch):
+        """
+        FIX A (scenario 2): если idx_items_url_norm пропал после _create_indexes
+        (OperationalError при CREATE UNIQUE INDEX не дал создать) — verify-блок
+        поднимает RuntimeError. verify-блок — последний safety net, срабатывает
+        после _create_indexes (до PRAGMA commit).
+
+        Тест: (1) monkeypatch _current_version → старый, force migration;
+        (2) monkeypatch _create_indexes — пропускает idx_items_url_norm.
+        Result: verify-block видит missing idx → RuntimeError.
+        """
+        import newsbot.storage as storage_mod
+        import sqlite3
+        db_path = tmp_path / "idx_verify.db"
+
+        # Шаг 1: штатный Storage() — все индексы созданы
+        s = Storage(db_path=db_path)
+        assert "idx_items_url_norm" in {str(r["name"]) for r in s._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()}
+        s.close()
+
+        # Шаг 2: capture originals BEFORE monkeypatch (to avoid recursion)
+        _orig_ci = storage_mod.Storage._create_indexes
+        _orig_cv = storage_mod.Storage._current_version
+
+        def idx_skipping_ci(self, conn):
+            """DROP idx_items_url_norm, skip CREATE, остальные — штатно."""
+            _skip_target = "idx_items_url_norm"
+            _skipped_flag = [False]
+            # DROP existing idx — моделируем OperationalError при CREATE
+            conn.execute(f"DROP INDEX IF EXISTS {_skip_target}")
+            for stmt in (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_url_norm ON items(url_norm)",
+                "CREATE INDEX IF NOT EXISTS idx_items_url ON items(url)",
+                "CREATE INDEX IF NOT EXISTS idx_items_state ON items(state)",
+                "CREATE INDEX IF NOT EXISTS idx_items_state_at ON items(state_at)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_seen_title_source "
+                "ON seen_titles(title_hash, source)",
+                "CREATE INDEX IF NOT EXISTS idx_seen_ttl ON seen_titles(expires_at)",
+                "CREATE INDEX IF NOT EXISTS idx_seen_fetched ON seen_titles(fetched_at)",
+                "CREATE INDEX IF NOT EXISTS idx_items_state_state_at ON items(state, state_at)",
+                "CREATE INDEX IF NOT EXISTS idx_items_source_fetched ON items(source, fetched_at)",
+                "CREATE INDEX IF NOT EXISTS idx_items_cluster_key_fetched ON items(cluster_key, fetched_at)",
+                "CREATE INDEX IF NOT EXISTS idx_items_fetched_at ON items(fetched_at)",
+            ):
+                if _skip_target in stmt:
+                    _skipped_flag[0] = True
+                    continue  # NOP — idx_items_url_norm не создан
+                try:
+                    conn.execute(stmt)
+                except sqlite3.IntegrityError as e:
+                    logger = __import__("newsbot.storage", fromlist=["logger"]).logger
+                    logger.warning("UNIQUE index пропущен: %s. Cmd: %s", e, stmt[:80])
+                except sqlite3.OperationalError:
+                    pass
+            assert _skipped_flag[0], "idx_items_url_norm was not skipped"
+
+        # Force migration path: call ORIGINAL _current_version (to avoid recursion),
+        # return SCHEMA_VERSION - 1 so from_version < SCHEMA_VERSION
+        def mock_current_version(self):
+            return _orig_cv(self) - 1  # calls original, then subtracts 1
+
+        monkeypatch.setattr(storage_mod.Storage, "_current_version", mock_current_version)
+        monkeypatch.setattr(storage_mod.Storage, "_create_indexes", idx_skipping_ci)
+
+        # verify-блок: idx_items_url_norm missing → RuntimeError
+        with pytest.raises(RuntimeError) as exc_info:
+            Storage(db_path=db_path)
+        assert "idx_items_url_norm" in str(exc_info.value), (
+            f"RuntimeError must name the missing index, got: {exc_info.value}"
+        )
+
 
 class TestUpdateLlmResultsBatchPerRecordIsolation:
     """

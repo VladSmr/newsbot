@@ -17,7 +17,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
-from datetime import timedelta, timezone
+from datetime import timedelta, timezone, datetime as _dt
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -578,6 +578,52 @@ class TestDigestWindowFailure(unittest.TestCase):
             # Граница НЕ сдвинута
             boundary = p.storage.get_meta("digest_window_started_at")
             self.assertEqual(boundary, "2024-01-01T00:00:00+00:00")
+
+            p.storage.close()
+            p.close()
+
+    def test_3strike_shifts_boundary(self):
+        """
+        FIX 5: 3-strike сдвигает digest_window_started_at (не только last_digest_at).
+        Без фикса: last_digest_at обновляется (слот обработан), но
+        digest_window_started_at остаётся от предыдущего успешного окна →
+        следующий слот считает границу от anchor → items старше границы
+        отсекаются published-фильтром → тихая потеря целого окна.
+        Фикс: обе мета-поля обновляются в 3-strike ветке.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2024-01-01T00:00:00+00:00")
+            s.set_meta("digest_failure_count", "3")  # уже на 3 неудачах
+            s.close()
+
+            for i in range(2):
+                _insert_deferred_item(
+                    db_path,
+                    title=f"Fault{i}", url=f"https://fault.com/f{i}",
+                    published="2099-01-01 12:00",
+                    fetched_at="2099-01-01T12:00:00+00:00",
+                )
+
+            p = _mk_pipeline(db_path)
+            delivery = MagicMock()
+            delivery.send_text.return_value = False  # всё падает
+            p.delivery = delivery
+
+            # 3-strike ветка: failure_count сброшен, boundary сдвинута
+            count = p.run_digest(force=True)
+
+            self.assertEqual(count, 0)
+
+            boundary = p.storage.get_meta("digest_window_started_at")
+            # FIX 5: boundary СДВИНУТА (не "2024-01-01T00:00:00+00:00")
+            assert boundary != "2024-01-01T00:00:00+00:00", (
+                f"FIX 5: 3-strike must shift digest_window_started_at, "
+                f"got: {boundary!r}"
+            )
+            failure_count = p.storage.get_meta("digest_failure_count")
+            self.assertEqual(failure_count, "0",
+                "3-strike resets failure_count")
 
             p.storage.close()
             p.close()
@@ -1576,7 +1622,7 @@ class TestCategoryGuaranteeEvictable(unittest.TestCase):
             FakeItem(9, 'deadline'),  # cinema
             FakeItem(2, 'deadline'),  # cinema
         ]
-        result = _category_guarantee(items, {'cinema': 2}, pool=None)
+        result, _ = _category_guarantee(items, {'cinema': 2}, pool=None)
         cats = [_infer_category(i) for i in result]
         self.assertEqual(cats.count('cinema'), 2)
         self.assertEqual(len(result), 2)  # unchanged
@@ -1822,8 +1868,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
     """
 
     def test_slot_08_boundary_is_yesterday_20(self):
-        import datetime as _dt
-        from datetime import timezone, timedelta
+        from datetime import datetime as _dt, timezone, timedelta
 
         with _tmp_db() as db_path:
             # No initial boundary (bootstrap сработает)
@@ -1862,7 +1907,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
                 score=9,
             )
 
-            fake_utc = _dt.datetime(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
+            fake_utc = _dt(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
 
             with _patch_dt_and_local_now(fake_utc):
                 count = p.run_digest(force=True)
@@ -1887,8 +1932,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
         Item с fetched_at = 2026-10-22T19:59 → В окне.
         Item с fetched_at = 2026-10-21T19:59 → ЗА границей.
         """
-        import datetime as _dt
-        from datetime import timezone
+        from datetime import datetime as _dt, timezone
 
         with _tmp_db() as db_path:
             p = _mk_pipeline(
@@ -1920,7 +1964,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
                 score=9,
             )
 
-            fake_utc = _dt.datetime(2026, 10, 22, 20, 0, 0, 0, tzinfo=timezone.utc)
+            fake_utc = _dt(2026, 10, 22, 20, 0, 0, 0, tzinfo=timezone.utc)
 
             with _patch_dt_and_local_now(fake_utc):
                 count = p.run_digest(force=True)
@@ -1941,8 +1985,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
         published-фильтр АКТИВЕН: новость с published ДО якоря не попадает,
         даже если fetched позже.
         """
-        import datetime as _dt
-        from datetime import timezone
+        from datetime import datetime as _dt, timezone
 
         with _tmp_db() as db_path:
             p = _mk_pipeline(
@@ -1970,7 +2013,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
                 score=9,
             )
 
-            fake_utc = _dt.datetime(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
+            fake_utc = _dt(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
 
             with _patch_dt_and_local_now(fake_utc):
                 count = p.run_digest(force=True)
@@ -1990,8 +2033,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
         поэтому fetched_at-граница НЕ фильтрует items. Оба items попадают
         в digest (сортировка по llm_score DESC: OldItem=9 первым).
         """
-        import datetime as _dt
-        from datetime import timezone
+        from datetime import datetime as _dt, timezone
 
         with _tmp_db() as db_path:
             p = _mk_pipeline(
@@ -2027,7 +2069,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
                 score=5,
             )
 
-            fake_utc = _dt.datetime(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
+            fake_utc = _dt(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
 
             with _patch_dt_and_local_now(fake_utc):
                 count = p.run_digest(force=True)
@@ -2046,8 +2088,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
         """
         Задача 1 (п.6): в anchor-режиме digest_window_started_at = anchor.
         """
-        import datetime as _dt
-        from datetime import timezone
+        from datetime import datetime as _dt, timezone
 
         with _tmp_db() as db_path:
             p = _mk_pipeline(
@@ -2071,7 +2112,7 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
                 score=7,
             )
 
-            fake_utc = _dt.datetime(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
+            fake_utc = _dt(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
 
             with _patch_dt_and_local_now(fake_utc):
                 count = p.run_digest(force=True)
@@ -2083,6 +2124,144 @@ class TestWindowAnchorSlot08Morning(unittest.TestCase):
             self.assertEqual(boundary, "2026-10-21T17:00:00+00:00",
                 f"Граница должна быть anchor-в-UTC (2026-10-21T17:00:00+00:00), "
                 f"получено: {boundary}")
+
+            p.storage.close()
+            p.close()
+
+    def test_anchor_meta_min_takes_more_recent_boundary(self):
+        """
+        FIX 4: anchor-режим с пропущенным слотом — window_start_iso = min(anchor, meta).
+        Если digest_slot был пропущен (scheduler lag), meta boundary осталась от
+        предыдущего окна и более свежая (=более узкая), чем anchor. БЕЗ min():
+        window_start=anchor → items после anchor (но до meta) теряются. С min():
+        window_start=meta (более узкая граница) → покрывает items из пропущенного
+        слота.
+        Break-check: без min() — тест падает, item не попадает.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            # anchor (yesterday 2026-10-21 20:00 UTC+3 = yesterday 17:00 UTC)
+            # meta = yesterday 14:00 UTC+3 = yesterday 11:00 UTC (ПОЗЖЕ = более свежая)
+            # min(anchor=17:00, meta=11:00) = 11:00 UTC — более узкое окно
+            s.set_meta("digest_window_started_at", "2026-10-21T14:00:00+03:00")
+            s.close()
+
+            # meta = 11:00 UTC (Oct 20) — earlier = more restrictive window
+            # anchor = 17:00 UTC (Oct 21) — later = wider window
+            # min(anchor, meta) = meta = 11:00 UTC — more restrictive (earlier = newer boundary)
+            # Item fetched_at = 22:00 UTC (Oct 21): AFTER anchor (22 > 17), BEFORE meta (22 < 31).
+            # БЕЗ min(): window=anchor=17:00 → item 22:00 ВНУТРИ → count=1.
+            # С min(): window=meta=11:00 → item 22:00 ВНУТРИ → count=1.
+            # => Для разницы нужен item ПОСЛЕ anchor, ДО meta (в UTC-сравнении).
+            # meta (Oct 22 07:00 UTC) — NEWER, later timestamp.
+            # anchor (Oct 21 17:00 UTC) — OLDER, earlier timestamp.
+            # Item at 22:00 UTC Oct 21: after anchor 17:00, before meta 07:00 Oct 22.
+            # published=14:01 UTC — строго между meta (11:00 UTC) и anchor (17:00 UTC).
+            # БЕЗ min(): window_start=anchor=17:00 → 14:01 < 17:00 → item ОТСЕКАЕТСЯ.
+            # С min(): window_start=meta=11:00 → 14:01 > 11:00 → item ПОПАДАЕТ.
+            _insert_deferred_item(
+                db_path, title="PostAnchorPreMeta",
+                url="https://ex.com/papm",
+                published="21.10.2026 14:01 UTC",
+                fetched_at="2026-10-21T14:01:00+00:00",
+                score=8,
+            )
+
+            fake_utc = _dt(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 100,
+                    "window_anchor": "20:00",
+                    "bootstrap_window_hours": 24,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            with _patch_dt_and_local_now(fake_utc):
+                count = p.run_digest(force=True)
+
+            # Item 14:01 UTC — после meta 11:00, до anchor 17:00.
+            # БЕЗ min(): window_start=anchor=17:00 → item ОТСЕКАЕТСЯ (published < 17:00).
+            # С min(): window_start=meta=11:00 → item ПОПАДАЕТ (11:00 < 14:01).
+            # Break-check: без min()-логики тест красный.
+            self.assertEqual(count, 1,
+                f"FIX 4: min(anchor, meta) must cover items between anchor and meta. "
+                f"got count={count}")
+
+            p.storage.close()
+            p.close()
+
+    def test_anchor_meta_min_old_boundary_is_ignored(self):
+        """
+        FIX D: stale meta (meta_dt < anchor_dt - bootstrap) — freshness guard
+        отклоняет её, window_start_iso остаётся от anchor. БЕЗ guard: stale
+        meta сужает window и теряет items.
+        Break-check: без guard тест падает.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            # anchor: Oct 21 17:00 UTC. Bootstrap=24ч.
+            # Stale threshold = anchor - 24ч = Oct 20 17:00 UTC.
+            # meta: Oct 19 08:00 UTC+3 = Oct 19 05:00 UTC (OLDER than threshold).
+            # С guard: meta отклоняется, window от anchor → [Oct 20 17:00, ...].
+            # БЕЗ guard: window от meta → [Oct 19 05:00, ...].
+            s.set_meta("digest_window_started_at", "2026-10-19T08:00:00+03:00")
+            s.close()
+
+            # Item: fetched_at = Oct 21 10:00 UTC.
+            # Внутри anchor-окна [Oct 20 17:00, Oct 21 17:00] → covered by anchor.
+            # Внутри stale meta-окна [Oct 19 05:00, Oct 21 17:00] → covered by stale.
+            # → Тест проверяет что stale meta НЕ используется для СУЖЕНИЯ.
+            # BREAK-CHECK: если убрать guard — meta всё равно шире (Oct 19 < Oct 20) →
+            # результат тот же → тест не падает. Сужаю meta ДО bootstrap:
+            # meta = Oct 20 10:00 UTC+3 = Oct 20 07:00 UTC (within bootstrap).
+            s2 = Storage(db_path)
+            # Anchor: Oct 21 17:00, stale threshold: Oct 20 17:00.
+            # Meta: Oct 20 10:00+03:00 = Oct 20 07:00 UTC.
+            # Freshness: 07:00 >= 17:00 - 24ч = Oct 20 17:00? NO → 07:00 < 17:00 → stale.
+            # С guard: window = anchor → [Oct 20 17:00, Oct 21 17:00].
+            # БЕЗ guard: window = meta → [Oct 20 07:00, Oct 21 17:00].
+            # Item fetched: Oct 21 14:00 UTC → inside stale-window, OUTSIDE anchor-window.
+            s2.set_meta("digest_window_started_at", "2026-10-20T10:00:00+03:00")
+            s2.close()
+
+            _insert_deferred_item(
+                db_path, title="StaleWindowCoveredItem",
+                url="https://ex.com/stale_covered",
+                published="21.10.2026 14:00 UTC",
+                fetched_at="2026-10-21T14:00:00+00:00",
+                score=8,
+            )
+
+            fake_utc = _dt(2026, 10, 22, 8, 0, 0, 0, tzinfo=timezone.utc)
+
+            p = _mk_pipeline(
+                db_path,
+                digest_cfg={
+                    "enabled": True, "max_items": 100,
+                    "window_anchor": "20:00",
+                    "bootstrap_window_hours": 24,
+                },
+            )
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            with _patch_dt_and_local_now(fake_utc):
+                count = p.run_digest(force=True)
+
+            # FIX D: stale meta (Oct 20 07:00 UTC) within bootstrap, but guard
+            # checks anchor - bootstrap = Oct 20 17:00 UTC. 07:00 < 17:00 → stale
+            # → window stays at anchor (Oct 20 17:00). Item 14:00 UTC is BEFORE
+            # anchor 17:00 → OUTSIDE anchor-window → count=0.
+            # Break-check: без guard → window = Oct 20 07:00 → item 14:00 inside → count=1.
+            self.assertEqual(count, 0,
+                f"FIX D: stale meta must be ignored; item before anchor must NOT be covered. "
+                f"got count={count}")
 
             p.storage.close()
             p.close()

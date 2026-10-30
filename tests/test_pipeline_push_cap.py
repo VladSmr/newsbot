@@ -14,7 +14,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # For test (f): patch setup_logging to avoid config.py writing to stderr
 try:
@@ -97,7 +97,7 @@ class FakeLLMFilter:
             if (is_fresh and (item.url in self._error_urls or self._force_ok_false)):
                 results.append(FilterResult(
                     ok=False,
-                    cost_blocked=True,
+                    cost_blocked=False,
                     score=None,
                     summary="",
                     reason="test-cost-blocked",
@@ -141,6 +141,12 @@ def fresh_db():
     os.close(fd)
     Path(path).unlink()
     return path, lambda: _cleanup_db(path)
+
+
+def _insert_items_to_storage(storage: Storage, items):
+    """Вставляет items в БД через storage.save() (подготовка перед set_state)."""
+    for item in items:
+        storage.save(item)
 
 
 def make_pipeline(db_path, llm_filter=None, extra_config=None):
@@ -432,5 +438,74 @@ def test_ok_false_no_crash():
             f"ok=False не должны считаться как push, counter={push_ref[0]}"
         )
         # _process_batch вернул управление (не упал с TypeError)
+    finally:
+        cleanup()
+
+
+def test_ok_false_single_apply_no_double_retry():
+    """
+    FIX E: ok=False обрабатывается ровно один раз за цикл.
+    Без фикса: первый проход (fresh path) вызывает _apply_result для ok=False,
+    НО url НЕ попадает в _pushed_urls → второй проход (items_to_llm loop)
+    вызывает _apply_result снова → двойной вызов на item.
+    Break-check: если _apply_result вызывается дважды хотя бы для одного item —
+    тест падает. Также: retry_count остаётся 0 (ok=False не инкрементирует).
+    """
+    db_path, cleanup = fresh_db()
+    try:
+        pipeline = make_pipeline(
+            db_path,
+            llm_filter=FakeLLMFilter(force_ok_false=True),
+            extra_config={"llm": {"max_pushes_per_cycle": 3}},
+        )
+        # fresh items: пойдут через evaluate_batch → ok=False
+        items = [
+            make_item(f"retry-test-{i}", score=9, urgent=True, has_llm_score=False)
+            for i in range(3)
+        ]
+        # Items must be in DB before set_state (UPDATE only).
+        _insert_items_to_storage(pipeline.storage, items)
+        pipeline.storage.set_state([i.url for i in items], "pending")
+
+        # Monkeypatch _apply_result: считаем вызовы на каждый url
+        apply_calls: dict = {i.url: 0 for i in items}
+        original_apply = pipeline._apply_result
+
+        def counting_apply(*args, **kwargs):
+            # args: (self, item, res, push_th, ...) — pipeline instance is args[0]
+            item = args[0]
+            if item.url in apply_calls:
+                apply_calls[item.url] += 1
+            return original_apply(*args, **kwargs)
+
+        pipeline._apply_result = counting_apply  # type: ignore[method-assign]
+
+        push_ref = [0]
+        pipeline._process_batch(
+            items, budget_override=len(items),
+            push_count_ref=push_ref,
+        )
+
+        # FIX E: _apply_result вызывается ровно один раз на каждый item.
+        # Без фикса: второй проход вызывает _apply_result снова → count=2 → FAIL.
+        for url, count in apply_calls.items():
+            assert count == 1, (
+                f"FIX E: _apply_result called {count} times for {url} "
+                f"(expected 1 = single apply per cycle)"
+            )
+
+        # retry_count остаётся 0 (ok=False не инкрементирует в _apply_result)
+        conn = pipeline.storage._connect()
+        for item in items:
+            row = conn.execute(
+                "SELECT retry_count FROM items WHERE url=?", (item.url,)
+            ).fetchone()
+            assert row is not None, f"{item.url} not found in DB"
+            assert row[0] == 0, (
+                f"retry_count for {item.url} expected 0 (ok=False не инкрементирует), got {row[0]}"
+            )
+        conn.close()
+
+        assert push_ref[0] == 0, "ok=False НЕ считается как push"
     finally:
         cleanup()
