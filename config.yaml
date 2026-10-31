@@ -118,7 +118,7 @@ sources:
 # wall-clock слоты: :30 каждые 2 ч (00:30, 02:30, … 22:30, локальное время).
 # poll_interval_minutes используется ТАКЖЕ как grace_period в pipeline.py
 # (расширяет окно published на 120 мин — допустимо, защита границы).
-poll_interval_minutes: 120
+poll_interval_minutes: 180
 
 # --- База данных ---
 database:
@@ -271,7 +271,7 @@ llm:
   # two_phase: двухфазная фильтрация (phase2 для borderline items).
   two_phase:
     enabled: true
-    phase2_min_score: 4          # items с score >= 4 идут во phase2
+    phase2_min_score: 5          # items с score >= 5 идут во phase2
   # prefilter: быстрый синтаксический/ключевой предфильтр ДО LLM.
   prefilter:
     enabled: true
