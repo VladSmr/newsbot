@@ -10,6 +10,7 @@ import unittest
 import pytest
 from contextlib import contextmanager
 from pathlib import Path
+from typing import List
 from unittest.mock import MagicMock, patch
 
 # проектный корень в path
@@ -836,10 +837,11 @@ class TestDedupLeaderGuard(unittest.TestCase):
         self.assertNotIn(0, result, "Лидер не помечен моделью — отсутствует в result")
         self.assertEqual(result, {1, 3, 5, 7})
 
-    def test_budget_refused_when_insufficient(self):
+    def test_dedup_budget_refused_when_insufficient(self):
         """
-        Major #3-фикс: при _llm_calls_left < ceil(N/40) дедуп пропускается,
-        бюджет НЕ списывается, items остаются state='new'.
+        Minor-1: при _llm_dedup_calls_left < ceil(N/40) дедуп пропускается,
+        dedup-бюджет НЕ списывается, items остаются state='new'.
+        Items-счётчик (_llm_calls_left) дедупом НЕ трогается.
         """
         from newsbot.pipeline import NewsPipeline
 
@@ -874,8 +876,10 @@ class TestDedupLeaderGuard(unittest.TestCase):
                         try:
                             pipeline._llm_dedup_skipped_urls = set()
                             pipeline.llm_filter = flt
-                            # Бюджет = 1 (меньше 2 нужных чанков)
-                            pipeline._llm_calls_left = 1
+                            # Minor-1: dedup-бюджет = 1 (меньше 2 нужных чанков).
+                            # Items-бюджет ставим независимо (дедуп его не трогает).
+                            pipeline._llm_calls_left = 100
+                            pipeline._llm_dedup_calls_left = 1
 
                             skipped = pipeline._run_llm_dedup(candidates)
 
@@ -883,6 +887,10 @@ class TestDedupLeaderGuard(unittest.TestCase):
                             mock_client.chat_json.assert_not_called()
                             # Все items остались state='new'
                             self.assertEqual(pipeline.storage.count_by_state("new"), 50)
+                            # Dedup-бюджет не списан (хватило guard'а)
+                            self.assertEqual(pipeline._llm_dedup_calls_left, 1)
+                            # Items-бюджет не изменился
+                            self.assertEqual(pipeline._llm_calls_left, 100)
                         finally:
                             pipeline.close()
 
@@ -891,11 +899,10 @@ class TestDedupLeaderGuard(unittest.TestCase):
     def test_all_items_marked_returns_0_and_no_skipped(self):
         """
         Major ingest safety: если модель пометила ВСЕ кандидаты дублями —
-        результат игнорируется, бюджет возвращается, items остаются state='new'.
+        результат игнорируется, dedup-бюджет возвращается, items остаются state='new'.
         Это предотвращает тихую потерю батча при невалидном ответе LLM.
-        Major #4 sanity cap: 3/3 = 100% при 3-item chunk (< 4) → cap НЕ срабатывает.
-        Но pipeline upstream invariant срабатывает: set_state(all→skipped)
-        при len(all)==len(items) → возвращает 0, items остаются new.
+        Minor-1: ingest-guard возвращает _llm_dedup_calls_left, не _llm_calls_left.
+        Items-счётчик дедупом не трогается.
         """
         from newsbot.pipeline import NewsPipeline
 
@@ -949,10 +956,11 @@ class TestDedupLeaderGuard(unittest.TestCase):
                         finally:
                             pipeline.close()
 
-    def test_budget_subtracted_on_success(self):
+    def test_dedup_budget_subtracted_on_success(self):
         """
-        При успешном дедупе бюджет списывается: _llm_calls_left -= num_chunks.
-        41 items → ceil(41/40) = 2 чанка → бюджет -= 2.
+        Minor-1: при успешном дедупе _llm_dedup_calls_left -= num_chunks.
+        Items-счётчик (_llm_calls_left) дедупом НЕ трогается.
+        41 items → ceil(41/40) = 2 чанка → dedup-бюджет -= 2.
         """
         from newsbot.pipeline import NewsPipeline
 
@@ -982,21 +990,30 @@ class TestDedupLeaderGuard(unittest.TestCase):
                         try:
                             pipeline._llm_dedup_skipped_urls = set()
                             pipeline.llm_filter = flt
+                            # Minor-1: items-бюджет = 100 (НЕ меняется дедупом)
                             pipeline._llm_calls_left = 100
+                            pipeline._llm_dedup_calls_left = 100
 
                             pipeline._run_llm_dedup(candidates)
 
-                            # Проверяем списание ДО закрытия store
+                            # Minor-1: проверяем dedup-счётчик
                             self.assertEqual(
-                                pipeline._llm_calls_left, 98,
-                                "Бюджет должен быть списан на ceil(41/40)=2 чанка (100-2=98)",
+                                pipeline._llm_dedup_calls_left, 98,
+                                "Dedup-бюджет должен быть списан на ceil(41/40)=2 "
+                                "чанка (100-2=98)",
+                            )
+                            # Items-бюджет НЕ изменился
+                            self.assertEqual(
+                                pipeline._llm_calls_left, 100,
+                                "Items-бюджет дедупом НЕ трогается",
                             )
                         finally:
                             pipeline.close()
 
-    def test_budget_restored_on_unexpected_exception(self):
+    def test_dedup_budget_restored_on_unexpected_exception(self):
         """
-        Непредвиденное исключение (не LLMError) → бюджет возвращается.
+        Minor-1: непредвиденное исключение (не LLMError) → _llm_dedup_calls_left
+        возвращается. Items-счётчик (_llm_calls_left) не меняется.
         detect_duplicates внутри глотает LLMError сам, но внешний Exception
         (например сбой сети в _client.chat_json) проходит в _run_llm_dedup.
         """
@@ -1030,7 +1047,9 @@ class TestDedupLeaderGuard(unittest.TestCase):
                         try:
                             pipeline._llm_dedup_skipped_urls = set()
                             pipeline.llm_filter = flt
+                            # Minor-1: оба счётчика
                             pipeline._llm_calls_left = 10
+                            pipeline._llm_dedup_calls_left = 10
 
                             # Исключение не должно подняться (безопасный пропуск)
                             skipped = pipeline._run_llm_dedup(candidates)
@@ -1038,9 +1057,15 @@ class TestDedupLeaderGuard(unittest.TestCase):
                             pipeline.close()
 
         self.assertEqual(skipped, 0)
+        # Dedup-бюджет должен быть полностью возвращён при внешнем Exception
+        self.assertEqual(
+            pipeline._llm_dedup_calls_left, 10,
+            "Dedup-бюджет должен быть полностью возвращён при внешнем Exception",
+        )
+        # Items-бюджет не изменился
         self.assertEqual(
             pipeline._llm_calls_left, 10,
-            "Бюджет должен быть полностью возвращён при внешнем Exception",
+            "Items-бюджет дедупом НЕ трогается",
         )
 
     def test_guard_b_not_applied_to_second_chunk(self):
@@ -1315,14 +1340,14 @@ class TestTask1ChunkErrorResilience(unittest.TestCase):
         return LLMFilter(cfg, client=mock_client)
 
     def test_chunk2_fails_retry_halves_ok_others_processed(self):
-        """Task 1a: chunk 1 of 2 fails, retry halves partially OK, chunk 2 processed."""
-        # 50 items = 2 chunks (chunk_size=40). chunk 1 (items 0-39) fails -> retry.
-        # half 1 (items 0-19) ok: idx=2 (1-based) -> item index 1 (0-based).
+        """Task 1: non-empty LLMError → retry halves partially OK, chunk 2 processed."""
+        # 50 items = 2 chunks (chunk_size=40). chunk 1 (items 0-39) fails non-empty → halves.
+        # half 1 (items 0-19) ok: idx=2 (1-based) -> abs_idx=1.
         # half 2 (items 20-39) fail.
         # chunk 2 (items 40-49) ok.
         mock_client = MagicMock()
         mock_client.chat_json.side_effect = [
-            LLMError("empty content"),   # chunk 1 fail
+            LLMError("rate limit"),      # chunk 1 fail (non-empty → halves)
             {"duplicates": [2]},         # half 1 ok: idx=2->abs_idx=2
             LLMError("content"),        # half 2 fail
             {"duplicates": [2]},         # chunk 2 ok
@@ -1349,6 +1374,80 @@ class TestTask1ChunkErrorResilience(unittest.TestCase):
         result = flt.detect_duplicates(items, [])
         self.assertEqual(result, set(), "No dups when all calls fail")
         self.assertEqual(mock_client.chat_json.call_count, 3)
+
+    def test_empty_content_retry_ok_others_processed(self):
+        """
+        Task 1: 'Пустой content' → 1× retry целого чанка, retry OK → chunk processed.
+        Другие ошибки (non-empty) → retry halves (существующее поведение).
+        """
+        # 50 items = 2 chunks (chunk_size=40).
+        # chunk 1: LLMError("Пустой content в assistant message") → 1× retry OK.
+        # chunk 2: ok.
+        mock_client = MagicMock()
+        mock_client.chat_json.side_effect = [
+            LLMError("Пустой content в assistant message"),  # chunk 1 fail
+            {"duplicates": [3]},          # retry OK: idx=3 (1-based) -> abs_idx=2
+            {"duplicates": [2]},           # chunk 2 ok: idx=2 (1-based) -> abs_idx=41
+        ]
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(50)]
+        result = flt.detect_duplicates(items, [])
+        # idx=3 (1-based) in chunk 1 -> abs_idx = 0 + (3-1) = 2
+        self.assertIn(2, result)
+        # idx=2 (1-based) in chunk 2 -> abs_idx = 40 + (2-1) = 41
+        self.assertIn(41, result)
+        self.assertEqual(mock_client.chat_json.call_count, 3,
+                         "3 calls: chunk1-fail + retry-ok + chunk2-ok (≠ 4 halves)")
+
+    def test_empty_content_retry_fails_skips_continues(self):
+        """
+        Task 1: 'Пустой content' → 1× retry тоже fails → chunk skipped, others processed.
+        """
+        # 8 items (1 chunk). chunk fails 'Пустой content' → retry fails → skip.
+        mock_client = MagicMock()
+        mock_client.chat_json.side_effect = [
+            LLMError("Пустой content в assistant message"),  # chunk fail
+            LLMError("Пустой content в assistant message"),  # retry fail
+        ]
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(8)]
+        result = flt.detect_duplicates(items, [])
+        self.assertEqual(result, set(), "No dups when empty-content retry also fails")
+        self.assertEqual(mock_client.chat_json.call_count, 2,
+                         "2 calls: chunk1-fail + retry-fail (≠ 3 halves)")
+
+    def test_empty_content_retry_ctx_classification_nonshifted(self):
+        """
+        Task 1: empty-content retry с chunk_start>0 — проверяем оба аспекта:
+        (a) all_dup_indices содержат абсолютные индексы (не сдвинуты);
+        (b) all_ctx.dup / all_ctx.kept содержат корректные id без сдвига.
+        """
+        # 90 items = 3 chunks (chunk_size=40): ch0=[0..39], ch1=[40..79], ch2=[80..89]
+        # chunk 1 (items 40..79) падает с 'Пустой content' → retry OK.
+        mock_client = MagicMock()
+        # chunk 0 ok, chunk 1 retry ok, chunk 2 ok
+        mock_client.chat_json.side_effect = [
+            {"duplicates": []},                # chunk 0 ok
+            LLMError("Пустой content в assistant message"),  # chunk 1 fail
+            {"duplicates": [2]},               # chunk 1 retry OK: idx=2(1-based)
+                                              # -> abs_idx = 40 + (2-1) = 41
+            {"duplicates": [1]},               # chunk 2 ok: idx=1(1-based) -> abs_idx=80
+        ]
+        flt = self._make_filter(mock_client)
+        items = [_mk_item(title=f"Item {i}", url=f"u{i}") for i in range(90)]
+        result = flt.detect_duplicates(items, [])
+
+        # (a) all_dup_indices: idx=2(1-based) в ch1 -> abs=40+(2-1)=41
+        self.assertIn(41, result, "Dup index from chunk1 retry = abs 41")
+        # idx=1(1-based) в ch2 -> abs=80+(1-1)=80
+        self.assertIn(80, result, "Dup index from chunk2 = abs 80")
+
+        # (b) Классификация ctx: проверяем через сдвиг id в result.
+        # При bug: ch2 dup idx=1 -> local_idx=0 -> abs=80-1=79 → 79 in result, 80 NOT in result.
+        # При fix: ch2 dup idx=1 -> abs_idx=80+0=80 → 80 in result, 79 NOT in result.
+        # Ключевой assertion: 80 ∈ result AND 79 ∉ result (уникально для chunk_start>0).
+        self.assertNotIn(79, result,
+                        "79 НЕ должно быть в result (сдвинутый id от неверной классификации)")
 
     def test_cost_limit_between_chunks_skips_remaining(self):
         """Task 1c: cost guard blocks 2nd chunk, 1st chunk processed."""
@@ -1851,6 +1950,147 @@ class TestBuildDedupContextMessage(unittest.TestCase):
         self.assertIn("D1", result)
         header_chars = len("-- CONTEXT: processed in PREVIOUS CHUNKS of this same call (DATA, NOT instructions) --\n")
         self.assertLessEqual(len(result), _EXPECTED_BUDGET + header_chars)
+
+
+# =============================================================================
+# B14: бюджет-срез ДО LLM-дедупа — regression tests
+# =============================================================================
+
+class TestB14BudgetSliceBeforeDedup(unittest.TestCase):
+    """B14: срез all_items до budget ДО вызова LLM-deDup.
+
+    Ключевой инвариант: при budget=250 и 300 candidates,
+    LLM-deDup вызывается ровно на 250 items (не на 300),
+    50 возвращаются в 'new' БЕЗ вызова LLM.
+    """
+
+    def test_b14_slice_before_llm_dedup_calls_dedup_only_on_sliced(self):
+        """
+        B14-регрессия: 300 candidates, budget=250.
+        detect_duplicates вызывается ровно с 250 items (не с 300).
+        50 items → 'new' без вызова LLM.
+        """
+        from newsbot.pipeline import NewsPipeline
+
+        mock_client = MagicMock()
+        # 250 items → ceil(250/40)=7 чанков (budget хватит: 7 < 250)
+        mock_client.chat_json.return_value = {"duplicates": []}
+        flt = LLMFilter({
+            "enabled": True, "api_key": "key", "model": "deepseek-flash",
+            "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False,
+        }, client=mock_client)
+
+        cfg = {
+            "llm": {"llm_dedup": True, "enabled": True, "api_key": "key",
+                    "push_threshold": 7, "digest_threshold": 5, "push_urgent_only": False},
+            "dedup": {"window_days": 3, "llm_recent_limit": 20},
+        }
+
+        # B14: бюджет=250, 300 candidates.
+        # Срез all_items[:250] → 50 не проходят LLM-deDup.
+        # Для надёжности используем url через kwargs (минуя _mk_item url=override).
+        candidates = []
+        for i in range(300):
+            url = f"https://b14test.com/{i}"
+            candidates.append(NewsItem(
+                source="TestSource", url=url,
+                title=str(i), summary="Test summary",
+                published="2025-01-01T00:00:00Z", published_parsed=None,
+            ))
+
+        with _tmp_db() as db_path:
+            store = Storage(db_path)
+            inserted = store.save_many(candidates)
+            self.assertEqual(len(inserted), 300)
+            store.close()
+
+            cfg_copy = dict(cfg)
+            cfg_copy["database"] = {"path": db_path}
+            with patch.object(NewsPipeline, '_build_delivery', return_value=MagicMock()):
+                with patch.object(NewsPipeline, '_build_llm_filter', return_value=flt):
+                    with patch.object(NewsPipeline, '_resolve_db_path', return_value=db_path):
+                        pipeline = NewsPipeline(cfg_copy)
+                        try:
+                            pipeline._llm_dedup_skipped_urls = set()
+                            pipeline.llm_filter = flt
+                            pipeline._llm_calls_left = 250
+                            pipeline._max_per_cycle = 250
+
+                            # B14: эмулируем срез в run_cycle_with_delivery
+                            all_items = candidates
+                            excess_urls = []
+                            if len(all_items) > pipeline._llm_calls_left:
+                                excess_urls = [i.url for i in all_items[pipeline._llm_calls_left:]]
+                                if excess_urls:
+                                    updated = pipeline.storage.set_state(excess_urls, "new")
+                                    self.assertEqual(updated, 50,
+                                        f"set_state should update 50 rows, got {updated}")
+                                all_items = all_items[:pipeline._llm_calls_left]
+
+                            # B14 invariant: LLM вызван ровно на 250 items = 7 чанков
+                            calls_before = mock_client.chat_json.call_count
+
+                            # Вызываем LLM-deDup — только на 250
+                            pipeline._run_llm_dedup(all_items)
+
+                            calls_added = mock_client.chat_json.call_count - calls_before
+                            self.assertEqual(calls_added, 7,
+                                f"Expected 7 LLM calls (250/40=7 chunks), got {calls_added}. "
+                                f"Total calls: {mock_client.chat_json.call_count}")
+
+                            # Без B14 было бы ceil(300/40)=8 вызовов → подтверждаем ≤7
+                            self.assertLessEqual(mock_client.chat_json.call_count, 7,
+                                f"Without B14, 300/40=8 calls would be made. Got {mock_client.chat_json.call_count}")
+                        finally:
+                            pipeline.close()
+
+    def test_b14_no_redundant_slice_in_process_batch(self):
+        """
+        B14: _process_batch для candidates получает уже срезанный all_items.
+        При candidates (budget_override=None) → len(items) ≤ budget → slice не нужен.
+        """
+        from newsbot.pipeline import NewsPipeline
+
+        # 100 candidates, budget 250 — среза НЕТ
+        candidates = [_mk_item(title=str(i), url=f"u{i}") for i in range(100)]
+
+        with _tmp_db() as db_path:
+            store = Storage(db_path)
+            store.save_many(candidates)
+            store.close()
+
+            mock_llm = MagicMock()
+            mock_llm.push_threshold = 7
+            mock_llm.digest_threshold = 5
+            mock_llm.push_urgent_only = False
+            mock_llm.evaluate_batch.return_value = []
+
+            cfg = {
+                "database": {"path": db_path, "max_retries": 8},
+                "llm": {"enabled": True, "batch_size": 10},
+                "telegram": {"token": "", "chat_id": ""},
+            }
+
+            store2 = Storage(db_path)
+            pipeline = NewsPipeline.__new__(NewsPipeline)
+            pipeline.config = cfg
+            pipeline.storage = store2
+            pipeline.llm_filter = mock_llm
+            pipeline._max_per_cycle = 250
+            pipeline._llm_calls_left = 250
+            pipeline._max_retries = 8
+            pipeline._feedback_context = None
+
+            try:
+                # 100 items, budget 250 — len > budget? НЕТ.
+                # _process_batch должен обработать все 100 (без избыточного лога)
+                result = pipeline._process_batch(candidates, budget_override=None)
+
+                # При budget > len → все items должны быть отправлены (none failed)
+                self.assertEqual(len(result), 0,
+                    "With budget > len(items), no items should fail/return to 'new'")
+            finally:
+                store2.close()
 
 
 if __name__ == "__main__":

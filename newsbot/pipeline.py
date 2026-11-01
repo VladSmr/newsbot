@@ -1673,6 +1673,9 @@ class NewsPipeline:
         # Инициализируем множество, если атрибут отсутствует (тесты через __new__)
         if not hasattr(self, '_llm_dedup_skipped_urls'):
             self._llm_dedup_skipped_urls: Set[str] = set()
+        # Minor-1: init-guard для прямых вызовов _run_llm_dedup (без run_cycle_with_delivery)
+        if not hasattr(self, '_llm_dedup_calls_left'):
+            self._llm_dedup_calls_left = self._max_per_cycle
 
         dedup_cfg = self.config.get("dedup", {})
         window_days = _coerce_int(dedup_cfg.get("window_days", 3), 3, "dedup.window_days")
@@ -1681,12 +1684,17 @@ class NewsPipeline:
         # Major #3-фикс: оцениваем стоимость дедупа ДО вызова.
         # detect_duplicates → ceil(N/40) чанков = ceil(N/40) вызовов.
         # Если бюджета недостаточно — пропускаем (безопасный fallback).
+        # Minor-1: дедуп списывает ceil(N/40) вызовов из отдельного счётчика,
+        # чтобы не смешивать единицы бюджета (items vs вызовы). До фикса:
+        # дедуп списывал вызовы из items-бюджета → после 9 чанков (350/40≈9)
+        # items-бюджет падал до 341 и redundancy-guard возвращал ~9 легитимных
+        # кандидатов в 'new'. Теперь dedup и скоринг имеют независимые бюджеты.
         num_chunks = math.ceil(len(candidates) / self.llm_filter._DEDUP_CHUNK_SIZE)
-        if self._llm_calls_left < num_chunks:
+        if self._llm_dedup_calls_left < num_chunks:
             logger.info(
-                "LLM-дедуп: бюджет %d < %d (нужно %d чанков) — пропускаем, "
-                "бюджет сохранён для скоринга (%d items)",
-                self._llm_calls_left, num_chunks, num_chunks, len(candidates),
+                "LLM-дедуп: dedup-бюджет %d < %d (нужно %d чанков) — пропускаем, "
+                "dedup-бюджет сохранён для скоринга (%d items)",
+                self._llm_dedup_calls_left, num_chunks, num_chunks, len(candidates),
             )
             return 0
         # Списываем бюджет заранее (до вызова — списываемое == ceil(N/40)).
@@ -1694,7 +1702,7 @@ class NewsPipeline:
         # поэтому реальных сбоев после списания почти не бывает —
         # возврат через except почти недостижим. Но guard оставлен
         # для устойчивости к непредвиденным исключениям (сбой сети и т.п.).
-        self._llm_calls_left -= num_chunks
+        self._llm_dedup_calls_left -= num_chunks
 
         # Собираем recent titles из БД
         recent = self.storage.get_recent_titles(
@@ -1709,7 +1717,7 @@ class NewsPipeline:
         except Exception as e:
             # Возврат при непредвиденном сбое (LLMError уже обработан внутри
             # detect_duplicates, но на случай непредвиденных исключений — возврат).
-            self._llm_calls_left += num_chunks
+            self._llm_dedup_calls_left += num_chunks
             logger.warning("_run_llm_dedup: исключение: %s — пропускаем (безопасно)", e)
             return 0
 
@@ -1724,7 +1732,7 @@ class NewsPipeline:
         # dedup одиночной новости (recent_list непуст в штатном сценарии).
         # Лечение: возвращаем бюджет, set_state не вызываем, items остаются new.
         if len(dup_0based) >= len(candidates) and len(candidates) > 1:
-            self._llm_calls_left += num_chunks
+            self._llm_dedup_calls_left += num_chunks
             logger.warning(
                 "LLM-дедуп (ingest): модель пометила все %d кандидатов дублями "
                 "(>1) — игнорируем результат (бюджет %d возвращён). "
@@ -2087,7 +2095,9 @@ class NewsPipeline:
         # recovered (K1) + candidates (сбор)
         all_items: List[NewsItem] = recovered + candidates
         # обнуляем бюджет на начало доставки
+        # Minor-1: dedup использует отдельный счётчик вызовов, не отнимая от items-бюджета
         self._llm_calls_left = self._max_per_cycle
+        self._llm_dedup_calls_left = self._max_per_cycle
 
         # ── Few-shot feedback context (Фаза 2c): один раз за цикл ──
         self._load_feedback_context()
@@ -2172,6 +2182,34 @@ class NewsPipeline:
                     len(prefiltered_urls), len(all_items),
                 )
 
+        # ── B14: бюджет-срез ДО LLM-дедупа — экономия на treadmill ──
+        # Major: B14 выполняется безусловно, но при llm_filter is None бюджета не
+        # существует (все items проходят _process_batch где llm_filter is not None
+        # проверяется на :2376). Без B14-guard кандидаты сверх max_per_cycle всё
+        # равно уходят в 'new' через budget<=0 (:2397-2405) — искусственный кап.
+        # Fix: проверяем llm_filter is not None.
+        # Minor-2: set_state(to_return_new, "new") избыточен — все items в
+        # all_items уже state='new' (recovered=K1/get_all_by_state("new"),
+        # candidates=save_many/new_items). Дубли и prefiltered уже вырезаны
+        # из all_items. set_state лишь перезаписывал state_at; без предиката по
+        # state любой будущий не-'new' элемент воскрешался бы в 'new'.
+        # all_items на этой точке: только 'new' items → безопасно удалить set_state.
+        llm_dedup_skipped = 0
+        if self.llm_filter is not None and len(all_items) > self._llm_calls_left:
+            to_process = all_items[:self._llm_calls_left]
+            to_return_new = all_items[self._llm_calls_left:]
+            logger.info(
+                "B14: бюджет-срез: %d/%d candidates → LLM-deDup, "
+                "%d → 'new' (retry в след.цикле, без LLM)",
+                len(to_process), len(all_items), len(to_return_new),
+            )
+            all_items = to_process
+        else:
+            logger.info(
+                "B14: бюджет-срез: %d/%d candidates → LLM-deDup",
+                len(all_items), len(all_items),
+            )
+
         # ── LLM-дедупликация: семантическая группировка «одно событие» ──
         # Critical #1-фикс: вызов ПОСЛЕ гейтов паузы и off-peak.
         # На паузе и в off-peak LLM-дедуп НЕ вызывается — экономия платных токенов.
@@ -2179,7 +2217,8 @@ class NewsPipeline:
         # также уже выполнены (до гейтов) — сохранность данных обеспечена.
         # При сбое LLM — безопасный пропуск: ни один дубль не проходит.
         # Major-3: prefiltered URLs уже исключены из all_items.
-        llm_dedup_skipped = 0
+        # B14: бюджет-срез ВЫШЕ — all_items уже ограничен бюджетом,
+        # un-sliced items возвращены в 'new' БЕЗ вызова LLM-deDup.
         # Проверяем что llm_filter имеет необходимые атрибуты (для тестов с FakeLLMFilter).
         has_dedup_chunk = (
             self.llm_filter is not None
@@ -2266,10 +2305,12 @@ class NewsPipeline:
             retry_budget = 0
 
         # ── доставка новых candidates + recovered ──
+        # B14: all_items уже ограничен бюджетом и очищен от LLM-дублей.
+        # remaining_budget — остаток после B14 (срез ДО LLM-deDup).
         remaining_budget = self._llm_calls_left
         if all_items:
             logger.info(
-                "Доставка %d candidates+recovered, бюджет %d/%d",
+                "Доставка %d candidates (после B14+dedup), бюджет остаток %d/%d",
                 len(all_items), remaining_budget, self._max_per_cycle,
             )
             # N1: candidates теперь реально вставленные items
@@ -2361,17 +2402,24 @@ class NewsPipeline:
             # Minor #4-фикс: при budget<0 → клампим в 0 (items[:<0] даёт непустой префикс)
             budget = max(0, budget)
             items_to_llm = items
+            # B14: бюджет-срез ДО LLM-deDup. Для candidates (budget_override=None)
+            # B14 уже срезал all_items до [:self._llm_calls_left] перед вызовом.
+            # Здесь redundancy-guard: если вызывающий (retry-batch) прислал больше
+            # items чем budget — логируем и режем. Для candidates это НЕ сработает
+            # (len(items) ≤ budget после B14).
             if budget <= 0:
                 # бюджет исчерпан — все items возвращаются в state='new' (K1 подхватит
                 # в следующем цикле). C1': НЕ добавляем в failed_urls →
                 # retry_count не инкрементируется.
                 logger.warning(
-                    "LLM-бюджет цикла исчерпан (0/%d); %d items → 'new' (retry в след.цикле)",
+                    "LLM-бюджет исчерпан (0/%d); %d items → 'new' (retry в след.цикле)",
                     self._max_per_cycle, len(items),
                 )
                 to_deliver = []  # никто не доставлен, никого не помечаем failed
 
             if len(items) > budget:
+                # B14-redundancy: сюда попадаем только если retry-batch больше budget
+                # (candidates прошли B14-срез и len(items) ≤ budget).
                 logger.warning(
                     "LLM-бюджет %d/%d: обрабатываем первые %d items, "
                     "остальные %d — back to 'new' (retry в след.цикле)",
@@ -2382,7 +2430,7 @@ class NewsPipeline:
                 if excess_urls:
                     self.storage.set_state(excess_urls, "new")
                     logger.debug(
-                        "Бюджетный срез: %d items возвращены в state='new' "
+                        "Бюджетный срез (retry): %d items возвращены в state='new' "
                         "(retry_count сохранён)",
                         len(excess_urls),
                     )

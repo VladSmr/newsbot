@@ -1880,15 +1880,77 @@ class LLMFilter:
                 _chunk_error = str(e)
 
             if _chunk_error is not None:
-                # Task 1: пробуем retry половинами.
+                _is_empty_content = "Пустой content" in _chunk_error
+
                 # NOTE: ПОВТОРНЫЙ вызов _check_daily_cost после успешного вызова
                 # в top-of-loop: безопасен (guard уже списал budget за этот чанк).
                 # Если лимит исчерпался после первого вызова этого чанка —
                 # retry не делаем, сразу пропускаем чанк.
+
+                # ── Пустой content → 1× retry целого чанка (≠ retry halves) ──
+                if _is_empty_content and self._check_daily_cost():
+                    retry_usage = self._usage_totals()
+                    retry_raw: Optional[Dict[str, Any]] = None
+                    retry_error: Optional[str] = None
+                    try:
+                        retry_raw = self._client.chat_json(
+                            system=DEDUP_SYSTEM_PROMPT,
+                            user=build_dedup_user_message(chunk, recent, ctx=all_ctx),
+                        )
+                    except LLMError as e:
+                        self._record_usage(retry_usage)
+                        retry_error = str(e)
+
+                    if retry_raw is not None:
+                        self._record_usage(retry_usage)
+                        retry_parsed = self._parse_dedup_response(
+                            retry_raw, len(chunk), chunk_start, recent=recent,
+                        )
+                        if retry_parsed is not None:
+                            # _parse_dedup_response returns 0-based ABSOLUTE indices
+                            all_dup_indices.update(retry_parsed)
+                            for local_idx in range(len(chunk)):
+                                abs_idx = chunk_start + local_idx
+                                item = items[abs_idx]
+                                if abs_idx in retry_parsed:
+                                    all_ctx.dup.append({
+                                        "id": abs_idx,
+                                        "title": item.title,
+                                        "source": getattr(item, "source", ""),
+                                    })
+                                else:
+                                    all_ctx.kept.append({
+                                        "id": abs_idx,
+                                        "title": item.title,
+                                        "source": getattr(item, "source", ""),
+                                    })
+                            _processed_chunks += 1
+                            continue
+                        # retry вернул None (cap/cant-parse) → skip чанк
+                        _skipped_chunks += 1
+                        logger.warning(
+                            "LLM-ошибка чанка [%d:%d]: retry 1x, skipped "
+                            "(cap / parse failed), сохраняем дубли (%d шт.)",
+                            chunk_start, chunk_start + len(chunk),
+                            len(all_dup_indices),
+                        )
+                        continue
+                    else:
+                        # retry тоже пустой → skip чанк
+                        _skipped_chunks += 1
+                        logger.warning(
+                            "LLM-ошибка чанка [%d:%d]: retry 1x, skipped, "
+                            "сохраняем уже найденные дубли (%d шт.)",
+                            chunk_start, chunk_start + len(chunk),
+                            len(all_dup_indices),
+                        )
+                        continue
+
+                # ── Все прочие ошибки → retry halves (существующее поведение) ──
                 _half_tried = 0
                 _half_failed = 0
                 half_dup_indices: Set[int] = set()
-                _half_classified: Set[int] = set()  # abs indices already in all_ctx
+                _half_classified: Set[int] = set()
 
                 if self._check_daily_cost():
                     mid = len(chunk) // 2
