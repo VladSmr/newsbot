@@ -674,12 +674,12 @@ class TestCostLogNoise:
             third = list(caplog.records)
 
         # Первый блок: ровно по одному WARNING на каждое сообщение
-        assert len(_warnings(first, "daily cost limit reached")) == 1
+        assert len(_warnings(first, "cost limit reached")) == 1
         assert len(_warnings(first, "в pending накоплено")) == 1
         # Повторы — не WARNING
-        assert _warnings(second, "daily cost limit") == []
+        assert _warnings(second, "cost limit") == []
         assert _warnings(second, "в pending накоплено") == []
-        assert _warnings(third, "daily cost limit") == []
+        assert _warnings(third, "cost limit") == []
         assert _warnings(third, "в pending накоплено") == []
         # ... но диагностика не потеряна: pending виден в DEBUG
         assert any(

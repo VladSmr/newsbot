@@ -598,19 +598,19 @@ class TestNewPurge(unittest.TestCase):
         try:
             st = Storage(Path(path))
             item = _mk_item(title="OldNew", url="https://oldnew.example/1")
-            st.save(item)  # state='new', state_at=сейчас
+            st.save(item)  # state='new', fetched_at=сейчас, state_at=сейчас
             conn = st._connect()
             from datetime import timedelta
-            # state_at = 100 дней назад → старше retention_days=90
-            old_at = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
+            # fetched_at = 100 дней назад → старше TTL new_retention_hours=48 (default)
+            old_fetched = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
             conn.execute(
-                "UPDATE items SET state='new', state_at=? WHERE url=?",
-                (old_at, "https://oldnew.example/1")
+                "UPDATE items SET state='new', fetched_at=? WHERE url=?",
+                (old_fetched, "https://oldnew.example/1")
             )
             conn.commit()
 
             deleted = st.purge_items(retention_days=90, deferred_retention_days=14)
-            self.assertGreaterEqual(deleted, 1, "Старый new item должен быть удалён")
+            self.assertGreaterEqual(deleted, 1, "Старый new item (fetched_at старше TTL) должен быть удалён")
 
             count = conn.execute(
                 "SELECT COUNT(*) FROM items WHERE state='new'"

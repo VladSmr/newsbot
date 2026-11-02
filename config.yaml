@@ -133,6 +133,7 @@ database:
                                   # (при долгой паузе 'new' накапливаются; лимит защищает RAM)
   stuck_pending_limit: 500      # макс. 'pending'-items, загружаемых из retry-очереди за один цикл
                                   # (аналогичная защита RAM от большого backlog)
+  new_retention_hours: 48        # TTL очереди 'new' в часах (по fetched_at); 0 = выключено
 
 # --- Логирование ---
 logging:
@@ -291,6 +292,9 @@ llm:
   pricing:
     deepseek-flash:  {input: 0.15, output: 0.60, cache_hit: 0.003}
     deepseek-v4-pro: {input: 0.50, output: 2.00, cache_hit: 0.003}   # placeholder: не верифицировано
+  # Window cost limit (USD per 6-hour UTC window); 0 = disabled
+  # Intended to spread the daily budget evenly — e.g. 0.12/6h ≈ $0.48/day
+  window_cost_limit: 0.12
   # Daily cost limit per model (USD per UTC day); 0 = disabled
   # Items exceeding the limit remain pending and retry in the next cycle
   daily_cost_limit: 0.50

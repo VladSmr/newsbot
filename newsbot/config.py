@@ -69,7 +69,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "poll_interval_minutes": 15,
     "database": {"path": "data/newsbot.db", "retention_days": 1, "retry_threshold_sec": 60,
                    "deferred_retention_days": 3, "recovery_new_limit": 500,
-                   "stuck_pending_limit": 500, "max_retries": 8},
+                   "stuck_pending_limit": 500, "max_retries": 8,
+                   "new_retention_hours": 48},
     "logging": {
         "level": "INFO",
         "format": "%(asctime)s | v%(version)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -126,6 +127,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "deepseek-flash": {"input": 0.15, "output": 0.60, "cache_hit": 0.003},
             "deepseek-v4-pro": {"input": 0.50, "output": 2.00, "cache_hit": 0.003},  # placeholder: не верифицировано
         },
+        "window_cost_limit": 0.12,  # USD per 6-hour UTC window; 0 = disabled
         "daily_cost_limit": 0.50,  # USD per day; 0 = disabled
     },
     # Фаза 2: обратная связь (кнопки 👍/👎)
@@ -315,6 +317,7 @@ def _validate_llm_numeric_fields(cfg: Dict[str, Any]) -> None:
         (("max_tokens",), int, 1, 65536),
         (("timeout_sec",), float, 1, 600),
         (("temperature",), float, 0, 2),
+        (("window_cost_limit",), float, 0, 100000),
         (("daily_cost_limit",), float, 0, 100000),
         (("batch_size",), int, 1, 1000),
         (("max_per_cycle",), int, 0, 100000),
@@ -587,6 +590,7 @@ def _validate_database_numeric(cfg: Dict[str, Any]) -> None:
     fields = (
         ("max_retries", 8, 1),
         ("recovery_new_limit", 500, 1),
+        ("new_retention_hours", 48, 0),  # 0 = выключено, max 8760 (365*24)
     )
     for field, default, min_bound in fields:
         if field not in db_cfg:
@@ -608,6 +612,26 @@ def _validate_database_numeric(cfg: Dict[str, Any]) -> None:
             db_cfg[field] = default
         else:
             db_cfg[field] = converted
+
+    # new_retention_hours: int в [0..8760], 0=выключено
+    raw_h = db_cfg.get("new_retention_hours")
+    if raw_h is not None:
+        converted_h = None
+        if not isinstance(raw_h, bool) and isinstance(raw_h, (int, float, str)):
+            try:
+                f = float(raw_h)
+                if math.isfinite(f) and f == int(f) and 0 <= int(f) <= 8760:
+                    converted_h = int(f)
+            except (TypeError, ValueError, OverflowError):
+                converted_h = None
+        if converted_h is None:
+            logger.warning(
+                "database.new_retention_hours=%r — ожидалось целое в [0..8760], используется дефолт 48",
+                raw_h,
+            )
+            db_cfg["new_retention_hours"] = 48
+        else:
+            db_cfg["new_retention_hours"] = converted_h
 
 
 def _validate_dedup_numeric(cfg: Dict[str, Any]) -> None:

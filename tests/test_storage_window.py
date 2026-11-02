@@ -400,42 +400,100 @@ class TestStorageWindow(unittest.TestCase):
             "None ожидается, когда new/pending items отсутствуют")
 
     # ─────────────────────────────────────────────────────────────────
-    # purge_items: separate 'new' retention window
+    # purge_items: TTL 'new' по fetched_at (new_retention_hours)
     # ─────────────────────────────────────────────────────────────────
 
-    def test_purge_keeps_new_items_within_new_retention(self):
-        """'new' item 2 дня назад при retention_days=0 НЕ удаляется
-        (new живёт минимум DEFAULT_NEW_RETENTION_DAYS=7 дней)."""
-        self._insert("new", hours_ago=48, title="New2days")  # 2 дня назад
-        deleted = self.storage.purge_items(retention_days=0)
-        self.assertEqual(deleted, 0, "new-item 2 дня назад не должен быть удалён")
+    def test_purge_new_48h_ttl_removes_old(self):
+        """'new' item старше 48ч по fetched_at → удалён."""
+        self._insert("new", hours_ago=49, title="New49h")  # старше TTL
+        deleted = self.storage.purge_items(retention_days=0, new_retention_hours=48)
+        self.assertEqual(deleted, 1, "new-item старше 48ч должен быть удалён")
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         remaining = {r["title"] for r in conn.execute("SELECT title FROM items").fetchall()}
         conn.close()
-        self.assertIn("New2days", remaining)
+        self.assertNotIn("New49h", remaining)
 
-    def test_purge_removes_old_new_items(self):
-        """'new' item 8 дней назад удаляется (старше DEFAULT_NEW_RETENTION_DAYS=7)."""
-        self._insert("new", hours_ago=8 * 24, title="New8days")
-        deleted = self.storage.purge_items(retention_days=0)
-        self.assertEqual(deleted, 1, "new-item старше 7 дней должен быть удалён")
+    def test_purge_new_48h_ttl_keeps_fresh(self):
+        """'new' item 47ч назад по fetched_at → жив (в пределах TTL)."""
+        self._insert("new", hours_ago=47, title="New47h")
+        deleted = self.storage.purge_items(retention_days=0, new_retention_hours=48)
+        self.assertEqual(deleted, 0, "new-item 47ч назад не должен быть удалён")
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         remaining = {r["title"] for r in conn.execute("SELECT title FROM items").fetchall()}
         conn.close()
-        self.assertNotIn("New8days", remaining)
+        self.assertIn("New47h", remaining)
 
-    def test_purge_removes_terminal_items_at_retention_1(self):
-        """'delivered' item 2 дня назад при retention_days=1 удаляется."""
-        self._insert("delivered", hours_ago=48, title="Del2days")
-        deleted = self.storage.purge_items(retention_days=1)
-        self.assertEqual(deleted, 1, "delivered старше retention_days должен быть удалён")
+    def test_purge_new_ttl_disabled(self):
+        """new_retention_hours=0 → ничего не удалено для 'new'."""
+        self._insert("new", hours_ago=1000, title="NewVeryOld")  # 1000ч назад
+        deleted = self.storage.purge_items(retention_days=0, new_retention_hours=0)
+        self.assertEqual(deleted, 0, "TTL выключен — 'new' не удаляются")
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         remaining = {r["title"] for r in conn.execute("SELECT title FROM items").fetchall()}
         conn.close()
-        self.assertNotIn("Del2days", remaining)
+        self.assertIn("NewVeryOld", remaining)
+
+    def test_purge_new_by_fetched_at_not_state_at(self):
+        """Item со свежим state_at, но старым fetched_at → удаляется (fetched_at)."""
+        # Вставляем item с разными fetched_at и state_at.
+        # state_at = сейчас (свежий), fetched_at = 49ч назад (старше TTL).
+        url = "https://example.com/fetched_vs_state_at"
+        fetched = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT INTO items
+                (source, url, title, summary, published, fetched_at,
+                 state, state_at, llm_score, llm_summary, llm_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, ("Test", url, "FreshStateOldFetch", "sum", fetched, fetched,
+              "new", now, 5.0, "summary", "reason"))
+        conn.commit()
+        conn.close()
+
+        deleted = self.storage.purge_items(retention_days=0, new_retention_hours=48)
+        self.assertEqual(deleted, 1,
+            "fresh state_at НЕ спасает — fetched_at определяет TTL")
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        remaining = {r["url"] for r in conn.execute("SELECT url FROM items").fetchall()}
+        conn.close()
+        self.assertNotIn(url, remaining)
+
+    def test_purge_new_default_48h(self):
+        """При отсутствии new_retention_hours дефолт = 48ч."""
+        self._insert("new", hours_ago=49, title="New49h_default")
+        deleted = self.storage.purge_items(retention_days=0)  # new_retention_hours=48 по умолчанию
+        self.assertEqual(deleted, 1, "дефолтный TTL=48ч удаляет 49ч-old")
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        remaining = {r["title"] for r in conn.execute("SELECT title FROM items").fetchall()}
+        conn.close()
+        self.assertNotIn("New49h_default", remaining)
+
+    def test_purge_other_states_not_affected_by_new_ttl(self):
+        """Другие states при 48ч-TTL для 'new' — НЕ удалены."""
+        self._insert("delivered", hours_ago=49, title="DelOld")
+        self._insert("pending", hours_ago=49, title="PendOld")
+        self._insert("deferred", hours_ago=49, title="DefOld")
+
+        deleted = self.storage.purge_items(
+            retention_days=100,  # delivered не удалится (49ч < 100 дней)
+            deferred_retention_days=100,  # deferred не удалится
+            new_retention_hours=48,
+        )
+        # Удалён только 'new' старше TTL, delivered/pending/deferred не трогаются
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        remaining = {r["title"] for r in conn.execute("SELECT title FROM items").fetchall()}
+        conn.close()
+        self.assertIn("DelOld", remaining)
+        self.assertIn("PendOld", remaining)
+        self.assertIn("DefOld", remaining)
 
     def test_get_deferred_items_published_since_ignored(self):
         """

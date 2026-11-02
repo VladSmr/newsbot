@@ -322,6 +322,16 @@ class LLMFilter:
             )
             self._daily_cost_limit = 0.0
 
+        self._window_cost_limit = self._parse_float_field(
+            config_llm, "window_cost_limit", 0.0
+        )
+        if self._window_cost_limit < 0:
+            logger.warning(
+                "llm.window_cost_limit=%r отрицательный — оконный guard выключен (0)",
+                self._window_cost_limit,
+            )
+            self._window_cost_limit = 0.0
+
         # Storage для daily cost tracking
         self._storage = storage
 
@@ -1272,75 +1282,108 @@ class LLMFilter:
         — После float() — валидация math.isfinite: NaN в meta → считаем 0.0
           (NaN < limit == False → вечная блокировка до полуночи).
         """
-        if self._daily_cost_limit <= 0 or not self._storage:
+        if (self._daily_cost_limit <= 0 and self._window_cost_limit <= 0) or not self._storage:
             return True
 
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        limit_key = f"llm_daily_cost_{today}"
-        warning_flag_key = f"llm_cost_limit_warning_done_{today}"
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y%m%d")
+        window_idx = now.hour // 6
+        day_key = f"llm_daily_cost_{today}"
+        window_key = f"llm_daily_cost_{today}_w{window_idx}"
+        day_warning_key = f"llm_cost_limit_warning_done_{today}"
+        window_warning_key = f"llm_window_cost_warning_done_{today}_w{window_idx}"
 
         # M11-fix: fail-open на чтение + isfinite после float()
-        try:
-            raw_cost = self._storage.get_meta(limit_key)
-            current_cost = float(raw_cost) if raw_cost is not None else 0.0
-        except Exception as e:  # noqa: BLE001 — sqlite3.OperationalError и др.
-            logger.warning(
-                "LLM cost-guard: не удалось прочитать дневной расход (%s) "
-                "→ fail-open, вызов разрешён",
-                e,
-            )
-            return True
-        if not math.isfinite(current_cost):
-            logger.warning(
-                "LLM cost-guard: невалидный дневной расход %r (not finite) "
-                "→ treated as 0.0",
-                raw_cost,
-            )
-            current_cost = 0.0
+        def _read_cost(key):
+            try:
+                raw = self._storage.get_meta(key)
+                val = float(raw) if raw is not None else 0.0
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "LLM cost-guard: не удалось прочитать расход '%s' (%s) "
+                    "→ fail-open, вызов разрешён",
+                    key, e,
+                )
+                return None
+            if not math.isfinite(val):
+                logger.warning(
+                    "LLM cost-guard: невалидный расход %r по ключу '%s' (not finite) "
+                    "→ treated as 0.0",
+                    raw, key,
+                )
+                return 0.0
+            return val
 
-        # Решение о блокировке — ВСЕГДА по факту current_cost (не по флагу).
-        # Флаг warning'а используется ТОЛЬКО для подавления повторного WARNING:
-        # если оператор поднял daily_cost_limit в тот же UTC-день, блокировка
-        # снимается сразу, без ожидания полуночи.
-        if current_cost < self._daily_cost_limit:
+        spent_day = _read_cost(day_key) if self._daily_cost_limit > 0 else None
+        spent_window = _read_cost(window_key) if self._window_cost_limit > 0 else None
+
+        # Проверка: отказ если ЛЮБОЙ активный лимит превышен
+        window_exceeded = spent_window is not None and spent_window >= self._window_cost_limit
+        daily_exceeded = spent_day is not None and spent_day >= self._daily_cost_limit
+
+        if not window_exceeded and not daily_exceeded:
             self._cost_warning_fresh = False
             return True
 
-        # M11-fix: fail-open на чтение warning-flag
-        try:
-            warning_done = self._storage.get_meta(warning_flag_key)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "LLM cost-guard: не удалось прочитать warning-flag (%s) "
-                "→ WARNING заблокирован, но лимит сработает",
-                e,
-            )
-            warning_done = None
+        # Определяем какой лимит сработал для логирования
+        violated = []
+        if window_exceeded:
+            violated.append(f"window ${spent_window:.2f}/${self._window_cost_limit:.2f}")
+        if daily_exceeded:
+            violated.append(f"daily ${spent_day:.2f}/${self._daily_cost_limit:.2f}")
 
-        if warning_done != "1":
-            logger.warning(
-                "LLM daily cost limit reached: $%.2f >= $%.2f — "
-                "skipping LLM call (items will be retried later)",
-                current_cost, self._daily_cost_limit,
-            )
-            # M11-fix: fail-open на запись warning-flag
+        # M11-fix: fail-open на чтение warning-flag
+        def _warning_done(key):
             try:
-                self._storage.set_meta(warning_flag_key, "1")
+                return self._storage.get_meta(key)
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "LLM cost-guard: не удалось записать warning-flag (%s) "
-                    "→ WARNING в этот день будет повторяться",
-                    e,
+                    "LLM cost-guard: не удалось прочитать warning-flag '%s' (%s) "
+                    "→ WARNING заблокирован, но лимит сработает",
+                    key, e,
                 )
+                return None
+
+        day_flag = _warning_done(day_warning_key) if daily_exceeded else None
+        window_flag = _warning_done(window_warning_key) if window_exceeded else None
+
+        day_done = day_flag == "1"
+        window_done = window_flag == "1"
+
+        # WARN if any exceeded limit has NOT yet shown its warning today.
+        # E.g. if daily_exceeded=False and day_flag=None → day_done=False, but
+        # we don't warn about daily (it wasn't exceeded). We warn only for
+        # exceeded limits whose flag is missing.
+        warn_day = daily_exceeded and not day_done
+        warn_window = window_exceeded and not window_done
+
+        if warn_day or warn_window:
+            logger.warning(
+                "LLM cost limit reached (%s) — "
+                "skipping LLM call (items will be retried later)",
+                ", ".join(violated),
+            )
             self._cost_warning_fresh = True
+
+            def _write_flag(key):
+                try:
+                    self._storage.set_meta(key, "1")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "LLM cost-guard: не удалось записать warning-flag '%s' (%s) "
+                        "→ WARNING в этот период будет повторяться",
+                        key, e,
+                    )
+
+            if warn_day:
+                _write_flag(day_warning_key)
+            if warn_window:
+                _write_flag(window_warning_key)
         else:
-            # Повторное превышение в тот же день (в т.ч. после того как оператор
-            # поднял лимит, а расход снова его достиг). DEBUG терял информацию —
-            # пишем INFO с фактическими значениями, но без WARNING-шума.
             logger.info(
-                "LLM daily cost limit reached again: $%.2f >= $%.2f — skip "
-                "(warning уже был сегодня)",
-                current_cost, self._daily_cost_limit,
+                "LLM cost limit reached again (%s) — skip "
+                "(warning уже был в этом периоде)",
+                ", ".join(violated),
             )
             self._cost_warning_fresh = False
         return False
@@ -1424,8 +1467,10 @@ class LLMFilter:
             completion_delta = after[1]
         if prompt_delta == 0 and completion_delta == 0:
             return
+        # Minor-1: вычисляем now один раз — гарантируем一致ность ключей
+        now = datetime.now(timezone.utc)
         self._accumulate_daily_cost(prompt_delta, completion_delta,
-                                     cache_hit_delta, cache_miss_delta)
+                                     cache_hit_delta, cache_miss_delta, now=now)
 
     def _accumulate_daily_cost(
         self,
@@ -1433,32 +1478,32 @@ class LLMFilter:
         completion_tokens: int,
         cache_hit_tokens: int = 0,
         cache_miss_tokens: int = 0,
+        now: "datetime" = None,
     ) -> None:
         """
-        Аккумулирует стоимость вызова в дневной счётчик.
-        Цена берётся из _pricing по модели.
+        Аккумулирует стоимость вызова в дневной и оконный счётчики.
 
-        Major #12-фикс: стоимость = hit * price_hit + miss * price_input
-        + completion * price_output. При отсутствии split'а
-        (cache_hit_tokens == 0 AND cache_miss_tokens == 0) — fallback
-        на старую формулу (все prompt по цене input, завышая стоимость).
-        Это сохраняет обратную совместимость: старые модели без поддержки
-        cache-hit просто получают завышенную оценку (консервативный подход).
+        Minor-1: ``now`` позволяет вызывающему коду передать уже вычисленное
+        UTC-время, чтобы _check_daily_cost и _accumulate_daily_cost
+        гарантированно использовали одно окно (не разбежались на границе).
+
+        Аккумуляция оконного ключа пишется ТОЛЬКО при window_cost_limit > 0:
+       Minor-2: при выключенном оконном лимите ключ не засоряется.
+
+        Каждый ключ читает свой current и пишет current + cost
+        (Critical-1: window_key = расход ТОЛЬКО текущего окна, не копия day).
 
         M11-fix: fail-open при ошибках storage.
-        — При ошибке чтения текущего cost (get_meta или float()) → выход БЕЗ
-          записи: except → return, set_meta НЕ вызывается. БЕЗ этого: код
-          продолжился бы к set_meta(..., "0.0") → недоучёт всех предыдущих
-          вызовов (аккумулятор перезаписывается нулём при каждой ошибке чтения).
-        — После float() — math.isfinite: NaN в meta → current = 0.0.
-        — При ошибке записи накопленного cost (set_meta) → no-op (токены уже
-          списаны API; дневной лимит сработает позже, в следующих вызовах).
         """
         if not self._storage:
             return
 
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        cost_key = f"llm_daily_cost_{today}"
+        if now is None:
+            now = datetime.now(timezone.utc)
+        today = now.strftime("%Y%m%d")
+        window_idx = now.hour // 6
+        day_key = f"llm_daily_cost_{today}"
+        window_key = f"llm_daily_cost_{today}_w{window_idx}"
 
         prices = self._pricing.get(self.model, {})
         input_price = prices.get("input", 0)   # USD per 1M tokens
@@ -1488,33 +1533,51 @@ class LLMFilter:
             ) / 1_000_000
 
         # M11-fix: fail-open на чтение + isfinite после float()
-        try:
-            raw = self._storage.get_meta(cost_key)
-            current = float(raw) if raw is not None else 0.0
-        except Exception as e:  # noqa: BLE001
-            # Выход БЕЗ записи: set_meta не вызывается, накопленный расход не перезаписывается.
-            # БЕЗ этого: set_meta(..., "0.0") → недоучёт всех предыдущих вызовов.
-            logger.warning(
-                "LLM cost-guard: не удалось прочитать дневной расход (%s) "
-                "→ накопление пропущено (не перезаписываем аккумулятор)",
-                e,
-            )
-            return
-        if not math.isfinite(current):
-            logger.warning(
-                "LLM cost-guard: невалидный дневной расход %r → current=0.0",
-                raw,
-            )
-            current = 0.0
+        def _read(key):
+            try:
+                raw = self._storage.get_meta(key)
+                val = float(raw) if raw is not None else 0.0
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "LLM cost-guard: не удалось прочитать расход '%s' (%s) "
+                    "→ накопление пропущено (не перезаписываем аккумулятор)",
+                    key, e,
+                )
+                return None
+            if not math.isfinite(val):
+                logger.warning(
+                    "LLM cost-guard: невалидный расход %r по ключу '%s' → current=0.0",
+                    raw, key,
+                )
+                return 0.0
+            return val
 
-        # M11-fix: fail-open на запись
+        day_current = _read(day_key)
+        if day_current is None:
+            return  # day write абортится, window не трогаем
+
+        # Minor-2: оконный ключ пишется только при активном оконном лимите
+        if self._window_cost_limit > 0:
+            window_current = _read(window_key)
+            if window_current is None:
+                return
+            try:
+                self._storage.set_meta(window_key, str(window_current + cost))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "LLM cost-guard: не удалось записать оконный расход '%s' (%s) "
+                    "→ токены уже списаны API",
+                    window_key, e,
+                )
+
+        # Дневной пишется всегда
         try:
-            self._storage.set_meta(cost_key, str(current + cost))
+            self._storage.set_meta(day_key, str(day_current + cost))
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "LLM cost-guard: не удалось записать накопленный расход (%s) "
-                "→ накопление пропущено (токены уже списаны API)",
-                e,
+                "LLM cost-guard: не удалось записать дневной расход '%s' (%s) "
+                "→ токены уже списаны API",
+                day_key, e,
             )
 
     # ── Task 4: length-split recursive batch ───────────────────────────────

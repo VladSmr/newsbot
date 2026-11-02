@@ -2395,29 +2395,44 @@ class Storage:
                 break
         return total
 
+    def count_expired_new(self, cutoff: str) -> int:
+        """
+        Подсчитывает 'new' items с fetched_at старше cutoff (для TTL-логирования).
+        cutoff — ISO-строка, items с fetched_at < cutoff считаются истёкшими.
+        """
+        try:
+            with self._tx() as conn:
+                cur = conn.execute(
+                    "SELECT COUNT(*) FROM items WHERE state = 'new' AND fetched_at < ?",
+                    (cutoff,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.warning("count_expired_new: ошибка — %s", e)
+            return 0
+
     def purge_items(
         self,
         retention_days: int = None,
         feedback_retention_days: int = None,
         deferred_retention_days: int = None,
+        new_retention_hours: int = 48,
     ) -> int:
         """
         Удаляет items старше retention_days:
-          - 'new': отдельное окно — не меньше DEFAULT_NEW_RETENTION_DAYS (7 дней),
-            чтобы пауза или долгий скоринг-цикл не уничтожили ещё не оценённые
-            новости, которые не попадали в дайджест.
-          - 'deferred': старые отложенные, которые не попали ни в один дайджест
-            (накапливались бесконечно при паузе или дайджест-окнах < max_items;
-            digest берёт топ-30 по score, остаток копился вечно).
+          - 'new': TTL в часах (new_retention_hours, по fetched_at).
+            0 = выключено (ничего не удаляется для 'new').
+            fetched_at вместо state_at: иммутабельна при insert,
+            не обновляется при B14-excess возвратах в 'new'.
+          - 'deferred': старые отложенные, которые не попали ни в один дайджест.
           - 'delivered', 'skipped', 'failed', 'digested': терминальные items
-            старше retention_days (классический purge).
+            старше retention_days.
         'pending' — не удаляется (активный retry). Но pending, который не
         двигается (state_at не обновлялся) дольше PENDING_STALE_DAYS, —
-        терминализируется в 'failed' (см. ниже), НЕ удаляется: удаление
-        произойдёт обычным retention-окном уже для failed.
+        терминализируется в 'failed'.
 
-        Также вызывает prune_feedback_targets для очистки старых targets
-        (feedback при этом СОХРАНЯЕТСЯ — обучающие данные).
+        Возвращает общее количество удалённых строк.
         """
         retention_days = _coerce_days(
             retention_days, self.DEFAULT_RETENTION_DAYS, "purge_items.retention_days",
@@ -2438,12 +2453,18 @@ class Storage:
         deferred_cutoff = (
             datetime.now(timezone.utc) - timedelta(days=deferred_retention_days)
         ).isoformat()
-        # 'new' живут минимум DEFAULT_NEW_RETENTION_DAYS дней, даже если
-        # retention_days передан как 0 (например, из тестов).
-        new_retention_days = max(retention_days, self.DEFAULT_NEW_RETENTION_DAYS)
-        cutoff_new = (
-            datetime.now(timezone.utc) - timedelta(days=new_retention_days)
-        ).isoformat()
+        # new_retention_hours: TTL для 'new' по fetched_at (0=выключено).
+        # Используем fetched_at (иммутабельна) вместо state_at, т.к.:
+        #   1) B14-excess возвращает items в 'new' БЕЗ вызова set_state
+        #      (pipeline.py:2198-2211) — state_at остаётся старым.
+        #   2) state_at обновляется при set_state (storage.py:1586), но
+        #      fetched_at не меняется — надёжнее как возраст.
+        #   3) Семантика fetched_at совпадает с дайджест-окном.
+        cutoff_new = None
+        if new_retention_hours > 0:
+            cutoff_new = (
+                datetime.now(timezone.utc) - timedelta(hours=new_retention_hours)
+            ).isoformat()
         # Застрявший pending: state_at не двигался PENDING_STALE_DAYS дней.
         pending_cutoff = (
             datetime.now(timezone.utc) - timedelta(days=self.PENDING_STALE_DAYS)
@@ -2478,16 +2499,18 @@ class Storage:
                 )
                 terminal_del = cur.rowcount
 
-                # new: отдельное окно (DEFAULT_NEW_RETENTION_DAYS, минимум 7 дней)
-                cur_new = conn.execute(
-                    """
-                    DELETE FROM items
-                    WHERE state = 'new'
-                      AND state_at < ?
-                    """,
-                    (cutoff_new,),
-                )
-                new_del = cur_new.rowcount
+                # new: TTL по fetched_at (new_retention_hours, 0=выключено)
+                new_del = 0
+                if cutoff_new is not None:
+                    cur_new = conn.execute(
+                        """
+                        DELETE FROM items
+                        WHERE state = 'new'
+                          AND fetched_at < ?
+                        """,
+                        (cutoff_new,),
+                    )
+                    new_del = cur_new.rowcount
 
                 # deferred: отдельное окно (deferred_retention_days)
                 cur_def = conn.execute(

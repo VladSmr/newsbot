@@ -1576,11 +1576,27 @@ class NewsPipeline:
             "deferred_retention_days",
             self.storage.DEFAULT_DEFERRED_RETENTION_DAYS,
         )
+        new_retention_hours = self.config.get("database", {}).get("new_retention_hours", 48)
+
+        # Подсчёт 'new' старше TTL перед purge (для INFO-лога).
+        expired_new = 0
+        if new_retention_hours > 0:
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=new_retention_hours)).isoformat()
+            expired_new = self.storage.count_expired_new(cutoff)
+
         self.storage.purge_items(
             retention_days=retention,
             feedback_retention_days=feedback_ret,
             deferred_retention_days=deferred_ret,
+            new_retention_hours=new_retention_hours,
         )
+
+        if isinstance(expired_new, int) and expired_new > 0:
+            logger.info(
+                "TTL: истекло %d 'new' items (старше %d ч)",
+                expired_new, new_retention_hours,
+            )
 
     def _load_feedback_context(self) -> None:
         """
