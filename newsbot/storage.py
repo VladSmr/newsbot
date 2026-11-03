@@ -1804,13 +1804,23 @@ class Storage:
             return 0
 
     def get_all_by_state(self, state: str, limit: Optional[int] = None) -> List[NewsItem]:
+        """
+        Возвращает items с заданным state.
+
+        Сортировка по умолчанию: fetched_at DESC (newest-first).
+        Радикальное исправление K1-recovery: старые items (FIFO/oldest-first)
+        забивали бюджет скоринга в ущерб свежим. При cost-cap-окне (~176 items/цикл)
+        старый хвост очереди 'new' не успевал обрабатываться → дайджест получал 0
+        candidates. Newest-first: свежие items получают приоритет, старые (fetched_at>48ч)
+        удаляются TTL-purge до того как застрянут навсегда.
+        """
         conn = self._connect()
         sql = """
             SELECT source, url, title, summary, published, tags, cluster_key, lang, fetched_at, state_at,
                    llm_score, llm_summary, llm_reason, llm_urgent, llm_title
             FROM items
             WHERE state = ?
-            ORDER BY id ASC
+            ORDER BY fetched_at DESC
         """
         if limit is not None:
             sql += f" LIMIT {int(limit)}"

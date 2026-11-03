@@ -61,6 +61,59 @@ def _cleanup(path):
 
 
 # =============================================================================
+# Empty digest: WARNING-лог + digest_empty_count инкремент
+# =============================================================================
+
+def test_pipeline_run_digest_empty_warns_and_increments_counter(caplog, tmp_path):
+    """
+    Пустой дайджест: WARNING в логах, digest_empty_count+1 в meta,
+    last_digest_at/digest_window_started_at пишутся как обычно.
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {"enabled": True, "on_empty": "skip",
+                   "max_items": 100, "max_items_per_message": 20},
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        # Пустая БД — deferred нет, on_empty=skip → early return
+        with caplog.at_level(logging.WARNING, logger="newsbot.pipeline"):
+            result = p.run_digest(force=False)
+
+        # (a) Возврат 0 (ok, ничего не отправлено)
+        assert result == 0, f"Expected 0, got {result}"
+
+        # (б) WARNING содержит "Дайджест пропущен" и "0 candidates"
+        warn_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            "Дайджест пропущен" in m and "0 candidates" in m for m in warn_messages
+        ), f"Expected WARNING 'Дайджест пропущен: 0 candidates'. Logs: {warn_messages}"
+
+        # (в) digest_empty_count увеличился
+        count_val = p.storage.get_meta("digest_empty_count")
+        assert count_val is not None, "digest_empty_count должен быть записан"
+        assert int(count_val) == 1, f"digest_empty_count ожидался 1, получен {count_val}"
+
+        # (г) last_digest_at записан (не пустой) — якорь окна
+        last_digest = p.storage.get_meta("last_digest_at")
+        assert last_digest is not None, "last_digest_at должен быть записан при пустом дайджесте"
+
+        # (д) digest_window_started_at записан (граница окна сдвинута)
+        window_start = p.storage.get_meta("digest_window_started_at")
+        assert window_start is not None, "digest_window_started_at должен быть записан"
+    finally:
+        p.close()
+
+
+# =============================================================================
 # M2: пустой deferred пишет last_digest_at (run_digest не спамит в след.цикле)
 # =============================================================================
 
@@ -567,6 +620,203 @@ def test_scored_stuck_delivered_when_llm_budget_exhausted(tmp_path):
         "evaluate_batch НЕ должен вызываться для scored items"
     )
     pipeline.close()
+
+
+# =============================================================================
+# Minor-1+2: empty-digest counter safety and separation
+# =============================================================================
+
+def test_empty_digest_increment_failure_does_not_block_markers(caplog, tmp_path):
+    """
+    Minor-1: get_meta/set_meta падают при инкременте → WARNING в логах,
+    маркеры last_digest_at/digest_window_started_at ВСЁ РАВНО записаны,
+    дайджест-ветка НЕ упала (return 0).
+
+    Это доказывает: маркеры не зависят от счётчика — свойство гарантировано
+    тем, что инкремент выполняется ПОСЛЕ записи обоих маркеров.
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {"enabled": True, "on_empty": "skip",
+                   "max_items": 100, "max_items_per_message": 20},
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        # Мокаем set_meta так, чтобы get_meta/set_meta ("digest_empty_count")
+        # падали, а маркеры — нет.
+        orig_set_meta = p.storage.set_meta
+        broken_count = {"called": False}
+
+        def flaky_set_meta(key, value):
+            if key == "digest_empty_count":
+                broken_count["called"] = True
+                raise RuntimeError("DB write error on counter")
+            return orig_set_meta(key, value)
+
+        p.storage.set_meta = flaky_set_meta
+
+        with caplog.at_level(logging.WARNING, logger="newsbot.pipeline"):
+            result = p.run_digest(force=False)
+
+        # (a) Дайджест вернул 0 (не упал)
+        assert result == 0, f"Expected 0, got {result}"
+
+        # (б) WARNING о счётчике
+        warn_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            "не удалось записать digest_empty_count" in m for m in warn_messages
+        ), f"Expected WARNING about counter. Logs: {warn_messages}"
+
+        # (в) broken_count вызван (инкремент пытался работать)
+        assert broken_count["called"], "set_meta для digest_empty_count должен был вызваться"
+
+        # (г) Маркеры ВСЁ РАВНО записаны (доказывает свойство независимости)
+        last_digest = p.storage.get_meta("last_digest_at")
+        assert last_digest is not None, (
+            "last_digest_at должен быть записан даже при сбое digest_empty_count"
+        )
+        window_start = p.storage.get_meta("digest_window_started_at")
+        assert window_start is not None, (
+            "digest_window_started_at должен быть записан даже при сбое digest_empty_count"
+        )
+    finally:
+        p.close()
+
+
+def test_failed_set_state_exception_writes_last_digest_at(caplog, tmp_path):
+    """
+    Аварийный путь: set_state('failed') кидает исключение → last_digest_at записан
+    (try/except), digest_window_started_at НЕ тронут (как 3-strike), return 0 без падения.
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    item = _mk_item(title="X", url="https://ex.com/x", llm_score=5)
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {"enabled": True, "on_empty": "skip",
+                   "max_items": 100, "max_items_per_message": 20},
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        p.storage.save(item)
+        p.storage.set_state(["https://ex.com/x"], "deferred")
+
+        # Мокаем build_digest_messages так, чтобы _build_failed был непустым
+        # (имитируем item, упавший при рендеринге). Это заставляет pipeline
+        # войти в блок `if _build_failed:` → set_state('failed') → except.
+        # Мокаем build_digest_messages так, чтобы _build_failed был непустым
+        # (имитируем item, упавший при рендеринге). Это заставляет pipeline
+        # войти в блок `if _build_failed:` → set_state('failed') → except.
+        import newsbot.pipeline
+        real_build = newsbot.pipeline.build_digest_messages
+
+        def fake_build(items, **kwargs):
+            # Пустые groups + один url в _build_failed → pipeline думает,
+            # что item выпал при рендеринге, вызывает set_state(['url'], 'failed').
+            return [], [], ["https://ex.com/x"]
+
+        # Мокаем set_state на RuntimeError при state='failed' — эмулируем БД-сбой.
+        _orig_set_state = p.storage.set_state
+
+        def broken_set_state(urls, state):
+            if state == "failed":
+                raise RuntimeError("DB write error")
+            return _orig_set_state(urls, state)
+
+        p.storage.set_state = broken_set_state
+
+        with caplog.at_level(logging.WARNING, logger="newsbot.pipeline"):
+            with patch("newsbot.pipeline.build_digest_messages", side_effect=fake_build):
+                result = p.run_digest(force=False)
+
+        # (a) WARNING о падении set_state('failed')
+        warn_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("set_state" in m and "упал" in m for m in warn_messages), (
+            f"Expected WARNING about set_state failure. Logs: {warn_messages}"
+        )
+
+        # (б) return = 0 (не упало)
+        assert result == 0, f"Expected 0, got {result}"
+
+        # (в) last_digest_at записан (try/except в аварийном пути)
+        last_digest = p.storage.get_meta("last_digest_at")
+        assert last_digest is not None, "last_digest_at должен быть записан при аварийном set_state"
+
+        # (г) digest_window_started_at НЕ записан (не двигаем границу, как 3-strike)
+        window_start = p.storage.get_meta("digest_window_started_at")
+        assert window_start is None, (
+            f"digest_window_started_at НЕ должен записываться в аварийном пути, got {window_start}"
+        )
+
+    finally:
+        p.close()
+
+
+def test_not_groups_empty_increments_render_count_not_main(caplog, tmp_path):
+    """
+    Minor-2: not-groups ветка инкрементирует digest_empty_render_count,
+    НЕ digest_empty_count. Проверяем: patch build_digest_messages → пустые groups.
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    item = _mk_item(title="X", url="https://ex.com/x", llm_score=5)
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {"enabled": True, "on_empty": "skip",
+                   "max_items": 100, "max_items_per_message": 20},
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        p.storage.save(item)
+        p.storage.set_state(["https://ex.com/x"], "deferred")
+
+        with caplog.at_level(logging.WARNING, logger="newsbot.pipeline"):
+            with patch("newsbot.pipeline.build_digest_messages", return_value=([], [], [])):
+                result = p.run_digest(force=False)
+
+        # (a) WARNING от not-groups содержит reason=render_or_dup
+        warn_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("reason=render_or_dup" in m for m in warn_messages), (
+            f"Expected WARNING with reason=render_or_dup. Logs: {warn_messages}"
+        )
+
+        # (б) digest_empty_render_count инкрементирован
+        render_count = p.storage.get_meta("digest_empty_render_count")
+        assert render_count is not None, "digest_empty_render_count должен быть записан"
+        assert int(render_count) == 1, f"render_count ожидался 1, got {render_count}"
+
+        # (в) digest_empty_count НЕ инкрементирован (skip-ветка не достигнута)
+        main_count = p.storage.get_meta("digest_empty_count")
+        assert main_count is None, (
+            f"digest_empty_count НЕ должен инкрементироваться в not-groups ветке, got {main_count}"
+        )
+
+        # (г) last_digest_at записан
+        last_digest = p.storage.get_meta("last_digest_at")
+        assert last_digest is not None, "last_digest_at должен быть записан"
+
+    finally:
+        p.close()
 
 
 # =============================================================================

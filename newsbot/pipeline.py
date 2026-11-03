@@ -3276,7 +3276,12 @@ class NewsPipeline:
                     "Дайджест: пустое окно (on_empty=skip) — dropped=%d, total=%d",
                     _n_dropped, n_published,
                 )
+                logger.warning(
+                    "Дайджест пропущен: 0 candidates (reason=no_candidates, on_empty=skip)",
+                )
                 logger.debug("Дайджест: нет отложенных новостей, окно проверено (skip)")
+                # Minor-1: маркеры пишутся БЕЗУСЛОВНО — инкремент счётчика не блокирует окно.
+                # Инкремент обёрнут в try/except (испорченная meta / ошибка БД).
                 self.storage.set_meta(
                     "last_digest_at",
                     digest_started_iso,
@@ -3292,6 +3297,13 @@ class NewsPipeline:
                     if udt is not None and udt < now_utc:
                         new_boundary = unprocessed
                 self.storage.set_meta("digest_window_started_at", new_boundary)
+                # Minor-1: инкремент после маркеров — сбой счётчика не блокирует окно.
+                # Оба маркера уже записаны выше; digest_empty_count — best-effort.
+                try:
+                    _prev = self.storage.get_meta("digest_empty_count") or "0"
+                    self.storage.set_meta("digest_empty_count", str(int(_prev) + 1))
+                except Exception:
+                    logger.warning("Дайджест: не удалось записать digest_empty_count")
                 return 0
             # on_empty=send: обрабатывается дальше (пустое уведомление)
 
@@ -3768,8 +3780,9 @@ class NewsPipeline:
         if not groups and (on_empty != "send" or deferred_items):
             # CRITICAL-фикс (3): все items упали при рендеринге — ранний выход,
             # но _build_failed urls ДОЛЖНЫ быть помечены 'failed', иначе они
-            # вечно останутся deferred (маркеры окна двигаются при return 0,
-            # но state='deferred' → при следующем окне они снова выберутся).
+            # вечно останутся deferred. Штатные выходы (skip/not-groups) пишут
+            # оба маркера; при аварийном set_state('failed') — только last_digest_at
+            # (digest_window_started_at не двигается, как в 3-strike).
             # Minor 2-фикс: границу окна двигает ТОЛЬКО успех. Если
             # set_state('failed') упал — НЕ двигаем digest_window_started_at
             # (иначе оставшиеся deferred окажутся позади новой границы,
@@ -3796,6 +3809,16 @@ class NewsPipeline:
                             self.storage.set_digested(list(_dup_urls))
                         except Exception:
                             pass
+                    # Minor: записываем last_digest_at — чтобы _maybe_run_digest не
+                    # ретриггерил дайджест каждый цикл. try/except гарантирует, что
+                    # аварийный путь сам не упадёт.
+                    try:
+                        self.storage.set_meta("last_digest_at", digest_started_iso)
+                    except Exception:
+                        logger.warning(
+                            "Дайджест: не удалось записать last_digest_at "
+                            "при аварийном set_state('failed')",
+                        )
                     return 0
             # Minor 1-фикс: весь дайджест — дубли (легально при непустом recent).
             # Без set_digested дубли вечно deferred → повторный расход токенов
@@ -3805,9 +3828,12 @@ class NewsPipeline:
                     self.storage.set_digested(list(_dup_urls))
                 except Exception:
                     pass
+            logger.warning(
+                "Дайджест пропущен: 0 candidates (reason=render_or_dup, deferred=%d)",
+                len(deferred_items),
+            )
             logger.info("Дайджест: нет сообщений для отправки.")
-            # M2: пишем маркер окна и при force+empty, чтобы _maybe_run_digest
-            # не спамил повторно в следующем цикле.
+            # Minor-1: маркеры пишутся БЕЗУСЛОВНО — инкремент счётчика не блокирует окно.
             self.storage.set_meta("last_digest_at", digest_started_iso)
             unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
             new_boundary = digest_started_iso
@@ -3816,6 +3842,12 @@ class NewsPipeline:
                 if udt is not None and udt < now_utc:
                     new_boundary = unprocessed
             self.storage.set_meta("digest_window_started_at", new_boundary)
+            # Minor-1+2: инкремент после маркеров — try/except; отдельный счётчик для render/dup.
+            try:
+                _prev_e = self.storage.get_meta("digest_empty_render_count") or "0"
+                self.storage.set_meta("digest_empty_render_count", str(int(_prev_e) + 1))
+            except Exception:
+                logger.warning("Дайджест: не удалось записать digest_empty_render_count")
             return 0
 
         # ── M3: финальная сборка item_buttons_per_msg с изоляцией битых items ──

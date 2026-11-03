@@ -502,6 +502,121 @@ class TestNewItemsRecovery(unittest.TestCase):
 
 
 # =============================================================================
+# K1-newest-first: get_all_by_state('new') возвращает newest-first
+# =============================================================================
+
+class TestK1NewestFirst(unittest.TestCase):
+    def test_get_all_by_state_newest_first(self):
+        """
+        K1-recovery: get_all_by_state('new') возвращает items newest-first.
+        Старые items (old fetched_at) не вытесняют свежие из батча скоринга.
+        """
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            now = datetime.now(timezone.utc)
+
+            # Старый item (40ч назад) — НЕ должен быть первым
+            old_ts = (now - timedelta(hours=40)).isoformat()
+            old_item = _mk_item(title="Old item", url="https://old.example/1")
+            st.save(old_item)
+            conn = st._connect()
+            conn.execute(
+                "UPDATE items SET fetched_at=? WHERE url=?",
+                (old_ts, "https://old.example/1"),
+            )
+            conn.commit()
+
+            # Средний item (5ч назад)
+            mid_ts = (now - timedelta(hours=5)).isoformat()
+            mid_item = _mk_item(title="Mid item", url="https://mid.example/1")
+            st.save(mid_item)
+            conn.execute(
+                "UPDATE items SET fetched_at=? WHERE url=?",
+                (mid_ts, "https://mid.example/1"),
+            )
+            conn.commit()
+
+            # Свежий item (1ч назад) — ДОЛЖЕН быть первым
+            fresh_ts = (now - timedelta(hours=1)).isoformat()
+            fresh_item = _mk_item(title="Fresh item", url="https://fresh.example/1")
+            st.save(fresh_item)
+            conn.execute(
+                "UPDATE items SET fetched_at=? WHERE url=?",
+                (fresh_ts, "https://fresh.example/1"),
+            )
+            conn.commit()
+
+            # Бач на 1 item — должен взять свежий, не старый
+            batch = st.get_all_by_state("new", limit=1)
+            self.assertEqual(len(batch), 1)
+            self.assertEqual(
+                batch[0].url, "https://fresh.example/1",
+                "Первый item в батче — свежий (1ч), не старый (40ч)",
+            )
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+    def test_b14_excess_returns_to_new_and_recompetes(self):
+        """
+        B14-excess: items возвращаются в state='new' после среза бюджета
+        и участвуют в следующем выборе батча (не теряются).
+        """
+        path = _tmp_db()
+        try:
+            st = Storage(Path(path))
+            now = datetime.now(timezone.utc)
+
+            # 5 items с разным fetched_at (вставлены в обратном порядке)
+            urls = []
+            for i, hours in enumerate([4, 3, 2, 1, 0]):
+                ts = (now - timedelta(hours=hours)).isoformat()
+                item = _mk_item(title=f"Item{i}", url=f"https://b14ex.com/{i}")
+                st.save(item)
+                urls.append(f"https://b14ex.com/{i}")
+                conn = st._connect()
+                conn.execute(
+                    "UPDATE items SET fetched_at=? WHERE url=?",
+                    (ts, f"https://b14ex.com/{i}"),
+                )
+                conn.commit()
+
+            # Эмуляция B14: берём top-2 (newest-first: Item4, Item3),
+            # остальные 3 возвращаются в 'new'
+            fresh_urls = {"https://b14ex.com/4", "https://b14ex.com/3"}
+            excess_urls = [u for u in urls if u not in fresh_urls]
+            st.set_state(excess_urls, "new")
+
+            # Следующий батч — newest-first: Item4 (0ч) первый
+            second_batch = st.get_all_by_state("new", limit=3)
+            second_batch_urls = {i.url for i in second_batch}
+
+            # (а) Второй батч: лимит=3, первый — самый свежий
+            self.assertEqual(len(second_batch), 3, "Второй батч: лимит=3, берём top-3")
+            self.assertEqual(
+                second_batch[0].url, "https://b14ex.com/4",
+                "Первый во втором батче — самый свежий (0ч)",
+            )
+            # (б) B14-excess: Item0, Item1, Item2 возвращены в 'new', Item3 тоже.
+            #    Все 5 items остаются в 'new' (не теряются).
+            #    Примечание: Item3 вернулся через set_state(..., "new") —
+            #    fetched_at у него 1ч, поэтому во втором батче он на позиции 2.
+            remaining = st.get_all_by_state("new")
+            self.assertEqual(
+                len(remaining), 5,
+                "Все 5 items остались в 'new' (excess + unscored — ни один не потерян)",
+            )
+            remaining_urls = {i.url for i in remaining}
+            for i in range(5):
+                self.assertIn(f"https://b14ex.com/{i}", remaining_urls,
+                              f"Item{i} должен остаться в 'new'")
+            st.close()
+        finally:
+            _cleanup_db(path)
+
+
+# =============================================================================
 # K5: deferred не purge'ится основным retention, но purge'ится по deferred_retention_days
 # =============================================================================
 
