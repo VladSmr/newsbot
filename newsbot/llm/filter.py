@@ -17,6 +17,7 @@ from .prompts import (
     BuildDedupContext,
     MAX_PROMPT_TITLE_CHARS, MAX_PROMPT_SUMMARY_CHARS, LANG_MARKER,
     format_system_prompt, format_batch_system_prompt,
+    TRANSLATE_SYSTEM_PROMPT, build_translate_user_message,
 )
 
 logger = logging.getLogger("newsbot.llm.filter")
@@ -1261,7 +1262,59 @@ class LLMFilter:
         """Доступ к HTTP-клиенту для pipeline / close."""
         return self._client
 
-    # ── internal ────────────────────────────────────────────────────────────
+    _TRANSLATE_CHUNK = 15
+
+    def translate_news_items(self, items: List["NewsItem"]) -> List[dict]:
+        """
+        Batch-translate RU news items into English for digest rendering.
+
+        Chunks items into batches of ≤15 per LLM call (avoids finish_reason=length).
+        Each chunk call is tracked with _record_usage; daily cost gate checked once
+        at entry (skip all translation if budget exhausted).
+
+        Parameters
+        ----------
+        items : List[NewsItem]
+            Items with RU titles (and optional summaries) to translate.
+
+        Returns
+        -------
+        List[dict]
+            [{"idx": int, "title_en": str, "summary_en": str}, ...]
+            idx is 1-based across the full items list (not per-chunk).
+        """
+        # Daily cost gate: перевод — luxury, а не critical path.
+        # При исчерпанном бюджете пропускаем полностью; pipeline отдаст
+        # сырые заголовки (fail-open уже в pipeline._translate_digest_items).
+        if not self._check_daily_cost():
+            return []
+
+        results: List[dict] = []
+        for chunk_start in range(0, len(items), self._TRANSLATE_CHUNK):
+            chunk = items[chunk_start: chunk_start + self._TRANSLATE_CHUNK]
+            usage_before = self._usage_totals()
+            try:
+                system = TRANSLATE_SYSTEM_PROMPT
+                user = build_translate_user_message(chunk)
+                raw = self._client.chat_json(system, user)
+                chunk_results = self._parse_translate_response(raw)
+            finally:
+                self._record_usage(usage_before)
+
+            # Переиндексируем: idx в chunk_results 1-based внутри chunk,
+            # глобальный idx = chunk_start (0-based) + chunk_idx + 1
+            for cr in chunk_results:
+                global_idx = chunk_start + cr["idx"]
+                results.append({
+                    "idx": global_idx,
+                    "title_en": cr["title_en"],
+                    "summary_en": cr["summary_en"],
+                })
+        return results
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
     # ── Task 3: daily cost guard ────────────────────────────────────────────
 
@@ -1484,8 +1537,9 @@ class LLMFilter:
         Аккумулирует стоимость вызова в дневной и оконный счётчики.
 
         Minor-1: ``now`` позволяет вызывающему коду передать уже вычисленное
-        UTC-время, чтобы _check_daily_cost и _accumulate_daily_cost
-        гарантированно использовали одно окно (не разбежались на границе).
+        UTC-время — accumulate фиксирует now при вызове из _record_usage;
+        гарантия согласованности ключей между несколькими accumulate в одном
+        вызове обеспечивается одним now (не между check и accumulate).
 
         Аккумуляция оконного ключа пишется ТОЛЬКО при window_cost_limit > 0:
        Minor-2: при выключенном оконном лимите ключ не засоряется.
@@ -1556,19 +1610,20 @@ class LLMFilter:
         if day_current is None:
             return  # day write абортится, window не трогаем
 
-        # Minor-2: оконный ключ пишется только при активном оконном лимите
+        # Minor-2: оконный ключ пишется только при активном оконном лимите.
+        # При сбое чтения window_key — WARNING + пропуск окна; day_key пишется.
         if self._window_cost_limit > 0:
             window_current = _read(window_key)
-            if window_current is None:
-                return
-            try:
-                self._storage.set_meta(window_key, str(window_current + cost))
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "LLM cost-guard: не удалось записать оконный расход '%s' (%s) "
-                    "→ токены уже списаны API",
-                    window_key, e,
-                )
+            if window_current is not None:
+                try:
+                    self._storage.set_meta(window_key, str(window_current + cost))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "LLM cost-guard: не удалось записать оконный расход '%s' (%s) "
+                        "→ токены уже списаны API",
+                        window_key, e,
+                    )
+            # else: WARNING уже залогирован в _read() — пропускаем только окно
 
         # Дневной пишется всегда
         try:
@@ -1718,6 +1773,57 @@ class LLMFilter:
 
         self._record_usage(usage_before)
         return self._parse_batch_response(raw, len(items))
+
+    # ── digest translation ─────────────────────────────────────────────────
+
+    def _parse_translate_response(self, raw: Dict[str, Any]) -> List[dict]:
+        """
+        Парсит ответ LLM для digest translation.
+
+        Ожидается формат: {"results": [{"idx": int, "title_en": str, "summary_en": str}, ...]}
+
+        Fail-safe: при любой ошибке парсинга бросает LLMError — вызывающая
+        сторона (pipeline) ловит и использует сырые заголовки.
+        """
+        if not isinstance(raw, dict):
+            raise LLMError(
+                f"translate response: ожидался dict, получен {type(raw).__name__}"
+            )
+        results = raw.get("results")
+        if not isinstance(results, list):
+            raise LLMError(
+                f"translate response: 'results' должен быть list, "
+                f"получен {type(results).__name__}"
+            )
+
+        # Собираем dict {idx: {idx, title_en, summary_en}} — первое вхождение idx
+        # выигрывает (LLM может вернуть дубликаты idx при ошибке).
+        first_seen: Dict[int, dict] = {}
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            idx = entry.get("idx")
+            if not isinstance(idx, int) or idx < 1:
+                continue
+            if idx in first_seen:
+                continue
+            raw_title = entry.get("title_en", "")
+            if isinstance(raw_title, str) and raw_title.strip():
+                title_en = raw_title.strip()
+            else:
+                title_en = ""
+
+            raw_sum = entry.get("summary_en", "")
+            if isinstance(raw_sum, str):
+                summary_en = raw_sum.strip()
+            else:
+                summary_en = ""
+
+            first_seen[idx] = {"idx": idx, "title_en": title_en, "summary_en": summary_en}
+
+        # Сортируем по idx — порядок применения предсказуем
+        out = sorted(first_seen.values(), key=lambda x: x["idx"])
+        return out
 
     # ── _build_user_message ─────────────────────────────────────────────────
 

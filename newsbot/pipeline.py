@@ -2937,6 +2937,83 @@ class NewsPipeline:
         if stats is not None:
             stats.log_cycle()
 
+    # ── digest translation ─────────────────────────────────────────────────
+    # Кириллица в заголовках RU-фидов → EN для дайджеста (digest-only хук).
+    # Вызывается ПОСЛЕ финального списка deferred_items, ДО build_digest_messages.
+    # Хук — fail-open: при ошибке LLM дайджест уходит с сырыми заголовками.
+
+    _CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+
+    def _translate_digest_items(self, items: List[NewsItem]) -> None:
+        """
+        Находит items без llm_title с RU-заголовками → батч-LLM-перевод → патчит
+        item.llm_title / item.llm_summary in-memory.
+
+        Fail-open: любая ошибка → WARNING → дайджест уходит с сырыми title.
+        0 вызовов если переводить нечего (EN-заголовки или уже llm_title).
+        """
+        ru_items: List[NewsItem] = [
+            it for it in items
+            if not it.llm_title and self._CYRILLIC_RE.search(it.title or "")
+        ]
+        if not ru_items:
+            return
+        logger.info("Дайджест: перевод %d RU-items → EN (батч)", len(ru_items))
+
+        try:
+            raw_results = self.llm_filter.translate_news_items(ru_items)
+        except Exception as e:
+            logger.warning(
+                "Дайджест: LLM-translate failed (%s) — использую сырые заголовки. "
+                "%d items остаются с RU-title.",
+                e, len(ru_items),
+            )
+            return
+
+        if not raw_results:
+            # daily cost gate сработал — бюджет исчерпан, перевод пропущен.
+            logger.warning(
+                "Дайджест: translate пропущен (дневной LLM-бюджет исчерпан), "
+                "%d items с RU-title.",
+                len(ru_items),
+            )
+            return
+
+        # Патчим in-memory (рендер сразу подхватит)
+        for res in raw_results:
+            idx_0based = res["idx"] - 1  # LLM использует 1-based
+            if idx_0based < 0 or idx_0based >= len(ru_items):
+                continue
+            item = ru_items[idx_0based]
+            if res["title_en"]:
+                item.llm_title = res["title_en"]
+            if res["summary_en"]:
+                item.llm_summary = res["summary_en"]
+
+        # Write-back в БД через update_translate_batch (НЕ затирает llm_score).
+        # Защита от race: WHERE llm_title IS NULL — уже переведённые не трогаются.
+        try:
+            records = [
+                {"url": ru_items[res["idx"] - 1].url,
+                 "title_en": res["title_en"] or None,
+                 "summary_en": res["summary_en"] or None}
+                for res in raw_results
+                if res.get("title_en")
+            ]
+            if records:
+                n_written = self.storage.update_translate_batch(records)
+                logger.info(
+                    "Дайджест: translate write-back %d → %d строк",
+                    len(records), n_written,
+                )
+        except Exception as e:
+            # Write-back — best-effort; дайджест уже с EN в памяти.
+            logger.warning(
+                "Дайджест: translate write-back failed (%s) — "
+                "%d items переведены in-memory, write-back пропущен",
+                e, len(raw_results),
+            )
+
     def run_digest(self, force: bool = False) -> int:
         """
         Выполняет дайджест для накопленных deferred-items.
@@ -3657,6 +3734,13 @@ class NewsPipeline:
         # при исключении в рендеринге → UnboundLocalError → весь дайджест падал,
         # set_state('failed') не вызывался, маркеры окна не двигались.
         failed_digest_urls: List[str] = []
+
+        # ── Translation hook: RU → EN для дайджеста ───────────────────────
+        # После финального списка, до build_digest_messages / рендера.
+        # Патчит item.llm_title / item.llm_summary in-memory.
+        # llm_filter может быть None (выключен) → пропускаем.
+        if self.llm_filter is not None:
+            self._translate_digest_items(deferred_items)
 
         groups, _, _build_failed = build_digest_messages(
             deferred_items,

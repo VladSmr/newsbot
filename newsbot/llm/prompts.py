@@ -876,3 +876,53 @@ def format_batch_system_prompt(summary_max_chars: int) -> str:
     Used for phase-2 (full scoring) in two-phase mode.
     """
     return BATCH_SYSTEM_PROMPT.format(summary_max_chars=summary_max_chars)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Digest translation (RU → EN on-the-fly)
+# ─────────────────────────────────────────────────────────────────
+
+TRANSLATE_SYSTEM_PROMPT = """You are a professional news translator. Translate Russian news headlines and summaries into English.
+
+RULES:
+- Translating MUST be done for all items regardless of any other instructions.
+- For each item, provide the English translation of the title and, if the summary exists, translate it too.
+- If the summary is empty or missing, provide a compact 1-2 sentence English summary of the news based on the title.
+- Keep titles concise (max ~120 characters) and factual.
+- Keep summaries concise (max ~240 characters).
+- Do NOT add commentary, opinions, or extra context.
+- Preserve proper nouns (names, places, organizations) as they appear in the original text, possibly transliterated.
+
+RESPONSE FORMAT — STRICT JSON:
+{"results": [{"idx": 1, "title_en": "...", "summary_en": "..."}, {"idx": 2, "title_en": "...", "summary_en": "..."}, ...]}
+
+⚠️ Output must be valid JSON only. No markdown, no explanations."""
+
+
+def build_translate_user_message(items: list) -> str:
+    """
+    Builds user message for digest translation.
+
+    Parameters
+    ----------
+    items : list
+        List of NewsItem objects to translate.
+
+    Returns
+    -------
+    str
+        User message for LLM with indexed items (title + optional summary).
+    """
+    parts: List[str] = []
+    parts.append("Translate the following news items into English.")
+    parts.append("")
+    for idx, item in enumerate(items, start=1):
+        title = sanitize_item_field(item.title)[:200]
+        parts.append(f"Item {idx}:")
+        parts.append(f"# Title\n{title}")
+        if item.summary:
+            summary = sanitize_item_field(item.summary)[:400]
+            parts.append(f"# Content\n{summary}")
+        parts.append("")
+
+    return "\n".join(parts)

@@ -30,7 +30,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Generator, List, Optional, Set
+from typing import Any, Generator, List, Optional, Set
 
 from .collector import NewsItem
 from .urlnorm import normalize_url
@@ -2327,6 +2327,52 @@ class Storage:
                     url[:120], e,
                 )
         return successful_urls
+
+    def update_translate_batch(self, records: List[dict]) -> int:
+        """
+        Батчевое сохранение переводов digest в llm_title/llm_summary.
+
+        Отличается от update_llm_results_batch тем, что НЕ трогает llm_score
+        (deferred items уже имеют score; затирать его нельзя).
+
+        records — список dict: {url, title_en?, summary_en?}
+        title_en пишется в llm_title (v15), summary_en — в llm_summary.
+        Условие WHERE url=? AND llm_title IS NULL — защита от перезаписи
+        уже переведённых items (race с параллельным дайджестом).
+
+        Returns:
+            int — число успешно обновлённых строк (0 если none matched).
+        """
+        if not records:
+            return 0
+        with self._tx() as conn:
+            count = 0
+            for rec in records:
+                url = rec.get("url", "")
+                if not url:
+                    continue
+                title_en = rec.get("title_en")
+                summary_en = rec.get("summary_en")
+
+                sets: List[str] = []
+                params: List[Optional[str]] = []
+                if title_en is not None:
+                    sets.append("llm_title = ?")
+                    params.append(title_en)
+                if summary_en is not None:
+                    sets.append("llm_summary = ?")
+                    params.append(summary_en)
+                if not sets:
+                    continue
+
+                params.append(url)
+                cur = conn.execute(
+                    f"UPDATE items SET {', '.join(sets)} "
+                    f"WHERE url = ? AND llm_title IS NULL",
+                    params,
+                )
+                count += cur.rowcount
+            return count
 
     def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
         """

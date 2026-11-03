@@ -588,6 +588,47 @@ class TestWindowCostAccumulation:
             "window key should NOT be written when window_cost_limit=0"
         )
 
+    def test_accumulate_window_read_fails_day_still_written(self, caplog):
+        """window_key read exception → day_key всё равно записан, функция не падает."""
+        k = _keys(3)
+        storage = MockStorage()
+
+        def broken_get(key):
+            if key == k["window"]:
+                raise sqlite3.OperationalError("database is locked")
+            if key == k["day"]:
+                return "0.30"  # day читается нормально
+            return None
+
+        storage._get_meta_side_effect = broken_get
+        filt = _make_window_filter(
+            storage=storage,
+            daily_cost_limit=0.50,
+            window_cost_limit=0.12,
+        )
+        with patch("newsbot.llm.filter.datetime", FakeDT(3)):
+            with caplog.at_level(logging.WARNING):
+                filt._accumulate_daily_cost(prompt_tokens=1000, completion_tokens=200)
+
+        # day_key записан (независимо от сбоя window_key)
+        assert storage._store.get(k["day"]) is not None, (
+            "day_key должен быть записан даже если window_key read упал"
+        )
+        day_val = float(storage._store.get(k["day"]))
+        # 0.30 + (1000*1.0 + 200*2.0)/1e6 = 0.30 + 0.0014 = 0.3014
+        assert day_val == pytest.approx(0.3014), f"expected ~0.3014, got {day_val}"
+
+        # window_key НЕ записан (сбой read — не перезаписываем мусором)
+        assert storage._store.get(k["window"]) is None, (
+            "window_key не должен быть записан при сбое read"
+        )
+
+        # WARNING про сбой window_key — ключ содержит _w0 (оконный суффикс)
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any(
+            "_w0" in m and "накопление пропущено" in m.lower() for m in msgs
+        ), msgs
+
 
 class TestWindowChangeReset:
     """(д) смена UTC-окна (w0→w1) сбрасывает оконный лимит."""
