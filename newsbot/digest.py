@@ -219,7 +219,6 @@ SECTION_TITLES: List[Tuple[str, str]] = [
     ("tech", "💻 Технологии"),
     ("cinema", "🎬 Кино"),
     ("games", "🎮 Игры"),
-    ("cyber", "🔐 Кибербезопасность"),
 ]
 _SECTION_TITLE_BY_KEY = dict(SECTION_TITLES)
 
@@ -229,7 +228,7 @@ def infer_category(item: NewsItem) -> str:
     Категория item'а для группировки в дайджесте.
 
     Единый источник истины — pipeline._infer_category (source + tags;
-    категории: cinema, games, space, tech, cyber, science + 'other').
+    категории: cinema, games, space, tech, science + 'other' после v1.5 удаления cyber).
     Импорт ленивый: pipeline импортирует digest на уровне модуля,
     top-level обратный импорт дал бы цикл.
 

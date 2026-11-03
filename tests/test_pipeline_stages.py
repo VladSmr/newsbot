@@ -143,11 +143,7 @@ class TestInferCategoryNormalization(unittest.TestCase):
         cats = [_infer_category(_mk_item(source=s)) for s in variants]
         assert all(c == "tech" for c in cats), f"Все Habr → tech, got: {cats}"
 
-    def test_krebs_aliases(self):
-        """"KrebsOnSecurity", "Krebs On Security", "krebs" → cyber."""
-        variants = ["KrebsOnSecurity", "Krebs On Security", "krebs", "KREBS"]
-        cats = [_infer_category(_mk_item(source=s)) for s in variants]
-        assert all(c == "cyber" for c in cats), f"Все Krebs → cyber, got: {cats}"
+    
 
     def test_sciencedaily_aliases(self):
         """"ScienceDaily", "science daily" → science."""
@@ -177,7 +173,6 @@ class TestInferCategoryNormalization(unittest.TestCase):
         assert _infer_category(_mk_item(source="Deadline")) == "cinema"
         assert _infer_category(_mk_item(source="IGN")) == "games"
         assert _infer_category(_mk_item(source="SpaceNews")) == "space"
-        assert _infer_category(_mk_item(source="BleepingComputer")) == "cyber"
         assert _infer_category(_mk_item(source="Phys.org")) == "science"
 
 

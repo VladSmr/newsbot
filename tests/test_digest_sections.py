@@ -75,7 +75,6 @@ def _section_order(msg: str):
 def test_sections_order_and_titles():
     """Секции идут в фиксированном порядке с правильными заголовками."""
     items = [
-        _mk_item("krebsonsecurity", "cyber-1", llm_score=9),
         _mk_item("ign", "games-1", llm_score=8),
         _mk_item("deadline", "cinema-1", llm_score=7),
         _mk_item("habr", "tech-1", llm_score=6),
@@ -90,14 +89,14 @@ def test_sections_order_and_titles():
     assert failed == []
 
     # порядок секций — как в SECTION_TITLES (general, science, space, tech,
-    # cinema, games, cyber)
+    # cinema, games)
     assert _section_order(msg) == list(range(len(SECTION_TITLES)))
     assert _section_titles_in(msg) == [t for _, t in SECTION_TITLES]
 
     # порядок items в группе соответствует порядку блоков в тексте
     assert [it.title for it in msg_items] == [
         "general-1", "science-1", "space-1", "tech-1",
-        "cinema-1", "games-1", "cyber-1",
+        "cinema-1", "games-1",
     ]
     assert len(included) == len(items)
 
@@ -115,22 +114,8 @@ def test_empty_sections_not_rendered():
     assert "<b>📰 Основные новости</b>" in msg
     assert "<b>🎮 Игры</b>" in msg
     for absent in ("🔬 Наука", "🚀 Космос", "💻 Технологии",
-                   "🎬 Кино", "🔐 Кибербезопасность"):
+                   "🎬 Кино"):
         assert absent not in msg, f"пустая секция '{absent}' не должна выводиться"
-
-
-def test_single_item_section_rendered():
-    """Секция из одной новости показывается (заголовок + новость)."""
-    items = [
-        _mk_item("tass", "general-1", llm_score=7),
-        _mk_item("tass", "general-2", llm_score=6),
-        _mk_item("krebsonsecurity", "cyber-only", llm_score=5),
-    ]
-    groups, _, _ = build_digest_messages(items)
-    msg = groups[0][0]
-
-    assert "<b>🔐 Кибербезопасность</b>" in msg
-    assert "cyber-only" in msg
 
 
 def test_detail_order_within_section_preserved():
@@ -380,7 +365,6 @@ def test_buttons_match_items_after_grouping():
         _mk_item("tass", "general-1", llm_score=9),
         _mk_item("ign", "games-1", llm_score=8),
         _mk_item("tass", "general-2", llm_score=7),
-        _mk_item("krebsonsecurity", "cyber-1", llm_score=6),
         _mk_item("sciencedaily", "science-1", llm_score=5),
     ]
     # target_id уникален для url
@@ -407,7 +391,6 @@ def test_buttons_match_items_after_pipeline_rebuild():
         _mk_item("tass", "general-1", llm_score=9),
         _mk_item("ign", "games-1", llm_score=8),
         _mk_item("tass", "general-2", llm_score=7),
-        _mk_item("krebsonsecurity", "cyber-1", llm_score=6),
         _mk_item("sciencedaily", "science-1", llm_score=5),
     ]
     target_id_by_url = {it.url: 1000 + i for i, it in enumerate(items)}

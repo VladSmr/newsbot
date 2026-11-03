@@ -91,7 +91,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "games": 1,
             "space": 1,
             "tech": 1,
-            "cyber": 1,
             "science": 1,
         },
     },

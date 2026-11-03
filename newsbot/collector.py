@@ -56,10 +56,10 @@ MAX_ITEMS_PER_FEED = 50  # защита от кривого фида
 _SOURCE_PREFIXES: List[Tuple[Pattern[str], str]] = [
     # "Reuters: Headline", "Bloomberg: Story", "Источник: Что-то произошло"
     (re.compile(r"^\s*(?:Reuters|Bloomberg|TASS|Reuters:|Bloomberg:|TASS:|"
-                r"Источник|Al\s?Jazeera|RBC|Kommersant|Interfax|РИА\s?Новости|"
+                r"Источник|Al\s?Jazeera|RBC|Kommersant|Interfax|"
                 r"Лента\.ру|Eurogamer|Guardian|FRANCE\s?24|Sky\s?News|AeroTime|"
                 r"NASA|Naked\sScience|N\+1|STAT\sNews|Phys\.org|ScienceDaily|"
-                r"BleepingComputer|KrebsOnSecurity|Habr|Tom['\u2019]?s\sHardware|"
+                r"Habr|Tom['\u2019]?s\sHardware|"
                 r"SpaceNews|NASASpaceflight|IGN|DTF|Deadline|Variety|"
                 r"Югополис|Кубанские\sновости)\s*[:—–-]+\s*", re.IGNORECASE), ""),
     # "Al Jazeera — Headline", "Bloomberg — News"

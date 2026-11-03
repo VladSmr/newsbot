@@ -864,9 +864,9 @@ def _parse_tags(tags_str: Optional[str]) -> List[str]:
 # нормализованном виде: lowercase без пунктуации/пробелов — см. _infer_category).
 # Все пробелы/апострофы удаляются: "Tom's Hardware"→"tomshardware",
 # "Krebs On Security"→"krebsonsecurity", "nasa spaceflight"→"nasaspaceflight".
+# "Tom's Hardware"→"tomshardware"
 _SOURCE_ALIASES = {
     "tomshardware": "tomshardware",
-    "krebsonsecurity": "krebs",
     "nasaspaceflight": "nasaspaceflight",
     "habr": "habr",
     "habrnews": "habr",
@@ -874,7 +874,6 @@ _SOURCE_ALIASES = {
     "stat": "statnews",
     "sciencedaily": "sciencedaily",
     "physorg": "physorg",
-    "bleepingcomputer": "bleepingcomputer",
     "n1": "n1",
     "nplus1": "n1",
     # P2-фикс: нормализация убирает ПРОБЕЛЫ, поэтому "Naked Science"
@@ -886,7 +885,7 @@ _SOURCE_ALIASES = {
 def _infer_category(item) -> str:
     """
     Определяет категорию новости по source + tags.
-    categories: cinema, games, space, tech, cyber, science
+    categories: cinema, games, space, tech, science  # cyber удалена в v1.5
 
     source нормализуется: lowercase + убирается пунктуация/апострофы.
     Словарь алиасов → канонический ключ (см. _SOURCE_ALIASES).
@@ -902,7 +901,7 @@ def _infer_category(item) -> str:
     raw = (item.source or "").lower()
     import re
     # Убираем всё что не буква/цифра (включая Unicode-апострофы, тире, пробелы)
-    # "Tom's Hardware" → "tomshardware"; "Krebs On Security" → "krebsonsecurity"
+    # "Tom's Hardware" → "tomshardware"
     normalized = re.sub(r"[^\w]", "", raw, flags=re.UNICODE)
 
     source = _SOURCE_ALIASES.get(normalized, normalized)
@@ -991,7 +990,7 @@ def _infer_category(item) -> str:
         'cinema': has_cinema_profile,
         'games': has_games_profile,
         'space': has_space_profile,
-        # tech, cyber, science — не domain-specific entertainment-источники,
+        # tech, science — не domain-specific entertainment-источники,
         # content-override для них не нужен (редко путают контент с другими темами)
     }
     for cat_check, has_profile in _SOURCE_TO_PROFILE.items():
@@ -1029,12 +1028,6 @@ def _infer_category(item) -> str:
         return 'tech'
     if any(t in tags_lower for t in ('technology', 'ai', 'tech', 'software', 'hardware')):
         return 'tech'
-
-    # Кибербезопасность
-    if source in ('krebs', 'bleepingcomputer'):
-        return 'cyber'
-    if any(t in tags_lower for t in ('cyber', 'security', 'malware', 'hack', 'vulnerability')):
-        return 'cyber'
 
     # Наука
     if source in ('sciencedaily', 'physorg', 'n1', 'nakedscience', 'statnews'):

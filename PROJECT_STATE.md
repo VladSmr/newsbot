@@ -243,13 +243,12 @@ skipped: LLM-фильтр (score<5) + кросс-источниковые дуб
 ```
 
 ## Источники (30 RSS-фидов, см. config.yaml)
-РФ (6): Интерфакс, ТАСС, РИА, Lenta, REGNUM, Коммерсантъ.
+РФ (4): Интерфакс, ТАСС, Lenta, Коммерсантъ.
 Кубань (2): Югополис, Кубанские новости.
 Мир (4): Al Jazeera, Guardian World, Sky News World, France 24 English.
 Авиа (1): AeroTime.
 Наука (5): ScienceDaily, Phys.org, STAT News, N+1, Naked Science.
-Кибер (3): BleepingComputer, KrebsOnSecurity, Habr news.
-Чипы (1): Tom's Hardware. Космос (3): SpaceNews, NASA, NASASpaceflight.
+Тех (2): Tom's Hardware, Habr news. Космос (3): SpaceNews, NASA, NASASpaceflight.
 Игры (3): IGN, Eurogamer, DTF. Кино (2): Deadline, Variety.
 
 ## Тесты

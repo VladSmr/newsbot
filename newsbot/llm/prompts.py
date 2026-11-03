@@ -352,7 +352,7 @@ OWNER'S TOPICS:
 4. Krasnodar and region — drones, incidents, infrastructure (outages, transport, construction), weather/natural disasters.
 5. Fuel — shortages, refinery shutdowns, attacks (Russia and region). Daily fuel price changes — NOT interesting.
 6. Sanctions and major corporate events — company exits/returns, large deals.
-7. High-tech — cyberattacks/massive leaks, space, hardware/chips. AI model releases — NOT interesting (except incidents).
+7. High-tech — space, hardware/chips. AI model releases — NOT interesting (except incidents).
 8. Games — major AAA releases and cult franchises (GTA 6, Witcher): dates, trailers, announcements. Industry/scandals — NOT interesting.
 9. Cinema — franchises and blockbusters: dates, trailers, production facts.
 10. Natural disasters — tornadoes, floods: Russia and world.
@@ -422,7 +422,7 @@ OWNER'S TOPICS:
 4. Krasnodar and region — drones, incidents, infrastructure (outages, transport, construction), weather/natural disasters.
 5. Fuel — shortages, refinery shutdowns, attacks (Russia and region). Daily fuel price changes — NOT interesting.
 6. Sanctions and major corporate events — company exits/returns, large deals.
-7. High-tech — cyberattacks/massive leaks, space, hardware/chips. AI model releases — NOT interesting (except incidents).
+7. High-tech — space, hardware/chips. AI model releases — NOT interesting (except incidents).
 8. Games — major AAA releases and cult franchises (GTA 6, Witcher): dates, trailers, announcements. Industry/scandals — NOT interesting.
 9. Cinema — franchises and blockbusters: dates, trailers, production facts.
 10. Natural disasters — tornadoes, floods: Russia and world.
