@@ -80,6 +80,23 @@ _NON_WORD_CHARS = re.compile(r"[^\w\s]")
 _MULTI_SPACE = re.compile(r"\s+")
 
 
+def normalize_title_text(text: str) -> str:
+    """
+    Нормализует произвольный title string (не объект) для дедупа.
+
+    Цепочка: strip-source-prefix -> lower -> remove non-word ->
+             collapse-multi-space -> strip.
+    Используется:
+      - в NewsItem.title_normalized() для self.title
+      - в pipeline F6 для getattr(item, 'llm_title', None) or item.title
+    """
+    step1 = _strip_source_prefix(text)
+    step2 = step1.lower()
+    step3 = _NON_WORD_CHARS.sub("", step2)
+    step4 = _MULTI_SPACE.sub(" ", step3).strip()
+    return step4
+
+
 def _strip_source_prefix(title: str) -> str:
     """
     Срезает типовой префикс источника в начале строки.
@@ -156,15 +173,7 @@ class NewsItem:
         При изменении нормализации (TTL 3 дня) — старые title_hash остаются
         с прежней семантикой до истечения TTL. Это приемлемо (TTL 3 дня).
         """
-        # (1) стриппинг префикса источника
-        step1 = _strip_source_prefix(self.title)
-        # (2) lowercase
-        step2 = step1.lower()
-        # (3) удалить пунктуацию / не-буквенные
-        step3 = _NON_WORD_CHARS.sub("", step2)
-        # (4) collapse пробелы + strip
-        step4 = _MULTI_SPACE.sub(" ", step3).strip()
-        return step4
+        return normalize_title_text(self.title)
 
 
 # ─────────────────────────────────────────────────────────────────

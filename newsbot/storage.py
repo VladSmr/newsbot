@@ -3187,7 +3187,7 @@ class Storage:
                 params.append(int(limit))
             rows = conn.execute(
                 f"""
-                SELECT title, source
+                SELECT COALESCE(llm_title, title) AS title, source
                 FROM items
                 WHERE state IN ('digested', 'delivered')
                   AND COALESCE(state_at, fetched_at) >= ?

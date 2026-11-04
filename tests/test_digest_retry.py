@@ -858,3 +858,259 @@ def test_send_digest_mismatch_logs_warning(tmp_path, caplog):
     assert len(warnings) == 1
     assert "рассинхрон" in warnings[0].message
     storage.close()
+
+
+# =============================================================================
+# Freeze-fix: монотонный кламп digest_window_started_at (MIN-free)
+# =============================================================================
+
+def test_digest_boundary_frozen_jump(caplog, tmp_path):
+    """
+    (а) Глубоко замороженная previous-граница (старше 2*period) →
+        после закрытия new_boundary == close_time - period (прыжок).
+
+    Сценарий: граница застряла на 3 дня назад, close теперь 04.11 08:00.
+    period=12ч, 2*period=24ч. gap=3д > 24ч → прыжок.
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    # Граница заморожена на 3 дня назад (far past)
+    three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+    three_days_ago = three_days_ago.replace(microsecond=0)
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {
+            "enabled": True, "on_empty": "skip",
+            "max_items": 100, "max_items_per_message": 20,
+            "times": ["08:00", "20:00"],  # period=12
+        },
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        p.storage.set_meta("digest_window_started_at", three_days_ago.isoformat())
+
+        with caplog.at_level(logging.DEBUG, logger="newsbot.pipeline"):
+            result = p.run_digest(force=False)
+
+        assert result == 0, f"Expected 0, got {result}"
+
+        new_boundary_str = p.storage.get_meta("digest_window_started_at")
+        assert new_boundary_str is not None, "digest_window_started_at должен быть записан"
+
+        # Ожидаемое значение: close_time - period (08:00 - 12ч = предыдущий день 20:00)
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        # close_time ≈ now_utc; период=12ч
+        expected_boundary = now_utc - timedelta(hours=12)
+        new_boundary_dt = _iso_dt_parsed(new_boundary_str)
+        assert new_boundary_dt is not None
+
+        # Допуск: ±5 минут (тест не зависит от точного времени суток)
+        diff_sec = abs((new_boundary_dt - expected_boundary).total_seconds())
+        assert diff_sec < 5 * 60, (
+            f"Frozen-jump: expected ~{expected_boundary.isoformat()}, "
+            f"got {new_boundary_str}, diff={diff_sec}s"
+        )
+    finally:
+        p.close()
+
+
+def test_digest_boundary_normal_close_ignores_unprocessed(caplog, tmp_path):
+    """
+    (б) Обычное закрытие: new_boundary == max(previous, close_time - period)
+        и НЕ зависит от наличия старых 'new' в очереди.
+        Это ключевой регресс-тест против заморозки.
+
+    Сценарий: граница 02.11 20:00, close 04.11 08:00. gap=36ч, 2*period=24ч,
+    gap > 2*period → прыжок на close-period. Но без старых new в очереди
+    формула даёт тот же результат, что и старая логика (MAX vs MIN).
+
+    Дополнительно: кладём «очень старый» new-item — он НЕ должен
+    откатить границу назад.
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    # Граница 2 дня назад (36ч назад ≈ gap > 2*period=24ч → прыжок)
+    two_days_ago = datetime.now(timezone.utc) - timedelta(hours=36)
+    two_days_ago = two_days_ago.replace(microsecond=0)
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {
+            "enabled": True, "on_empty": "skip",
+            "max_items": 100, "max_items_per_message": 20,
+            "times": ["08:00", "20:00"],  # period=12
+        },
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        p.storage.set_meta("digest_window_started_at", two_days_ago.isoformat())
+
+        # Кладём «очень старый» new-item (старше границы) —
+        # старая логика откатила бы границу к нему; новая — нет.
+        old_item = _mk_item(
+            title="Old New Item",
+            url="https://ex.com/old-new",
+            llm_score=5,
+            fetched_at=two_days_ago.isoformat(),
+        )
+        p.storage.save(old_item)
+        # Item остаётся в state='new' (дефолтное состояние)
+
+        with caplog.at_level(logging.DEBUG, logger="newsbot.pipeline"):
+            result = p.run_digest(force=False)
+
+        assert result == 0, f"Expected 0, got {result}"
+
+        new_boundary_str = p.storage.get_meta("digest_window_started_at")
+        assert new_boundary_str is not None
+
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        expected_boundary = now_utc - timedelta(hours=12)  # close_time - period
+        new_boundary_dt = _iso_dt_parsed(new_boundary_str)
+        assert new_boundary_dt is not None
+
+        diff_sec = abs((new_boundary_dt - expected_boundary).total_seconds())
+        assert diff_sec < 5 * 60, (
+            f"Normal close: expected ~{expected_boundary.isoformat()}, "
+            f"got {new_boundary_str}, diff={diff_sec}s"
+        )
+
+        # Граница НЕ откатилась к старому new-item (regression check)
+        old_fetched = _iso_dt_parsed(old_item.fetched_at)
+        assert new_boundary_dt > old_fetched, (
+            "Граница НЕ должна откатываться к старому 'new' item. "
+            f"new_boundary={new_boundary_str} <= old_fetched_at={old_item.fetched_at}"
+        )
+    finally:
+        p.close()
+
+
+def test_digest_boundary_empty_digest_uses_clamp(caplog, tmp_path):
+    """
+    (в) Empty-дайджест (on_empty=skip): граница по той же формуле,
+        НЕ откатывается к unprocessed.
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    # Граница 36ч назад (gap > 2*period=24ч)
+    two_days_ago = datetime.now(timezone.utc) - timedelta(hours=36)
+    two_days_ago = two_days_ago.replace(microsecond=0)
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {
+            "enabled": True, "on_empty": "skip",
+            "max_items": 100, "max_items_per_message": 20,
+            "times": ["08:00", "20:00"],  # period=12
+        },
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        p.storage.set_meta("digest_window_started_at", two_days_ago.isoformat())
+
+        # Кладём старый new-item, который в старой логике откатил бы границу
+        old_item = _mk_item(
+            title="Old Unprocessed",
+            url="https://ex.com/old-unproc",
+            llm_score=5,
+            fetched_at=two_days_ago.isoformat(),
+        )
+        p.storage.save(old_item)  # state='new' по умолчанию
+
+        with caplog.at_level(logging.DEBUG, logger="newsbot.pipeline"):
+            result = p.run_digest(force=False)
+
+        assert result == 0
+        new_boundary_str = p.storage.get_meta("digest_window_started_at")
+        assert new_boundary_str is not None
+
+        # close_time - period (прыжок из заморозки)
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        expected_boundary = now_utc - timedelta(hours=12)
+        new_boundary_dt = _iso_dt_parsed(new_boundary_str)
+        assert new_boundary_dt is not None
+
+        diff_sec = abs((new_boundary_dt - expected_boundary).total_seconds())
+        assert diff_sec < 5 * 60, (
+            f"Empty-digest clamp: expected ~{expected_boundary.isoformat()}, "
+            f"got {new_boundary_str}"
+        )
+    finally:
+        p.close()
+
+
+def test_digest_boundary_monotonicity(caplog, tmp_path):
+    """
+    (д) Монотонность: new_boundary >= previous во всех ветках
+        (на штатном закрытии и на empty).
+    """
+    import logging
+
+    db_path = tmp_path / "test.db"
+    # Начальная граница 12ч назад (gap < 2*period → max-ветка)
+    twelve_hours_ago = datetime.now(timezone.utc) - timedelta(hours=12)
+    twelve_hours_ago = twelve_hours_ago.replace(microsecond=0)
+    config = {
+        "sources": [],
+        "database": {"path": str(db_path)},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {
+            "enabled": True, "on_empty": "skip",
+            "max_items": 100, "max_items_per_message": 20,
+            "times": ["08:00", "20:00"],  # period=12
+        },
+        "llm": {"enabled": False},
+    }
+
+    from newsbot.pipeline import NewsPipeline
+    p = NewsPipeline(config)
+    try:
+        p.storage.set_meta("digest_window_started_at", twelve_hours_ago.isoformat())
+
+        with caplog.at_level(logging.DEBUG, logger="newsbot.pipeline"):
+            result = p.run_digest(force=False)
+
+        assert result == 0
+        new_boundary_str = p.storage.get_meta("digest_window_started_at")
+        assert new_boundary_str is not None
+
+        new_boundary_dt = _iso_dt_parsed(new_boundary_str)
+        assert new_boundary_dt is not None
+
+        # new >= previous
+        assert new_boundary_dt >= twelve_hours_ago, (
+            f"Монотонность нарушена: new={new_boundary_str} < previous={twelve_hours_ago.isoformat()}"
+        )
+    finally:
+        p.close()
+
+
+# Вспомогательный парсер ISO → datetime (вынесен для reuse)
+def _iso_dt_parsed(iso_str):
+    """Парсит ISO-строку с/без timezone в datetime (UTC или tz-aware)."""
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    try:
+        # Пытаемся распознать timezone
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None

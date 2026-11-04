@@ -25,7 +25,7 @@ _root = Path(__file__).parent.parent
 sys.path.insert(0, str(_root))
 
 from newsbot.collector import NewsItem
-from newsbot.pipeline import NewsPipeline
+from newsbot.pipeline import NewsPipeline, _iso_dt
 from newsbot.storage import Storage
 
 
@@ -133,6 +133,45 @@ def _mk_pipeline(db_path, digest_cfg=None, llm_filter=None):
     p.storage = Storage(db_path)
     if llm_filter is not None:
         p.llm_filter = llm_filter
+    return p
+
+
+def _mk_pipeline_mf(db_path, mock_filter, digest_cfg=None):
+    """Pipeline с mock-фильтром (вызывает _build_llm_filter через patch)."""
+    cfg = {
+        "sources": [],
+        "database": {"path": db_path},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": digest_cfg or {
+            "enabled": True, "max_items": 100, "max_items_per_message": 20,
+        },
+        "llm": {"enabled": False},
+    }
+    with patch.object(NewsPipeline, "_build_delivery", return_value=MagicMock()):
+        with patch.object(NewsPipeline, "_build_llm_filter", return_value=mock_filter):
+            p = NewsPipeline(cfg)
+            p.storage.close()
+            p.storage = Storage(db_path)
+            p.llm_filter = mock_filter
+            return p
+
+
+def _mk_pipeline_unit(digest_cfg=None):
+    """
+    Создаёт pipeline через __new__ (unit, без Storage).
+    Для тестирования helper-методов (не требует БД).
+    """
+    cfg = {
+        "sources": [],
+        "database": {"path": "data/nb.db"},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": digest_cfg or {"bootstrap_window_hours": 24},
+        "llm": {"enabled": False},
+    }
+    with patch.object(NewsPipeline, "_build_delivery", return_value=MagicMock()):
+        with patch.object(NewsPipeline, "_build_llm_filter", return_value=MagicMock()):
+            p = NewsPipeline(cfg)
+            p.storage = MagicMock()
     return p
 
 
@@ -901,16 +940,118 @@ class TestDigestEmptyWindowWithUnprocessed(unittest.TestCase):
             pending_urls = {i.url for i in p.storage.get_all_by_state("pending")}
             self.assertIn("https://ex.com/pending", pending_urls)
 
-            # Граница НЕ дальше fetched_at pending-item
+            # Major-1 fix: граница НЕ привязана к MIN(unprocessed).
+            # Проверяем монотонность: new_boundary >= prev_boundary
+            # (не откатывается назад, даже если pending.fetched_at старая).
+            # prev_boundary = 2025-01-01; close-period ≈ 2025-12-01 >> prev.
             boundary = p.storage.get_meta("digest_window_started_at")
             self.assertIsNotNone(boundary)
-            # boundary <= pending.fetched_at (2025-06-01T12:00:00+00:00)
-            self.assertLessEqual(boundary, "2025-06-01T12:00:00+00:00")
-            # При этом граница сдвинута ОТ начальной
-            self.assertGreater(boundary, "2025-01-01T00:00:00+00:00")
+            self.assertGreaterEqual(boundary, "2025-01-01T00:00:00+00:00",
+                "Граница не откатилась назад (монотонность)")
 
             p.storage.close()
             p.close()
+
+
+# =============================================================================
+# Major-1 regression tests: not-groups branch + not-MIN monotonicity
+# =============================================================================
+
+class TestMajor1NotGroupsBoundary(unittest.TestCase):
+    """
+    Регрессионные тесты для Major-1 (helper _next_window_boundary).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_helper_boundary_monotonic_no_min_rollback(self):
+        """
+        _next_window_boundary: монотонность (new >= prev), НЕ MIN(unprocessed).
+        Это ключевой регрессионный тест против old MIN-logic rollback.
+        """
+        p = _mk_pipeline_unit(digest_cfg={"bootstrap_window_hours": 24})
+
+        now = _dt.now(timezone.utc)
+        digest_started = (now - timedelta(hours=1)).isoformat()
+        prev = (now - timedelta(days=2)).isoformat()
+
+        result = p._next_window_boundary(
+            raw_boundary=prev,
+            digest_started_iso=digest_started,
+            anchor_mode=False,
+            anchor_boundary="unused",
+        )
+        result_dt = _iso_dt(result)
+        prev_dt = _iso_dt(prev)
+        now_dt = _iso_dt(_dt.now(timezone.utc).isoformat())
+
+        # Монотонность: new >= prev
+        self.assertGreaterEqual(result_dt, prev_dt)
+        # new не из будущего
+        self.assertLessEqual(result_dt, now_dt)
+        # close-period = digest_started - 24h >> prev (2 дня назад)
+        # Helper: max(prev, close-period) = close-period
+
+    def test_helper_bootstrap_no_prev(self):
+        """
+        _next_window_boundary: bootstrap (raw_boundary=None) -> digest_started_iso.
+        """
+        p = _mk_pipeline_unit(digest_cfg={"bootstrap_window_hours": 24})
+
+        now = _dt.now(timezone.utc).isoformat()
+
+        result = p._next_window_boundary(
+            raw_boundary=None,
+            digest_started_iso=now,
+            anchor_mode=False,
+            anchor_boundary="unused",
+        )
+        # Bootstrap: digest_started_iso
+        self.assertEqual(result, now)
+
+    def test_helper_anchor_mode(self):
+        """
+        _next_window_boundary: anchor_mode=True -> anchor_boundary returned.
+        """
+        p = _mk_pipeline_unit(digest_cfg={"bootstrap_window_hours": 24})
+
+        result = p._next_window_boundary(
+            raw_boundary="old-value",
+            digest_started_iso="2026-01-01T00:00:00+00:00",
+            anchor_mode=True,
+            anchor_boundary="2026-06-01T00:00:00+00:00",
+        )
+        # Anchor: anchor_boundary returned
+        self.assertEqual(result, "2026-06-01T00:00:00+00:00")
+
+    def test_helper_freeze_gap_above_2period(self):
+        """
+        _next_window_boundary: gap > 2*period -> freeze jump.
+        """
+        p = _mk_pipeline_unit(digest_cfg={"bootstrap_window_hours": 24})
+
+        # prev = 3 дня назад, digest_started = now (gap > 2*24h)
+        prev = (_dt.now(timezone.utc) - timedelta(days=3)).isoformat()
+        now = _dt.now(timezone.utc).isoformat()
+
+        result = p._next_window_boundary(
+            raw_boundary=prev,
+            digest_started_iso=now,
+            anchor_mode=False,
+            anchor_boundary="unused",
+        )
+        result_dt = _iso_dt(result)
+        now_dt = _iso_dt(now)
+
+        # Freeze: close - period (one-time jump forward)
+        self.assertLess(result_dt, now_dt)
+        # new >> prev (pruned 3 days ago -> jumped close-period >> prev)
+        self.assertGreater(result_dt, _iso_dt(prev))
 
 
 class TestDigestWindowUnprocessedAndCleanup(unittest.TestCase):
@@ -921,8 +1062,9 @@ class TestDigestWindowUnprocessedAndCleanup(unittest.TestCase):
         В БД есть:
           - new-item с fetched_at СТАРШЕ старта дайджеста (new, pending, skipped, failed)
           - deferred-item ВНУТРИ окна (уйдёт в digest).
-        После успешного digest: deferred удалён, new остался,
-        digest_window_started_at <= fetched_at этого new.
+        После успешного digest: deferred → digested, new остался,
+        digest_window_started_at >= previous (монотонность по clamp-формуле;
+        freeze-fix: граница БОЛЬШЕ необработанных, НЕ привязана к MIN(unprocessed)).
         """
         with _tmp_db() as db_path:
             s = Storage(db_path)
@@ -978,11 +1120,14 @@ class TestDigestWindowUnprocessedAndCleanup(unittest.TestCase):
             # new-item сохранён
             self.assertIn("https://ex.com/new", all_urls)
 
-            # Граница НЕ дальше fetched_at new-item
+            # Freeze-fix: граница вычислена по clamp-формуле,
+            # НЕ привязана к MIN(unprocessed). Проверяем монотонность:
+            # new_boundary >= previous (2020-01-01T00:00:00+00:00).
+            # new-item сохранён (boundary не откатывается к нему назад).
             boundary = p.storage.get_meta("digest_window_started_at")
             self.assertIsNotNone(boundary)
-            # boundary <= fetched_at new-item (2024-01-01T12:00:00+00:00)
-            self.assertLessEqual(boundary, "2024-01-01T12:00:00+00:00")
+            self.assertGreaterEqual(boundary, "2020-01-01T00:00:00+00:00",
+                "Граница должна быть >= previous (монотонность clamp-формулы)")
 
             p.storage.close()
             p.close()

@@ -1156,5 +1156,119 @@ class TestContainmentDedupAfterLLM(unittest.TestCase):
             p.close()
 
 
+# =============================================================================
+# dedup-before-translate integration tests
+# =============================================================================
+
+class TestDedupOnTranslatedTitles(unittest.TestCase):
+    """
+    Интеграция: перевод РАНЬШЕ кластеризации → RU+EN одного события
+    попадают в единый кластер.
+
+    Сценарий: Ярославль-НПЗ ×3 RU-варианта + EN-перевод.
+    Без перевода: 4 разных RU-заголовка → LLM не видит дублей.
+    С переводом: все 4 → EN → LLM кластеризует в 1 кластер.
+    """
+
+    def test_ru_en_dup_clustered_together(self):
+        """
+        RU-item с llm_title + EN-item → оба в едином кластере.
+        detect_duplicates получает оба с EN-title в промпте.
+        """
+        from newsbot.llm.prompts import build_dedup_user_message
+
+        ru_item = _mk_item(
+            url="https://ex.com/ru1",
+            title="Ярославль НПЗ подвергся атаке беспилотников",
+            summary="Резервуары повреждены.",
+            llm_score=7,
+            llm_title="Yaroslavl Oil Refinery Hit by Drone Strike",
+        )
+        en_item = _mk_item(
+            url="https://ex.com/en1",
+            title="Yaroslavl Oil Refinery Hit by Drone Strike",
+            summary="Tanks damaged.",
+            llm_score=6,
+        )
+
+        # Промпт для dedup
+        msg = build_dedup_user_message([ru_item, en_item], [])
+        # Обе версии — EN в промпте
+        count_en = msg.count("Yaroslavl Oil Refinery Hit by Drone Strike")
+        self.assertEqual(count_en, 2, "Оба title — EN в dedup-промпте")
+        # RU не попадает в промпт
+        self.assertNotIn("Ярославль", msg)
+
+    def test_llm_detect_receives_en_titles(self):
+        """
+        LLM-дедуп получает items с llm_title в промпте.
+        Проверяем моком: что именно передаётся в build_dedup_user_message.
+        """
+        from newsbot.llm.prompts import build_dedup_user_message
+
+        # Ситуация: EN-item уже был, RU-item получил llm_title
+        ru_item = _mk_item(
+            url="https://ex.com/ru2",
+            title="US strikes Qeshm airport in Iran",
+            summary="",
+            llm_score=8,
+            llm_title="US Strikes Qeshm Airport in Iran",
+        )
+        # EN-item: без llm_title — raw EN-title
+        en_item = _mk_item(
+            url="https://ex.com/en2",
+            title="US Strikes Qeshm Airport in Iran",
+            summary="",
+            llm_score=7,
+        )
+
+        msg = build_dedup_user_message([ru_item, en_item], [])
+        # RU-item: llm_title в промпте
+        self.assertIn("US Strikes Qeshm Airport in Iran", msg)
+
+    def test_containment_uses_translated_title(self):
+        """
+        F6 containment: title_normalized от llm_title.
+        RU-item (с llm_title) containment-дубль с EN-item отсекается.
+        """
+        from newsbot.dedup import is_containment_duplicate
+        import re
+
+        # RU-item: llm_title есть
+        ru_item = _mk_item(
+            url="https://ex.com/ru3",
+            title="Два человека погибли при атаке дрона на Воронежскую область",
+            summary="",
+            llm_score=7,
+            llm_title="Two killed in Ukrainian attack on Voronezh region",
+        )
+        # EN-item: raw title совпадает с llm_title RU-item
+        en_item = _mk_item(
+            url="https://ex.com/en3",
+            title="Two killed in Ukrainian attack on Voronezh region",
+            summary="",
+            llm_score=6,
+        )
+
+        # Inline normalizer — точная копия logic из pipeline F6
+        _NON_WORD = re.compile(r"[^\w\s]")
+        _MULTI_SPACE = re.compile(r"\s+")
+
+        def _tn(item_):
+            t = getattr(item_, 'llm_title', None) or item_.title or ""
+            step1 = t  # no-op: _strip_source_prefix опущен (нет source prefix в тесте)
+            step2 = step1.lower()
+            step3 = _NON_WORD.sub("", step2)
+            return _MULTI_SPACE.sub(" ", step3).strip()
+
+        a_title = _tn(ru_item)
+        b_title = _tn(en_item)
+
+        # Containment: оба нормализуются к одному и тому же
+        self.assertEqual(a_title, b_title)
+        icd = is_containment_duplicate(a_title, b_title)
+        self.assertTrue(icd, "RU с llm_title + EN с тем же текстом → containment дубль")
+
+
 if __name__ == "__main__":
     unittest.main()

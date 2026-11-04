@@ -877,5 +877,371 @@ class TestTranslationChunking(unittest.TestCase):
         self.assertIn(35, global_indices)
 
 
+# =============================================================================
+# Test L: dedup-before-translate (a–d)
+# =============================================================================
+
+class TestDedupBeforeTranslate(unittest.TestCase):
+    """
+    RU-item с EN llm_title кластеризуется как дубль с EN-item.
+    llm_title пуст → fallback на title.
+    Перевод вызывается ДО кластеризации.
+    При исчерпанном бюджете дедуп работает на сырых title.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pipe = _build_news_pipeline(Path(self.tmp))
+        self.flt = self.pipe.llm_filter
+
+    def tearDown(self):
+        _unmock()
+        self.pipe.storage.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ru_item_with_llm_title_clustered_as_dup_with_en(self):
+        """
+        (a) RU-item с llm_title кластеризуется с EN-item.
+        build_dedup_user_message получает EN-тексты.
+        """
+        from newsbot.llm.prompts import build_dedup_user_message
+
+        ru_item = _mk_item(
+            url="https://ex.com/ru1",
+            title="Ярославль НПЗ подвергся атаке дронов",
+            summary="Резервуары повреждены.",
+            llm_score=7,
+            llm_title="Yaroslavl Oil Refinery Hit by Drone Strike",  # уже переведён
+            llm_summary="Tanks damaged.",
+        )
+        en_item = _mk_item(
+            url="https://ex.com/en1",
+            title="Yaroslavl Oil Refinery Hit by Drone Strike",
+            summary="Tanks damaged.",
+            llm_score=6,
+        )
+
+        msg = build_dedup_user_message([ru_item, en_item], [])
+        # Оба title должны быть EN в промпте
+        self.assertIn("Yaroslavl Oil Refinery Hit by Drone Strike", msg)
+        self.assertNotIn("Ярославль", msg)
+
+    def test_llm_title_empty_falls_back_to_title(self):
+        """
+        (b) llm_title пуст → используется title.
+        """
+        from newsbot.llm.prompts import build_dedup_user_message
+
+        item = _mk_item(
+            url="https://ex.com/ru1",
+            title="Шторм обрушился на Испанию",
+            summary="Есть жертвы.",
+            llm_score=6,
+            llm_title=None,
+        )
+
+        msg = build_dedup_user_message([item], [])
+        #Fallback: RU-title попадает в промпт
+        self.assertIn("Шторм", msg)
+        self.assertIn("Испанию", msg)
+
+    def test_translate_called_before_cluster(self):
+        """
+        (в) Перевод вызывается ДО кластеризации — порядок вызовов.
+        RU-items без llm_title триггерят translate_news_items.
+        """
+        call_order = []
+
+        def tracking_translate(items):
+            call_order.append("translate")
+            return []  # fail-open: бюджет исчерпан
+
+        def tracking_detect(candidates, recent):
+            call_order.append("detect")
+            return set()
+
+        self.flt.translate_news_items = MagicMock(side_effect=tracking_translate)
+        self.flt.detect_duplicates = MagicMock(side_effect=tracking_detect)
+
+        # Подменяем get_shown_for_window
+        self.pipe.storage.get_shown_for_window = MagicMock(return_value=[])
+
+        # Оба — RU titles без llm_title → перевод триггерится
+        items = [
+            _mk_item(url="https://ex.com/1",
+                     title="Шторм обрушился на Испанию", llm_score=6),
+            _mk_item(url="https://ex.com/2",
+                     title="Буря в Средиземном море", llm_score=6),
+        ]
+
+        # Вызываем в нужном порядке: сначала _translate_digest_items,
+        # потом _cluster_deferred_duplicates
+        self.pipe._translate_digest_items(items)
+        self.pipe._cluster_deferred_duplicates(items, "2026-01-01T00:00:00+00:00")
+
+        self.assertEqual(call_order, ["translate", "detect"],
+            "translate должен вызываться ДО detect")
+
+    def test_budget_exhausted_dedup_works_on_raw_titles(self):
+        """
+        (г) При исчерпанном бюджете перевода дедуп не падает и работает на сырых.
+        """
+        from newsbot.llm.prompts import build_dedup_user_message
+        from newsbot.llm.client import LLMError
+
+        ru_item = _mk_item(
+            url="https://ex.com/ru1",
+            title="Ярославль НПЗ подвергся атаке",
+            summary="",
+            llm_score=6,
+            llm_title=None,
+        )
+        en_item = _mk_item(
+            url="https://ex.com/en1",
+            title="Yaroslavl Oil Refinery Hit by Drone Strike",
+            summary="",
+            llm_score=6,
+            llm_title=None,
+        )
+
+        # Симулируем исчерпанный бюджет: translate возвращает []
+        self.flt.translate_news_items = MagicMock(return_value=[])
+
+        self.pipe._translate_digest_items([ru_item, en_item])
+
+        # llm_title не заполнен (бюджет исчерпан)
+        self.assertIsNone(ru_item.llm_title)
+
+        # Но дедуп-промпт не падает — fallback на raw title
+        msg = build_dedup_user_message([ru_item, en_item], [])
+        self.assertIn("Ярославль", msg)
+        self.assertIn("Yaroslavl", msg)
+
+    def test_order_preserved_after_translate(self):
+        """
+        (д) Перенос перевода не меняет порядок items.
+        translate_news_items итерирует по ru_items (= подмножество deferred),
+        порядок deferred не меняется.
+        """
+        items = [
+            _mk_item(url=f"https://ex.com/{i}", title=f"Н-{i}", llm_score=6)
+            for i in range(5)
+        ]
+
+        def fake_translate(batch):
+            return [{"idx": j+1, "title_en": f"T{j+1}", "summary_en": ""}
+                    for j in range(len(batch))]
+
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = MagicMock(side_effect=fake_translate)
+
+        self.pipe._translate_digest_items(items)
+
+        # Порядок сохранён
+        urls = [it.url for it in items]
+        for i in range(5):
+            self.assertIn(f"https://ex.com/{i}", urls)
+
+        self.flt.translate_news_items = orig
+
+
+# =============================================================================
+# Test M: RECENT из БД использует COALESCE(title_en, title)
+# =============================================================================
+
+class TestRecentSqlCoalesce(unittest.TestCase):
+    """(е) get_shown_for_window возвращает llm_title для переведённых items."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = str(Path(self.tmp) / "test.db")
+        self.s = Storage(db_path=self.db_path)
+
+    def tearDown(self):
+        self.s.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _insert_item(self, url, title, llm_title, state, state_at_iso, fetched_at_iso):
+        """Прямой INSERT в БД (контролирует llm_title и state_at)."""
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO items
+            (source, url, title, summary, published, fetched_at, state, state_at,
+             llm_score, llm_title)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("TestSrc", url, title, "S", "2025-01-01 12:00", fetched_at_iso,
+             state, state_at_iso, 6, llm_title),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_shown_for_window_uses_llm_title(self):
+        """COALESCE(llm_title, title): переведённый item возвращает EN-title."""
+        now = "2026-11-04T00:00:00+00:00"
+        self._insert_item(
+            url="https://ex.com/translated",
+            title="Шторм в Испании",
+            llm_title="Storm in Spain",
+            state="digested",
+            state_at_iso=now,
+            fetched_at_iso=now,
+        )
+
+        result = self.s.get_shown_for_window(cutoff_iso="2020-01-01T00:00:00+00:00")
+        self.assertEqual(len(result), 1)
+        # EN-title из llm_title, не RU из title
+        self.assertEqual(result[0]["title"], "Storm in Spain")
+
+    def test_shown_for_window_falls_back_to_title_when_no_llm_title(self):
+        """COALESCE(llm_title, title): без llm_title возвращает исходный title."""
+        now = "2026-11-04T00:00:00+00:00"
+        self._insert_item(
+            url="https://ex.com/raw",
+            title="Storm Hits Spain",
+            llm_title=None,
+            state="digested",
+            state_at_iso=now,
+            fetched_at_iso=now,
+        )
+
+        result = self.s.get_shown_for_window(cutoff_iso="2020-01-01T00:00:00+00:00")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["title"], "Storm Hits Spain")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# =============================================================================
+# Test N: Major-2 — повторный перевод после late_backfill
+# =============================================================================
+
+class TestMajor2LateBackfillTranslation(unittest.TestCase):
+    """
+    new_fallback/late_backfill item без llm_title попадает в рендер
+    переведённым (повторный _translate_digest_items после backfill).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pipe = _build_news_pipeline(Path(self.tmp))
+        self.flt = self.pipe.llm_filter
+
+    def tearDown(self):
+        _unmock()
+        self.pipe.storage.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_late_backfill_item_translated_before_render(self):
+        """
+        RU-item без llm_title переводится _translate_digest_items и
+        попадает в рендер с EN-title. Idempotency: второй вызов — no-op.
+        """
+        # item без llm_title — имитирует late_backfill / new_fallback
+        item = _mk_item(
+            url="https://ex.com/late",
+            title="Шторм обрушился на побережье",
+            summary="Есть пострадавшие.",
+            llm_score=6,
+            llm_title=None,
+        )
+
+        translate_calls = []
+
+        def tracking_translate(batch):
+            translate_calls.append(list(batch))
+            return [{"idx": j + 1,
+                     "title_en": f"Storm Hits Coast-{j+1}",
+                     "summary_en": ""}
+                    for j in range(len(batch))]
+
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = MagicMock(side_effect=tracking_translate)
+
+        # Первый вызов: item без llm_title → вызов translate_news_items
+        self.pipe._translate_digest_items([item])
+
+        # Вызов был ровно один (RU без llm_title)
+        self.assertEqual(len(translate_calls), 1,
+            "Первый вызов: RU-item триггерит перевод")
+        self.assertEqual(len(translate_calls[0]), 1)
+
+        # llm_title заполнен
+        self.assertIsNotNone(item.llm_title)
+        self.assertEqual(item.llm_title, "Storm Hits Coast-1")
+
+        # Второй вызов: item уже с llm_title → no-op (idempotent)
+        self.pipe._translate_digest_items([item])
+
+        # Вызовов по-прежнему 1 (idempotent, not llm_title не сработал)
+        self.assertEqual(len(translate_calls), 1,
+            "Второй вызов: llm_title уже есть → no-op (idempotent)")
+
+        # EN-title в рендере
+        from newsbot.digest import _render_item_raw
+        title_raw, _, _, _ = _render_item_raw(item)
+        self.assertEqual(title_raw, "Storm Hits Coast-1")
+
+        self.flt.translate_news_items = orig
+
+    def test_retranslate_only_missing_llm_title(self):
+        """
+        При наличии mixed-пула (EN с llm_title + RU без) повторный вызов
+        переводит только RU-items.
+        """
+        # EN item — уже переведён
+        en_item = _mk_item(
+            url="https://ex.com/en",
+            title="Storm Hits Coast",
+            llm_score=6,
+            llm_title="Storm Hits Coast",
+        )
+        # RU item — без перевода
+        ru_item = _mk_item(
+            url="https://ex.com/ru",
+            title="Шторм обрушился на побережье",
+            llm_score=6,
+            llm_title=None,
+        )
+
+        translate_mock = MagicMock()
+
+        def tracking_translate(batch):
+            return [{"idx": j + 1,
+                     "title_en": f"Storm Hits Coast-{batch[j].url.split('/')[-1]}",
+                     "summary_en": ""}
+                    for j in range(len(batch))]
+
+        translate_mock.side_effect = tracking_translate
+
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = translate_mock
+
+        pool = [en_item, ru_item]
+
+        # Первый вызов: только RU-item попадает в batch перевода
+        self.pipe._translate_digest_items(pool)
+        self.assertEqual(translate_mock.call_count, 1)
+        first_batch = translate_mock.call_args[0][0]
+        self.assertEqual(len(first_batch), 1)
+        self.assertEqual(first_batch[0].url, "https://ex.com/ru")
+
+        # EN-item не тронут
+        self.assertEqual(en_item.llm_title, "Storm Hits Coast")
+
+        # RU-item переведён
+        self.assertIsNotNone(ru_item.llm_title)
+
+        # Второй вызов (имитация повторного вызова перед render)
+        self.pipe._translate_digest_items(pool)
+        # Вызовов по-прежнему 1 (idempotent, оба с llm_title)
+        self.assertEqual(translate_mock.call_count, 1)
+
+        self.flt.translate_news_items = orig

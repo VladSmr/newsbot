@@ -35,7 +35,7 @@ from datetime import datetime, timedelta, timezone as tz
 from email.utils import parsedate_to_datetime as _parsedate_to_dt
 from typing import Dict, List, Optional, Set, Tuple
 
-from .collector import FeedCollector, FeedResult, NewsItem
+from .collector import FeedCollector, FeedResult, NewsItem, normalize_title_text
 from .dedup import filter_new, is_containment_duplicate
 from .delivery import ConsoleDelivery, TelegramDelivery, Delivery
 from .delivery.telegram import ChatIdNotBoundError, BotBlockedError
@@ -144,6 +144,34 @@ def _normalize_category_min(raw) -> Dict[str, int]:
 
 # Дефолтные слоты расписания дайджеста. Синхронизировано с
 # config.DEFAULT_CONFIG["digest"]["times"] = ["08:00", "20:00"].
+
+
+def _digest_period_hours(config: dict) -> int:
+    """
+    Вычисляет интервал между digest-слотами в часах.
+
+    period = мин. разница между двумя соседними слотами по CIRCULAR-часам
+    (00:00..23:59 по кругу). Fallback: 24ч при ≤1 слоте.
+
+    При ["08:00","20:00"]:
+      sorted = [(8,0),(20,0)]; gap1 = 12ч; gap2 = 24-12=12ч → period=12.
+    """
+    times_raw = config.get("digest", {}).get("times")
+    slots = _normalize_digest_times(times_raw)
+    if len(slots) <= 1:
+        return 24
+    sorted_times = sorted(slots)
+    min_gap = 24 * 60  # минуты
+    for i in range(len(sorted_times)):
+        h1, m1 = sorted_times[i]
+        h2, m2 = sorted_times[(i + 1) % len(sorted_times)]
+        diff = (h2 * 60 + m2) - (h1 * 60 + m1)
+        if diff <= 0:
+            diff += 24 * 60
+        min_gap = min(min_gap, diff)
+    return max(1, min_gap // 60)
+
+
 _DEFAULT_DIGEST_TIMES = ("08:00", "20:00")
 
 
@@ -3007,6 +3035,41 @@ class NewsPipeline:
                 e, len(raw_results),
             )
 
+
+    def _next_window_boundary(
+        self,
+        raw_boundary,
+        digest_started_iso,
+        anchor_mode,
+        anchor_boundary: str,
+    ):
+        """
+        Computes the new window boundary from the closing time and previous boundary.
+
+        anchor_mode -> anchor_boundary (e.g. window_start_iso or anchor_dt)
+        gap > 2*period  -> freeze (one-time jump)
+        else             -> max(prev, close - period)
+        no prev           -> digest_started_iso (bootstrap)
+
+        Called from all four window-close paths:
+          :3313 (empty-skip), :4148 (normal), :4197 (empty-send),
+          :3882 (not-groups / render-dup).
+        """
+        if anchor_mode:
+            return anchor_boundary
+        close_time = _iso_dt(digest_started_iso)
+        prev_boundary_dt = _iso_dt(raw_boundary) if raw_boundary else None
+        period_h = _digest_period_hours(self.config)
+        period_delta = timedelta(hours=period_h)
+        if close_time is not None and prev_boundary_dt is not None:
+            gap = close_time - prev_boundary_dt
+            if gap > 2 * period_delta:
+                return (close_time - period_delta).isoformat()
+            else:
+                return max(prev_boundary_dt, close_time - period_delta).isoformat()
+        else:
+            return digest_started_iso  # bootstrap
+
     def run_digest(self, force: bool = False) -> int:
         """
         Выполняет дайджест для накопленных deferred-items.
@@ -3279,16 +3342,13 @@ class NewsPipeline:
                     "last_digest_at",
                     digest_started_iso,
                 )
-                # Задача 1 (п.5): anchor-режим — граница фиксирована якорем.
-                # Fallback — прежний rollback к unprocessed.
-                if anchor_mode:
-                    new_boundary = window_start_iso
-                else:
-                    unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-                    new_boundary = digest_started_iso
-                    udt = _iso_dt(unprocessed) if isinstance(unprocessed, str) else None
-                    if udt is not None and udt < now_utc:
-                        new_boundary = unprocessed
+                # Freeze-fix: монотонный кламп границы — больше НЕ зависит от
+                # MIN(unprocessed). 'new'-items старше 2*period не откатывают
+                # границу назад. Helper deduplicates formula across 4 paths.
+                new_boundary = self._next_window_boundary(
+                    raw_boundary, digest_started_iso, anchor_mode,
+                    window_start_iso,
+                )
                 self.storage.set_meta("digest_window_started_at", new_boundary)
                 # Minor-1: инкремент после маркеров — сбой счётчика не блокирует окно.
                 # Оба маркера уже записаны выше; digest_empty_count — best-effort.
@@ -3299,6 +3359,14 @@ class NewsPipeline:
                     logger.warning("Дайджест: не удалось записать digest_empty_count")
                 return 0
             # on_empty=send: обрабатывается дальше (пустое уведомление)
+
+        # ── Translation hook: RU → EN для дайджеста ───────────────────────
+        # Перевод РАНЬШЕ кластеризации: llm_title заполняется до того,
+        # как дедуп-промпт и LLM-дедуп увидят заголовки. Это позволяет
+        # кластеризовать RU+EN-версии одного события в единый кластер.
+        # llm_filter может быть None (выключен) → пропускаем (fail-open).
+        if self.llm_filter is not None:
+            self._translate_digest_items(deferred_items)
 
         # ── Финальный сейф от дублей: семантическая кластеризация deferred ──
         # Новости одного события, накопленные за несколько циклов, не должны
@@ -3326,8 +3394,10 @@ class NewsPipeline:
                     b = deferred_items[j]
                     if b.url in _containment_dup_urls:
                         continue
-                    a_title = getattr(a, 'title_normalized', None)() if hasattr(a, 'title_normalized') else ""
-                    b_title = getattr(b, 'title_normalized', None)() if hasattr(b, 'title_normalized') else ""
+                    # dedup-before-translate fix: containment работает от llm_title если есть.
+                    # Inline normalizer (не трогаем production title_normalized).
+                    a_title = normalize_title_text(getattr(a, 'llm_title', None) or a.title or "")
+                    b_title = normalize_title_text(getattr(b, 'llm_title', None) or b.title or "")
                     if not a_title or not b_title:
                         continue
                     icd = is_containment_duplicate(a_title, b_title)
@@ -3711,6 +3781,14 @@ class NewsPipeline:
             n_guarantee, n_cap, n_late_backfill, n_final,
         )
 
+        # Major-2 fix: повторный перевод после late_backfill — гарантирует,
+        # что new_fallback/late_backfill items (добавленные ПОСЛЕ первого
+        # перевода) тоже получают llm_title перед build_digest_messages.
+        # Idempotent: _translate_digest_items фильтрует not llm_title,
+        # уже переведённые пропускаются. llm_filter может быть None.
+        if self.llm_filter is not None:
+            self._translate_digest_items(deferred_items)
+
         # ── Feedback targets + передача готовых groups в digest ──
         # F2: только при TelegramDelivery + feedback.enabled + digest_enabled.
         # digest_enabled=false (дефолт): не создаём targets (экономия БД-записей),
@@ -3739,13 +3817,6 @@ class NewsPipeline:
         # при исключении в рендеринге → UnboundLocalError → весь дайджест падал,
         # set_state('failed') не вызывался, маркеры окна не двигались.
         failed_digest_urls: List[str] = []
-
-        # ── Translation hook: RU → EN для дайджеста ───────────────────────
-        # После финального списка, до build_digest_messages / рендера.
-        # Патчит item.llm_title / item.llm_summary in-memory.
-        # llm_filter может быть None (выключен) → пропускаем.
-        if self.llm_filter is not None:
-            self._translate_digest_items(deferred_items)
 
         groups, _, _build_failed = build_digest_messages(
             deferred_items,
@@ -3828,12 +3899,11 @@ class NewsPipeline:
             logger.info("Дайджест: нет сообщений для отправки.")
             # Minor-1: маркеры пишутся БЕЗУСЛОВНО — инкремент счётчика не блокирует окно.
             self.storage.set_meta("last_digest_at", digest_started_iso)
-            unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-            new_boundary = digest_started_iso
-            if isinstance(unprocessed, str):
-                udt = _iso_dt(unprocessed)
-                if udt is not None and udt < now_utc:
-                    new_boundary = unprocessed
+            # Freeze-fix: NOT groups branch uses same helper (no MIN rollback).
+            new_boundary = self._next_window_boundary(
+                raw_boundary, digest_started_iso, anchor_mode,
+                window_start_iso,
+            )
             self.storage.set_meta("digest_window_started_at", new_boundary)
             # Minor-1+2: инкремент после маркеров — try/except; отдельный счётчик для render/dup.
             try:
@@ -4095,19 +4165,10 @@ class NewsPipeline:
                     "(fetched_at < %s)",
                     dropped_count, window_start_iso,
                 )
-            if anchor_mode:
-                new_boundary = window_start_iso
-            else:
-                unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-                new_boundary = digest_started_iso
-                if isinstance(unprocessed, str):
-                    udt = _iso_dt(unprocessed)
-                    if udt is not None and udt < now_utc:
-                        new_boundary = unprocessed
-                        logger.info(
-                            "Дайджест: есть необработанные items с %s — "
-                            "граница окна отодвинута", unprocessed,
-                        )
+            new_boundary = self._next_window_boundary(
+                raw_boundary, digest_started_iso, anchor_mode,
+                window_start_iso,
+            )
             try:
                 # Удаляем ровно окно: всё, что собрано ДО window_start_iso.
                 # new/pending защищены на уровне storage.
@@ -4140,15 +4201,11 @@ class NewsPipeline:
                         "(fetched_at < %s)",
                         dropped_count, window_start_iso,
                     )
-                if anchor_mode:
-                    new_boundary = window_start_iso
-                else:
-                    unprocessed = self.storage.get_oldest_unprocessed_fetched_at()
-                    new_boundary = digest_started_iso
-                    if isinstance(unprocessed, str):
-                        udt = _iso_dt(unprocessed)
-                        if udt is not None and udt < now_utc:
-                            new_boundary = unprocessed
+                # Same helper — no MIN(unprocessed) rollback.
+                new_boundary = self._next_window_boundary(
+                    raw_boundary, digest_started_iso, anchor_mode,
+                    window_start_iso,
+                )
                 self.storage.set_meta("digest_window_started_at", new_boundary)
             except Exception as e:
                 logger.warning("Дайджест: пустой дайджест не отправлен: %s", e)

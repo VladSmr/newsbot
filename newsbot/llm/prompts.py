@@ -826,7 +826,10 @@ def build_dedup_user_message(
 
         # m2: title capped (for LLM dedup readability,
         # 200 chars is enough for any title)
-        title = sanitize_item_field(_truncate(item.title, MAX_PROMPT_TITLE_CHARS))
+        # dedup-before-translate fix: используем llm_title если есть,
+        # чтобы RU+EN-версии одного события попали в единый кластер.
+        raw_title = getattr(item, "llm_title", None) or item.title
+        title = sanitize_item_field(_truncate(raw_title, MAX_PROMPT_TITLE_CHARS))
         parts.append(f"# Title\n{title}")
 
         # F2-fix: include first ~200 chars of summary so LLM sees
