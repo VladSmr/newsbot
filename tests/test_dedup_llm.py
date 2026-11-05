@@ -1452,7 +1452,7 @@ class TestTask1ChunkErrorResilience(unittest.TestCase):
     def test_cost_limit_between_chunks_skips_remaining(self):
         """Task 1c: cost guard blocks 2nd chunk, 1st chunk processed."""
         class _BudgetExhaustedFilter(LLMFilter):
-            def _check_daily_cost(self):
+            def _check_daily_cost(self, check_window=True):
                 if not hasattr(self, "_cost_call_count"):
                     self._cost_call_count = 0
                 self._cost_call_count += 1

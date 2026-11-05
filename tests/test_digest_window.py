@@ -25,7 +25,7 @@ _root = Path(__file__).parent.parent
 sys.path.insert(0, str(_root))
 
 from newsbot.collector import NewsItem
-from newsbot.pipeline import NewsPipeline, _iso_dt
+from newsbot.pipeline import NewsPipeline, _iso_dt, _published_in_window
 from newsbot.storage import Storage
 
 
@@ -39,13 +39,14 @@ def _mk_item(
     url=None,
     summary="Test summary.",
     llm_score=6,
+    published="2025-01-01 12:00",
     **kwargs,
 ) -> NewsItem:
     if url is None:
         url = f"https://example.com/{hash(title) & 0xFFFF:05d}"
     return NewsItem(
         source=source, url=url, title=title, summary=summary,
-        published="2025-01-01 12:00", published_parsed=None,
+        published=published, published_parsed=None,
         llm_score=llm_score, **kwargs,
     )
 
@@ -3531,6 +3532,201 @@ class TestRecentCap(unittest.TestCase):
                 f"RECENT-блок в промпте не должен превышать 20000 символов, "
                 f"получено {len(recent_block_match.group(0))}",
             )
+
+            p.storage.close()
+            p.close()
+
+
+# =============================================================================
+# Test: Ф4 — published-фильтр для fallback/skipped
+# =============================================================================
+
+class TestPublishedInWindowFilter(unittest.TestCase):
+    """
+    (a) new_fallback item с published ВНЕ окна → отсечён.
+    (b) Непарсящийся published + свежий fetched → оставлен.
+    (c) Main-пул: поведение не изменилось.
+    """
+
+    def test_fallback_item_published_outside_window_filtered(self):
+        """
+        (a) new_fallback item с published ВНЕ окна → отсечён _published_in_window.
+        """
+        from datetime import datetime
+
+        ws_grace = datetime(2026, 1, 1, 0, 0, 0)
+
+        item_outside = _mk_item(
+            url="https://e.com/old",
+            title="Старая новость",
+            llm_score=6,
+            published="2025-12-31T23:00:00",
+        )
+
+        self.assertFalse(
+            _published_in_window(item_outside, ws_grace),
+            "Item с published вне окна должен быть отсечён"
+        )
+
+    def test_fallback_item_published_inside_window_kept(self):
+        """
+        (a) new_fallback item с published ВНУТРИ окна → оставлен.
+        """
+        from datetime import datetime
+
+        ws_grace = datetime(2026, 1, 1, 0, 0, 0)
+
+        item_inside = _mk_item(
+            url="https://e.com/new",
+            title="Новая новость",
+            llm_score=6,
+            published="2026-01-01T12:00:00",
+        )
+
+        self.assertTrue(
+            _published_in_window(item_inside, ws_grace),
+            "Item с published внутри окна должен быть оставлен"
+        )
+
+    def test_unparsable_published_kept(self):
+        """
+        (b) Непарсящийся published + свежий fetched → оставлен.
+        Семантика: непарсящийся published сохраняется (main-семантика).
+        """
+        from datetime import datetime
+
+        ws_grace = datetime(2026, 1, 1, 0, 0, 0)
+
+        item_unparsable = _mk_item(
+            url="https://e.com/unparsable",
+            title="Непарсящаяся",
+            llm_score=6,
+            published="bad-date-string",
+        )
+
+        self.assertTrue(
+            _published_in_window(item_unparsable, ws_grace),
+            "Непарсящийся published должен сохраняться (не теряем новости)"
+        )
+
+    def test_skipped_item_outside_window_filtered(self):
+        """
+        (a) Skipped item с published ВНЕ окна → Ф4-фильтр отсекает.
+        """
+        from datetime import datetime
+
+        ws_grace = datetime(2026, 1, 1, 0, 0, 0)
+
+        item_outside = _mk_item(
+            url="https://e.com/skip-old",
+            title="Пропущенная старая",
+            llm_score=3,
+            published="2025-12-30T10:00:00",
+        )
+
+        self.assertFalse(
+            _published_in_window(item_outside, ws_grace),
+            "Skipped item вне окна должен быть отсечён"
+        )
+
+
+# =============================================================================
+# Test: Critical — bootstrap-fallback UnboundLocalError fix
+# =============================================================================
+
+class TestBootstrapFallbackNoUnboundLocalError(unittest.TestCase):
+    """
+    Critical-fix: ws_grace_naive вычисляется НЕЗАВИСИМО от published_filter_active.
+    При bootstrap (raw_boundary=None, force=True) → ws_dt=None, fallback-пути
+    вызывают _published_in_window с ws_grace=None → helper возвращает True.
+    """
+
+    def test_bootstrap_force_digest_no_unbound_error(self):
+        """Bootstrap без digest_window_started_at — run_digest без UnboundLocalError."""
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.close()  # чистый bootstrap — границы нет
+
+            _insert_deferred_item(
+                db_path, title="BootstrapItem",
+                url="https://ex.com/bootstrap",
+                published="2026-01-01 12:00",
+                fetched_at="2026-01-01T12:00:00+00:00", score=7,
+            )
+
+            p = _mk_pipeline(db_path)
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            try:
+                count = p.run_digest(force=True)
+                self.assertIn(count, (0, 1))
+            except NameError as e:
+                self.fail(f"UnboundLocalError на bootstrap: {e}")
+
+            p.storage.close()
+            p.close()
+
+    def test_published_in_window_none_grace_keeps_items(self):
+        """_published_in_window(it, ws_grace=None) → True (fallback-семантика)."""
+        item_old = _mk_item(
+            url="https://e.com/old", title="Old",
+            llm_score=6, published="2020-01-01 00:00",
+        )
+        self.assertTrue(
+            _published_in_window(item_old, None),
+            "ws_grace=None должен возвращать True"
+        )
+
+
+# =============================================================================
+# Test: Minor-1 — final_dup_urls merged into _dup_urls for set_digested
+# =============================================================================
+
+class TestFinalDupUrlsMergedForSetDigested(unittest.TestCase):
+    """
+    Minor-1-fix: _final_dup_urls из re-dedup блока попадают в _dup_urls
+    → set_digested закрывает их. Без этого дубли вечно deferred.
+    """
+
+    def test_final_dup_urls_digested_after_send(self):
+        """
+        Первичный дедуп: dup_a. Re-dedup: dup_b.
+        Оба должны попасть в set_digested → state=digested.
+        """
+        with _tmp_db() as db_path:
+            s = Storage(db_path)
+            s.set_meta("digest_window_started_at", "2024-01-01T00:00:00+00:00")
+            s.close()
+
+            for i, pub in enumerate(["2026-01-01 10:00", "2026-01-01 11:00",
+                                      "2026-01-01 12:00"]):
+                _insert_deferred_item(db_path, title=f"Item{i}", url=f"u{i}",
+                    published=pub, fetched_at=f"2026-01-01T{10+i}:00:00+00:00", score=7)
+
+            call_round = [0]
+
+            def fake_cluster(items, window_iso):
+                call_round[0] += 1
+                if call_round[0] == 1:
+                    return ({"u0"}, [])
+                return ({"u1"}, [])
+
+            p = _mk_pipeline(db_path, digest_cfg={
+                "enabled": True, "max_items": 5, "category_min": {"TestSrc": 1},
+            })
+            p._cluster_deferred_duplicates = fake_cluster
+            delivery = MagicMock()
+            delivery.send_text.return_value = True
+            p.delivery = delivery
+
+            count = p.run_digest(force=True)
+
+            # u0 (первичный) и u1 (финальный) → digested
+            digested = {i.url for i in p.storage.get_all_by_state("digested")}
+            self.assertIn("u0", digested, "Первичный дубль (u0) → digested")
+            self.assertIn("u1", digested, "Финальный дубль (u1) → digested (minor-1)")
 
             p.storage.close()
             p.close()

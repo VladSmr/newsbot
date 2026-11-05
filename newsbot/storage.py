@@ -2347,8 +2347,11 @@ class Storage:
 
         records — список dict: {url, title_en?, summary_en?}
         title_en пишется в llm_title (v15), summary_en — в llm_summary.
-        Условие WHERE url=? AND llm_title IS NULL — защита от перезаписи
-        уже переведённых items (race с параллельным дайджестом).
+        Условие WHERE url=? AND (llm_title IS NULL OR llm_title GLOB '*[А-Яа-яЁёІіЇїЄєЎўҐґ]*')
+        — защита от перезаписи уже переведённых EN items (race с параллельным
+        дайджестом), а также позволяет обновить items с русским llm_title
+        (переведённые Ф1-кириллица-хуком в дайджесте). GLOB покрывает кириллицу
+        Unicode range U+0400–U+04FF плюс расширение для укр./бел. букв (ІіЇїЄєЎўҐґ).
 
         Returns:
             int — число успешно обновлённых строк (0 если none matched).
@@ -2378,7 +2381,7 @@ class Storage:
                 params.append(url)
                 cur = conn.execute(
                     f"UPDATE items SET {', '.join(sets)} "
-                    f"WHERE url = ? AND llm_title IS NULL",
+                    f"WHERE url = ? AND (llm_title IS NULL OR llm_title GLOB '*[А-Яа-яЁёІіЇїЄєЎўҐґ]*')",
                     params,
                 )
                 count += cur.rowcount

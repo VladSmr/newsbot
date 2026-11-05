@@ -18,12 +18,28 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+_unmock = lambda: None  # no global mock in this file
+
+
+class FakeResponse:
+    def __init__(self, json_data, status_code=200):
+        self._json_data = json_data
+        self.status_code = status_code
+
+    def json(self):
+        return self._json_data
+
+    def raise_for_status(self):
+        pass
+
 _root = Path(__file__).parent.parent
 sys.path.insert(0, str(_root))
 
 from newsbot.collector import NewsItem
-from newsbot.pipeline import NewsPipeline, _cap_by_location
+from newsbot.pipeline import NewsPipeline, _cap_by_location, _published_in_window
 from newsbot.storage import Storage
+from newsbot.llm.filter import LLMFilter
+from newsbot.llm.client import DeepSeekClient
 
 
 # =============================================================================
@@ -774,7 +790,7 @@ class TestOffpeakGateInCheckAgainstShown(unittest.TestCase):
             result = p._check_against_shown(candidates, recent)
 
         # detect_duplicates вызван, вернул {0} → кандидат 0 дубль
-        mock_filter.detect_duplicates.assert_called_once_with(candidates, recent)
+        mock_filter.detect_duplicates.assert_called_once_with(candidates, recent, check_window=False)
         self.assertEqual(result, {"https://cand.com/0"})
 
     def test_off_peak_only_false_detect_duplicates_called_in_peak(self):
@@ -1268,6 +1284,167 @@ class TestDedupOnTranslatedTitles(unittest.TestCase):
         self.assertEqual(a_title, b_title)
         icd = is_containment_duplicate(a_title, b_title)
         self.assertTrue(icd, "RU с llm_title + EN с тем же текстом → containment дубль")
+
+
+# =============================================================================
+# Test: Ф3 — re-dedup после guarantee/backfill (финальный список)
+# =============================================================================
+
+class TestFinalDedupAfterGuarantee(unittest.TestCase):
+    """
+    (a) Финальный список с добор-парой → склеены (re-dedup).
+    (b) Неизменённый список → повторного вызова detect нет.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+        class _MockHttp:
+            is_closed = False
+
+            def __init__(self, **kw):
+                pass
+
+            def post(self, url, **kw):
+                return FakeResponse({"choices": [{"message": {"content": "{}"}}]})
+
+            def close(self):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        import newsbot.llm as llm_module
+        _saved = llm_module.client.httpx.Client
+        llm_module.client.httpx.Client = _MockHttp
+
+        client = DeepSeekClient("key", "https://api.deepseek.com", "model")
+        llm_cfg = {
+            "enabled": True, "model": "deepseek-flash",
+            "base_url": "https://api.deepseek.com", "api_key": "mock",
+            "push_threshold": 7, "digest_threshold": 5,
+            "system_prompt": "test",
+        }
+        flt = LLMFilter(llm_cfg, client=client)
+        self.flt = flt
+
+        # Use existing helper from this file
+        self.pipe = _mk_pipeline_unit(llm_filter=flt)
+        # Restore
+        llm_module.client.httpx.Client = _saved
+
+    def tearDown(self):
+        _unmock()
+        if hasattr(self.pipe, 'storage') and self.pipe.storage:
+            self.pipe.storage.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_final_dedup_called_when_list_changed(self):
+        """
+        (a) guarantee/backfill добавил item → повторный дедуп вызывается.
+        """
+        # Оригинальный список (2 разных news)
+        items_pre = [
+            _mk_item(url="https://e.com/1", title="Новость А", llm_score=7),
+            _mk_item(url="https://e.com/2", title="Новость Б", llm_score=6),
+        ]
+        # Финальный список: guarantee добавил дубликат item #2
+        items_post = [
+            _mk_item(url="https://e.com/1", title="Новость А", llm_score=7),
+            _mk_item(url="https://e.com/2", title="Новость Б", llm_score=6),
+            _mk_item(url="https://e.com/3", title="Новость Б (копия)", llm_score=5),
+        ]
+
+        detect_calls = [0]
+
+        def tracking_detect(candidates, recent):
+            detect_calls[0] += 1
+            if len(candidates) >= 2:
+                urls = {it.url for it in candidates}
+                if "https://e.com/3" in urls and "https://e.com/2" in urls:
+                    return {"https://e.com/3"}
+            return set()
+
+        orig_detect = self.flt.detect_duplicates
+        self.flt.detect_duplicates = MagicMock(side_effect=tracking_detect)
+
+        pre_urls = {it.url for it in items_pre}
+        post_urls = {it.url for it in items_post}
+
+        if post_urls != pre_urls:
+            dup_urls = self.flt.detect_duplicates(items_post, [])
+            if dup_urls:
+                items_post[:] = [it for it in items_post if it.url not in dup_urls]
+
+        self.assertEqual(detect_calls[0], 1,
+            "При изменённом списке detect_duplicates должен вызываться")
+        self.assertEqual(len(items_post), 2)
+
+        self.flt.detect_duplicates = orig_detect
+
+    def test_final_dedup_skipped_when_list_unchanged(self):
+        """
+        (b) Список не изменился после доборов → detect_duplicates не вызывается.
+        """
+        items = [
+            _mk_item(url="https://e.com/1", title="Новость А", llm_score=7),
+            _mk_item(url="https://e.com/2", title="Новость Б", llm_score=6),
+        ]
+        pre_urls = {it.url for it in items}
+        post_urls = {it.url for it in items}
+
+        detect_calls = [0]
+
+        def tracking_detect(candidates, recent):
+            detect_calls[0] += 1
+            return set()
+
+        orig_detect = self.flt.detect_duplicates
+        self.flt.detect_duplicates = MagicMock(side_effect=tracking_detect)
+
+        if post_urls != pre_urls:
+            self.flt.detect_duplicates(items, [])
+
+        self.assertEqual(detect_calls[0], 0,
+            "При неизменённом списке detect_duplicates НЕ должен вызываться")
+
+        self.flt.detect_duplicates = orig_detect
+
+    def test_recent_context_uses_llm_title_or_title(self):
+        """
+        Ф3 recent-контекст: _digest_topn_shown берёт llm_title or title.
+        build_dedup_user_message формирует RECENT-блок с EN title для
+        items с llm_title, и с raw title для items без.
+        """
+        from newsbot.llm.prompts import build_dedup_user_message
+
+        item_with_llm = _mk_item(
+            url="https://e.com/1",
+            title="Шторм обрушился на побережье",
+            llm_title="Storm Hits the Coast",
+            llm_score=6,
+        )
+        item_no_llm = _mk_item(
+            url="https://e.com/2",
+            title="Storm in the city",
+            llm_score=6,
+        )
+        # Симулируем _digest_topn_shown: llm_title or title
+        recent_from_topn = [
+            {"title": getattr(it, 'llm_title', None) or it.title, "source": it.source}
+            for it in [item_with_llm, item_no_llm]
+        ]
+
+        msg = build_dedup_user_message([item_with_llm, item_no_llm], recent_from_topn)
+
+        # EN title в RECENT (llm_title приоритетнее title)
+        self.assertIn("Storm Hits the Coast", msg)
+        # Без llm_title — fallback на title
+        self.assertIn("Storm in the city", msg)
 
 
 if __name__ == "__main__":

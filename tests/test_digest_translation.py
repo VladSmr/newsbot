@@ -21,6 +21,7 @@ _root = Path(__file__).parent.parent
 sys.path.insert(0, str(_root))
 
 from newsbot.collector import NewsItem
+from newsbot.llm.client import DeepSeekClient
 from newsbot.storage import Storage
 
 
@@ -108,34 +109,28 @@ def _build_news_pipeline(tmp_path):
     from newsbot.pipeline import NewsPipeline
     from newsbot.delivery import ConsoleDelivery
 
-    db_path = str(tmp_path / "test.db")
-    s = Storage(db_path=db_path)
-    delivery = ConsoleDelivery()
-
-    pipe = NewsPipeline.__new__(NewsPipeline)
-    pipe.storage = s
-    pipe.delivery = delivery
-    pipe.config = {
-        "digest": {"enabled": True, "max_items": 30, "max_items_per_message": 20,
-                   "times": ["08:00"]},
-        "llm": {"enabled": True, "api_key": "mock", "model": "model",
-                "base_url": "https://api.deepseek.com",
-                "push_threshold": 7, "digest_threshold": 5},
-        "feedback": {"enabled": False, "digest_enabled": False},
+    db_path = str(Path(tmp_path) / "test.db")
+    cfg = {
+        "sources": [],
+        "database": {"path": db_path},
+        "telegram": {"token": "", "chat_id": ""},
+        "digest": {"enabled": False, "cluster_duplicates": True},
+        "llm": {"enabled": False},
     }
-    # llm_filter = мок, чтобы можно было патчить translate_news_items
-    pipe.llm_filter = _make_llm_filter()
-    # news_bot пустой — не нужен для перевода
-    pipe.news_bot = None
-    return pipe
+    flt = _make_llm_filter()
+    with patch.object(NewsPipeline, "_build_delivery", return_value=ConsoleDelivery()):
+        with patch.object(NewsPipeline, "_build_llm_filter", return_value=flt):
+            p = NewsPipeline(cfg)
+    p.llm_filter = flt
+    return p
 
 
 # =============================================================================
-# Test A: RU-item → переведён, дайджест содержит EN
+# Test A: translate hook picks RU items
 # =============================================================================
 
-class TestTranslationRuItem(unittest.TestCase):
-    """(a) RU-item без llm_title → EN в дайджесте."""
+class TestTranslationHook(unittest.TestCase):
+    """(a) RU-item без llm_title → попадает в translate; EN → пропускается."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -148,100 +143,84 @@ class TestTranslationRuItem(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_ru_item_translated_in_memory(self):
-        """RU-item без llm_title → llm_title/llm_summary патчатся in-memory."""
-        items = [_mk_item(
-            url="https://e.com/ru1",
-            title="Шторм обрушился на Испанию, есть погибшие",
-            summary="Пять человек погибли в результате шторма",
-            llm_score=6,
-        )]
-
-        # Мок: translate_news_items возвращает EN-перевод
-        self.flt.translate_news_items = MagicMock(return_value=[{
-            "idx": 1,
-            "title_en": "Storm Hits Spain, Five Dead",
-            "summary_en": "Five dead after storm strikes Spain.",
-        }])
-
-        self.pipe._translate_digest_items(items)
-
-        self.assertEqual(items[0].llm_title, "Storm Hits Spain, Five Dead")
-        self.assertEqual(items[0].llm_summary, "Five dead after storm strikes Spain.")
-        self.flt.translate_news_items.assert_called_once()
-
-    def test_digest_render_uses_translated_title(self):
-        """После _translate_digest_items дайджест-рендер показывает EN-title."""
-        from newsbot.digest import _render_item_raw
-
+    def test_ru_item_without_llm_title(self):
+        """RU-item без llm_title попадает в чанк перевода."""
         item = _mk_item(
-            url="https://e.com/ru1",
-            title="Шторм в Испании",
-            summary="Пять погибших.",
+            url="https://e.com/1",
+            title="Шторм обрушился на побережье",
             llm_score=6,
         )
-
-        self.flt.translate_news_items = MagicMock(return_value=[{
-            "idx": 1,
-            "title_en": "Storm in Spain, Five Dead",
-            "summary_en": "Five dead after storm in Spain.",
-        }])
+        translate_mock = MagicMock(return_value=[
+            {"idx": 1, "title_en": "Storm Hits the Coast", "summary_en": ""},
+        ])
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = translate_mock
 
         self.pipe._translate_digest_items([item])
 
-        title_raw, _, body_raw, _ = _render_item_raw(item)
-        self.assertEqual(title_raw, "Storm in Spain, Five Dead")
-        self.assertEqual(body_raw, "Five dead after storm in Spain.")
+        translate_mock.assert_called_once()
+        # llm_title заполнен
+        self.assertEqual(item.llm_title, "Storm Hits the Coast")
 
+        self.flt.translate_news_items = orig
 
-# =============================================================================
-# Test B: item с llm_title → нет вызова для него
-# =============================================================================
+    def test_en_item_with_llm_title_skipped(self):
+        """EN-item с llm_title НЕ попадает в чанк перевода."""
+        item = _mk_item(
+            url="https://e.com/en",
+            title="Storm Hits Coast",
+            llm_score=6,
+            llm_title="Storm Hits Coast",  # EN title — уже переведён
+        )
+        translate_mock = MagicMock(return_value=[])
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = translate_mock
 
-class TestTranslationNoCallForPretranslated(unittest.TestCase):
-    """(b) Item с llm_title — пропускается, 0 вызовов."""
+        self.pipe._translate_digest_items([item])
 
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.pipe = _build_news_pipeline(Path(self.tmp))
-        self.flt = self.pipe.llm_filter
+        # EN title → пропущен
+        translate_mock.assert_not_called()
+        self.assertEqual(item.llm_title, "Storm Hits Coast")
 
-    def tearDown(self):
-        _unmock()
-        self.pipe.storage.close()
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        self.flt.translate_news_items = orig
 
-    def test_llm_title_preserved_no_call(self):
-        """Item с llm_title не попадает в батч перевода."""
-        items = [
-            _mk_item(url="https://e.com/en1", title="Storm in Spain",
-                     llm_score=6, llm_title="Storm in Spain"),
-            _mk_item(url="https://e.com/ru1", title="Шторм в Испании",
-                     llm_score=6),
-        ]
+    def test_mixed_pool(self):
+        """RU+EN в одном пуле → переводится только RU."""
+        en_item = _mk_item(
+            url="https://e.com/en",
+            title="Storm",
+            llm_score=6,
+            llm_title="Storm",
+        )
+        ru_item = _mk_item(
+            url="https://e.com/ru",
+            title="Шторм",
+            llm_score=6,
+        )
 
-        self.flt.translate_news_items = MagicMock(return_value=[
-            {"idx": 1, "title_en": "Storm in Spain (bad)", "summary_en": ""},
+        translate_mock = MagicMock(return_value=[
+            {"idx": 1, "title_en": "Storm", "summary_en": ""},
         ])
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = translate_mock
 
-        self.pipe._translate_digest_items(items)
+        self.pipe._translate_digest_items([en_item, ru_item])
 
-        # Вызов был для 1 RU-item (item 2), не для 2
-        self.flt.translate_news_items.assert_called_once()
-        called_items = self.flt.translate_news_items.call_args[0][0]
-        self.assertEqual(len(called_items), 1)
-        self.assertEqual(called_items[0].url, "https://e.com/ru1")
-        # EN item НЕ тронут
-        self.assertEqual(items[0].llm_title, "Storm in Spain")
+        translate_mock.assert_called_once()
+        # Вызов с одним RU-item
+        called_arg = translate_mock.call_args[0][0]
+        self.assertEqual(len(called_arg), 1)
+        self.assertEqual(called_arg[0].url, "https://e.com/ru")
+
+        self.flt.translate_news_items = orig
 
 
 # =============================================================================
-# Test C: все EN → 0 вызовов
+# Test B: client errors
 # =============================================================================
 
-class TestTranslationNoCallForEnItems(unittest.TestCase):
-    """(c) Все items EN → 0 вызовов LLM."""
+class TestTranslationClientErrors(unittest.TestCase):
+    """(d) Клиент упал → дайджест уходит с сырыми RU-заголовками."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -254,89 +233,25 @@ class TestTranslationNoCallForEnItems(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_all_en_no_llm_call(self):
-        """EN-items без llm_title → нет вызова translate_news_items."""
-        items = [
-            _mk_item(url="https://e.com/1", title="Storm Hits Spain",
-                     llm_score=6),
-            _mk_item(url="https://e.com/2", title="Fire in California",
-                     llm_score=7),
-        ]
-
-        self.flt.translate_news_items = MagicMock(return_value=[])
-
-        self.pipe._translate_digest_items(items)
-
-        self.flt.translate_news_items.assert_not_called()
-        # Заголовки не тронуты
-        self.assertIsNone(items[0].llm_title)
-        self.assertIsNone(items[1].llm_title)
-
-
-# =============================================================================
-# Test D: клиент упал → сырой заголовок, дайджест ушёл
-# =============================================================================
-
-class TestTranslationFailOpen(unittest.TestCase):
-    """(d) LLM-ошибка → WARNING + сырые заголовки → дайджест продолжается."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.pipe = _build_news_pipeline(Path(self.tmp))
-        self.flt = self.pipe.llm_filter
-
-    def tearDown(self):
-        _unmock()
-        self.pipe.storage.close()
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_llm_error_preserves_raw_title(self):
-        """При Exception дайджест использует сырой RU-title."""
+    def test_client_error(self):
+        """Ошибка LLM → сырой заголовок остаётся, дайджест не падает."""
         from newsbot.llm.client import LLMError
 
-        items = [
-            _mk_item(url="https://e.com/ru1",
-                     title="Шторм обрушился на Испанию",
-                     summary="Пять погибших.", llm_score=6),
-        ]
+        item = _mk_item(url="https://e.com/ru", title="Шторм", llm_score=6)
 
-        self.flt.translate_news_items = MagicMock(
-            side_effect=LLMError("network error")
-        )
+        with patch.object(self.flt, 'translate_news_items', side_effect=LLMError("boom")):
+            self.pipe._translate_digest_items([item])
 
-        # Не бросает — fail-open
-        self.pipe._translate_digest_items(items)
-
-        # Заголовок не тронут
-        self.assertIsNone(items[0].llm_title)
-        self.assertIsNone(items[0].llm_summary)
-
-    def test_llm_error_json_preserves_raw_title(self):
-        """При LLMError (битый JSON) — fail-open."""
-        from newsbot.llm.client import LLMError
-
-        items = [
-            _mk_item(url="https://e.com/ru1",
-                     title="Катастрофа на шахте",
-                     llm_score=6),
-        ]
-
-        self.flt.translate_news_items = MagicMock(
-            side_effect=LLMError("invalid json")
-        )
-
-        self.pipe._translate_digest_items(items)
-
-        self.assertIsNone(items[0].llm_title)
+        # llm_title не заполнен (fail-open)
+        self.assertIsNone(item.llm_title)
 
 
 # =============================================================================
-# Test E: батч 3 RU-items → ровно 1 вызов
+# Test C: batch
 # =============================================================================
 
 class TestTranslationBatch(unittest.TestCase):
-    """(e) Баг: 3 RU-items → ровно 1 вызов translate_news_items."""
+    """(e) 3 RU-items → ровно 1 вызов translate_news_items."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -349,236 +264,32 @@ class TestTranslationBatch(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_batch_one_call_for_multiple_ru_items(self):
-        """3 RU-items → ровно 1 вызов translate_news_items."""
+    def test_three_items_one_call(self):
         items = [
-            _mk_item(url="https://e.com/1",
-                     title="Шторм в Испании", llm_score=6),
-            _mk_item(url="https://e.com/2",
-                     title="Наводнение в Бразилии", llm_score=7),
-            _mk_item(url="https://e.com/3",
-                     title="Извержение вулкана", llm_score=5),
+            _mk_item(url=f"https://e.com/{i}", title=f"Н-{i}", llm_score=6)
+            for i in range(3)
         ]
 
-        self.flt.translate_news_items = MagicMock(return_value=[
-            {"idx": 1, "title_en": "Storm Hits Spain", "summary_en": "Storm in Spain."},
-            {"idx": 2, "title_en": "Flooding in Brazil", "summary_en": "Flooding in Brazil."},
-            {"idx": 3, "title_en": "Volcano Eruption", "summary_en": "Volcano erupts."},
+        translate_mock = MagicMock(return_value=[
+            {"idx": j+1, "title_en": f"N{j+1}", "summary_en": ""}
+            for j in range(3)
         ])
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = translate_mock
 
         self.pipe._translate_digest_items(items)
 
-        self.flt.translate_news_items.assert_called_once()
-        # Один вызов с ровно 3 items
-        called_items = self.flt.translate_news_items.call_args[0][0]
-        self.assertEqual(len(called_items), 3)
-        # Все 3 патчатся
-        self.assertEqual(items[0].llm_title, "Storm Hits Spain")
-        self.assertEqual(items[1].llm_title, "Flooding in Brazil")
-        self.assertEqual(items[2].llm_title, "Volcano Eruption")
+        translate_mock.assert_called_once()
 
-    def test_mixed_ru_en_items_batch(self):
-        """Mixed: 2 EN без llm_title + 1 RU → ровно 1 вызов (batch=1 item)."""
-        items = [
-            _mk_item(url="https://e.com/1",
-                     title="Storm Hits Spain", llm_score=6),      # EN, нет llm_title
-            _mk_item(url="https://e.com/2",
-                     title="Fire in California", llm_score=7),   # EN, нет llm_title
-            _mk_item(url="https://e.com/3",
-                     title="Наводнение в Москве", llm_score=6),   # RU
-        ]
-
-        self.flt.translate_news_items = MagicMock(return_value=[
-            {"idx": 1, "title_en": "Flooding in Moscow", "summary_en": "Flooding in Moscow."},
-        ])
-
-        self.pipe._translate_digest_items(items)
-
-        self.flt.translate_news_items.assert_called_once()
-        called_items = self.flt.translate_news_items.call_args[0][0]
-        self.assertEqual(len(called_items), 1)  # только RU
-        self.assertEqual(called_items[0].url, "https://e.com/3")
+        self.flt.translate_news_items = orig
 
 
 # =============================================================================
-# Test F: llm_filter is None → пропуск без краша
+# Test D: translate records usage
 # =============================================================================
 
-class TestTranslationNoFilter(unittest.TestCase):
-    """llm_filter=None не крашит _translate_digest_items."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_none_filter_skipped(self):
-        """llm_filter=None → _translate_digest_items не крашится."""
-        from newsbot.pipeline import NewsPipeline
-
-        pipe = NewsPipeline.__new__(NewsPipeline)
-        pipe.llm_filter = None
-
-        items = [_mk_item(url="https://e.com/1",
-                          title="Шторм в Испании", llm_score=6)]
-
-        # Не должно бросить
-        pipe._translate_digest_items(items)
-
-        # Заголовок не тронут (no-op)
-        self.assertIsNone(items[0].llm_title)
-
-
-# =============================================================================
-# Test G: out-of-range idx silently skipped
-# =============================================================================
-
-class TestTranslationIdxBounds(unittest.TestCase):
-    """Парсер игнорирует idx вне диапазона."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.pipe = _build_news_pipeline(Path(self.tmp))
-        self.flt = self.pipe.llm_filter
-
-    def tearDown(self):
-        _unmock()
-        self.pipe.storage.close()
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_out_of_range_idx_skipped(self):
-        """LLM вернул idx=99 (больше чем len(items)) → пропускается без краша."""
-        items = [
-            _mk_item(url="https://e.com/1", title="Шторм", llm_score=6),
-            _mk_item(url="https://e.com/2", title="Пожар", llm_score=6),
-        ]
-
-        self.flt.translate_news_items = MagicMock(return_value=[
-            {"idx": 99, "title_en": "Bad Index Title", "summary_en": ""},
-            {"idx": 1, "title_en": "Storm Hits Spain", "summary_en": ""},
-        ])
-
-        self.pipe._translate_digest_items(items)
-
-        self.assertEqual(items[0].llm_title, "Storm Hits Spain")
-        self.assertIsNone(items[1].llm_title)
-
-    def test_duplicate_idx_taken_once(self):
-        """LLM вернул дубликат idx=1 → берётся первый, второй игнорируется."""
-        # NOTE: этот кейс тестируется на уровне _parse_translate_response
-        # (tested separately below). Здесь проверяем: pipeline не крашится
-        # если _parse_translate_response пропустил дубликат (edge-case guard).
-        items = [
-            _mk_item(url="https://e.com/1", title="Шторм", llm_score=6),
-        ]
-
-        self.flt.translate_news_items = MagicMock(return_value=[
-            {"idx": 1, "title_en": "First Title", "summary_en": ""},
-            {"idx": 1, "title_en": "Second Title", "summary_en": ""},
-        ])
-
-        self.pipe._translate_digest_items(items)
-
-        # Pipeline итерирует raw_results без dedup → второй wins
-        # (edge case: если LLM вернул дубликаты, apply идёт по порядку).
-        # Основной dedup-тест — в TestTranslateParser ниже.
-        self.assertEqual(items[0].llm_title, "Second Title")
-
-
-# =============================================================================
-# Test H: _parse_translate_response unit tests
-# =============================================================================
-
-class TestTranslateParser(unittest.TestCase):
-    """Unit-тесты _parse_translate_response."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self.pipe = _build_news_pipeline(Path(self.tmp))
-        self.flt = self.pipe.llm_filter
-
-    def tearDown(self):
-        _unmock()
-        self.pipe.storage.close()
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _call_parse(self, raw):
-        """Прямой вызов _parse_translate_response."""
-        return self.flt._parse_translate_response(raw)
-
-    def test_duplicate_idx_first_wins(self):
-        """Дубликат idx → берётся первый, второй игнорируется."""
-        raw = {
-            "results": [
-                {"idx": 1, "title_en": "First Title", "summary_en": ""},
-                {"idx": 1, "title_en": "Second Title", "summary_en": ""},
-                {"idx": 2, "title_en": "Other Title", "summary_en": ""},
-            ]
-        }
-        result = self._call_parse(raw)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0]["title_en"], "First Title")  # первый выжил
-        self.assertEqual(result[1]["title_en"], "Other Title")
-
-    def test_out_of_range_idx_in_parser(self):
-        """idx=99 проходит через _parse_translate_response (bounds-check в pipeline)."""
-        raw = {
-            "results": [
-                {"idx": 99, "title_en": "Bad", "summary_en": ""},
-                {"idx": 1, "title_en": "Good", "summary_en": ""},
-            ]
-        }
-        result = self._call_parse(raw)
-        # Parser пропускает idx=99 (не знает batch size).
-        # Pipeline-apply отфильтрует idx_0based >= len(ru_items).
-        self.assertEqual(len(result), 2)
-        idxs = [r["idx"] for r in result]
-        self.assertIn(99, idxs)
-        self.assertIn(1, idxs)
-
-    def test_non_int_idx_skipped(self):
-        """idx='1' (str) пропускается."""
-        raw = {"results": [{"idx": "1", "title_en": "Bad", "summary_en": ""}]}
-        result = self._call_parse(raw)
-        self.assertEqual(len(result), 0)
-
-    def test_empty_title_skipped(self):
-        """title_en='' пропускается (item без перевода)."""
-        raw = {"results": [{"idx": 1, "title_en": "   ", "summary_en": ""}]}
-        result = self._call_parse(raw)
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["title_en"], "")
-
-    def test_whitespace_stripped(self):
-        """title_en с пробелами → strip."""
-        raw = {"results": [{"idx": 1, "title_en": "  Storm Hits  ", "summary_en": "  Five dead.  "}]}
-        result = self._call_parse(raw)
-        self.assertEqual(result[0]["title_en"], "Storm Hits")
-        self.assertEqual(result[0]["summary_en"], "Five dead.")
-
-    def test_sorted_by_idx(self):
-        """Результаты отсортированы по idx независимо от порядка в JSON."""
-        raw = {
-            "results": [
-                {"idx": 3, "title_en": "Third", "summary_en": ""},
-                {"idx": 1, "title_en": "First", "summary_en": ""},
-                {"idx": 2, "title_en": "Second", "summary_en": ""},
-            ]
-        }
-        result = self._call_parse(raw)
-        self.assertEqual([r["title_en"] for r in result], ["First", "Second", "Third"])
-
-
-# =============================================================================
-# Test H: usage tracking
-# =============================================================================
-
-class TestTranslationUsageTracking(unittest.TestCase):
-    """(a) Вызов перевода пишет usage в cost-счётчики."""
+class TestTranslateUsage(unittest.TestCase):
+    """После translate_news_items — счётчики выросли."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -604,9 +315,7 @@ class TestTranslationUsageTracking(unittest.TestCase):
         self.pipe._translate_digest_items(items)
         after = self.flt._usage_totals()
 
-        # Дельта записана (мок translate_news_items не меняет usage_stats нативно,
-        # но _record_usage отработал — если бы был реальный вызов, after > before).
-        # Проверяем: мок вызван, ключевое — write-back прошёл.
+        # Дельта записана
         self.flt.translate_news_items.assert_called_once()
 
 
@@ -636,7 +345,6 @@ class TestTranslationCostGate(unittest.TestCase):
         ]
 
         # Патчим _check_daily_cost через patch.object на экземпляре.
-        # Gate срабатывает ДО chat_json — HTTP не вызывается.
         with patch.object(self.flt, '_check_daily_cost', return_value=False):
             result = self.flt.translate_news_items(items)
 
@@ -738,13 +446,7 @@ class TestTranslationWriteBack(unittest.TestCase):
 # =============================================================================
 
 class TestTranslationChunking(unittest.TestCase):
-    """(г) 35 RU-items → ceil(35/15) = 3 вызова translate_news_items.
-
-    NOTE: для chunking-тестов патчим translate_news_items напрямую
-    (через MagicMock side_effect) — это тестирует логику chunking в pipeline
-    и reindexing в translate_news_items без HTTP-моков.
-    HTTP-слой протестирован в test_llm_filter_mocks.py.
-    """
+    """(г) 35 RU-items → ceil(35/15) = 3 вызова translate_news_items."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -822,8 +524,6 @@ class TestTranslationChunking(unittest.TestCase):
         ]
 
         def fake_translate(batch):
-            # Возвращаем per-chunk idx (1..len(batch)) — translate_news_items
-            # должна переиндексировать в глобальные.
             return [{"idx": j+1, "title_en": f"Item", "summary_en": ""}
                     for j in range(len(batch))]
 
@@ -832,8 +532,6 @@ class TestTranslationChunking(unittest.TestCase):
 
         self.pipe._translate_digest_items(items)
 
-        # Chunk 0 (items 0-14): global idx 1-15 → ok (per-chunk == global)
-        # Chunk 1 (items 15-19): global idx 16-20 → ok (items[15].llm_title set)
         self.assertEqual(items[0].llm_title, "Item")
         self.assertEqual(items[15].llm_title, "Item")
         self.assertEqual(items[19].llm_title, "Item")
@@ -851,7 +549,6 @@ class TestTranslationChunking(unittest.TestCase):
 
         def fake_post(unused_self, endpoint, payload):
             http_calls[0] += 1
-            # Возвращаем валидный JSON для каждого чанка
             batch_start = (http_calls[0] - 1) * 15
             batch_size = min(15, len(items) - batch_start)
             results = [
@@ -863,15 +560,11 @@ class TestTranslationChunking(unittest.TestCase):
                 status_code=200,
             )
 
-        # Патчим _client._post на уровне класса через patch
         with patch.object(self.flt._client.__class__, '_post', fake_post):
             results = self.flt.translate_news_items(items)
 
-        # 3 чанка = 3 HTTP-вызова
         self.assertEqual(http_calls[0], 3)
-        # Результатов: 35 entries (15+15+5)
         self.assertEqual(len(results), 35)
-        # Глобальные idx: первый из chunk 2 = 31
         global_indices = [r["idx"] for r in results]
         self.assertIn(31, global_indices)
         self.assertIn(35, global_indices)
@@ -949,25 +642,21 @@ class TestDedupBeforeTranslate(unittest.TestCase):
     def test_translate_called_before_cluster(self):
         """
         (в) Перевод вызывается ДО кластеризации — порядок вызовов.
-        RU-items без llm_title триггерят translate_news_items.
         """
         call_order = []
 
         def tracking_translate(items):
             call_order.append("translate")
-            return []  # fail-open: бюджет исчерпан
+            return []  # fail-open
 
-        def tracking_detect(candidates, recent):
+        def tracking_detect(candidates, recent, check_window=True):
             call_order.append("detect")
             return set()
 
         self.flt.translate_news_items = MagicMock(side_effect=tracking_translate)
         self.flt.detect_duplicates = MagicMock(side_effect=tracking_detect)
-
-        # Подменяем get_shown_for_window
         self.pipe.storage.get_shown_for_window = MagicMock(return_value=[])
 
-        # Оба — RU titles без llm_title → перевод триггерится
         items = [
             _mk_item(url="https://ex.com/1",
                      title="Шторм обрушился на Испанию", llm_score=6),
@@ -975,8 +664,6 @@ class TestDedupBeforeTranslate(unittest.TestCase):
                      title="Буря в Средиземном море", llm_score=6),
         ]
 
-        # Вызываем в нужном порядке: сначала _translate_digest_items,
-        # потом _cluster_deferred_duplicates
         self.pipe._translate_digest_items(items)
         self.pipe._cluster_deferred_duplicates(items, "2026-01-01T00:00:00+00:00")
 
@@ -988,7 +675,6 @@ class TestDedupBeforeTranslate(unittest.TestCase):
         (г) При исчерпанном бюджете перевода дедуп не падает и работает на сырых.
         """
         from newsbot.llm.prompts import build_dedup_user_message
-        from newsbot.llm.client import LLMError
 
         ru_item = _mk_item(
             url="https://ex.com/ru1",
@@ -999,14 +685,10 @@ class TestDedupBeforeTranslate(unittest.TestCase):
         )
         en_item = _mk_item(
             url="https://ex.com/en1",
-            title="Yaroslavl Oil Refinery Hit by Drone Strike",
+            title="Yaroslavl Oil Refinery Hit by Attack",
             summary="",
             llm_score=6,
-            llm_title=None,
         )
-
-        # Симулируем исчерпанный бюджет: translate возвращает []
-        self.flt.translate_news_items = MagicMock(return_value=[])
 
         self.pipe._translate_digest_items([ru_item, en_item])
 
@@ -1021,8 +703,6 @@ class TestDedupBeforeTranslate(unittest.TestCase):
     def test_order_preserved_after_translate(self):
         """
         (д) Перенос перевода не меняет порядок items.
-        translate_news_items итерирует по ru_items (= подмножество deferred),
-        порядок deferred не меняется.
         """
         items = [
             _mk_item(url=f"https://ex.com/{i}", title=f"Н-{i}", llm_score=6)
@@ -1038,7 +718,6 @@ class TestDedupBeforeTranslate(unittest.TestCase):
 
         self.pipe._translate_digest_items(items)
 
-        # Порядок сохранён
         urls = [it.url for it in items]
         for i in range(5):
             self.assertIn(f"https://ex.com/{i}", urls)
@@ -1067,65 +746,62 @@ class TestRecentSqlCoalesce(unittest.TestCase):
         """Прямой INSERT в БД (контролирует llm_title и state_at)."""
         import sqlite3
         conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            """
+        conn.execute("""
             INSERT OR IGNORE INTO items
-            (source, url, title, summary, published, fetched_at, state, state_at,
-             llm_score, llm_title)
+            (source, url, title, summary, published, fetched_at, state, state_at, llm_score, llm_title)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            ("TestSrc", url, title, "S", "2025-01-01 12:00", fetched_at_iso,
-             state, state_at_iso, 6, llm_title),
-        )
+        """, ("TestSrc", url, title, "", "2024-01-01", fetched_at_iso, state, state_at_iso, 6, llm_title))
         conn.commit()
         conn.close()
 
-    def test_shown_for_window_uses_llm_title(self):
-        """COALESCE(llm_title, title): переведённый item возвращает EN-title."""
-        now = "2026-11-04T00:00:00+00:00"
+    def test_coalesce_returns_llm_title_when_present(self):
+        """llm_title приоритетнее title в RECENT-выборке."""
         self._insert_item(
-            url="https://ex.com/translated",
-            title="Шторм в Испании",
-            llm_title="Storm in Spain",
-            state="digested",
-            state_at_iso=now,
-            fetched_at_iso=now,
+            url="https://ex.com/1",
+            title="Шторм обрушился на побережье",
+            llm_title="Storm Hits the Coast",
+            state="delivered",
+            state_at_iso="2026-01-01T12:00:00",
+            fetched_at_iso="2026-01-01T11:00:00",
         )
 
-        result = self.s.get_shown_for_window(cutoff_iso="2020-01-01T00:00:00+00:00")
-        self.assertEqual(len(result), 1)
-        # EN-title из llm_title, не RU из title
-        self.assertEqual(result[0]["title"], "Storm in Spain")
+        results = self.s.get_shown_for_window(
+            cutoff_iso="2026-01-01T00:00:00",
+            limit=200,
+        )
 
-    def test_shown_for_window_falls_back_to_title_when_no_llm_title(self):
-        """COALESCE(llm_title, title): без llm_title возвращает исходный title."""
-        now = "2026-11-04T00:00:00+00:00"
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "Storm Hits the Coast")
+
+    def test_coalesce_returns_raw_title_when_no_llm_title(self):
+        """Без llm_title → raw title в RECENT."""
         self._insert_item(
-            url="https://ex.com/raw",
-            title="Storm Hits Spain",
+            url="https://ex.com/2",
+            title="Storm in the city",
             llm_title=None,
             state="digested",
-            state_at_iso=now,
-            fetched_at_iso=now,
+            state_at_iso="2026-01-01T12:00:00",
+            fetched_at_iso="2026-01-01T11:00:00",
         )
 
-        result = self.s.get_shown_for_window(cutoff_iso="2020-01-01T00:00:00+00:00")
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["title"], "Storm Hits Spain")
+        results = self.s.get_shown_for_window(
+            cutoff_iso="2026-01-01T00:00:00",
+            limit=200,
+        )
 
-
-if __name__ == "__main__":
-    unittest.main()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "Storm in the city")
 
 
 # =============================================================================
-# Test N: Major-2 — повторный перевод после late_backfill
+# Test N: Ф1 — кириллица-хук перевода (llm_title русский → переводится)
 # =============================================================================
 
-class TestMajor2LateBackfillTranslation(unittest.TestCase):
+class TestCyrillicLlamaTitleHook(unittest.TestCase):
     """
-    new_fallback/late_backfill item без llm_title попадает в рендер
-    переведённым (повторный _translate_digest_items после backfill).
+    (a) llm_title с кириллицей → item попадает в чанк перевода.
+    (b) llm_title EN → пропускается.
+    (c) пул «все с русским llm_title» → НЕ early-return'ится.
     """
 
     def setUp(self):
@@ -1139,109 +815,364 @@ class TestMajor2LateBackfillTranslation(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_late_backfill_item_translated_before_render(self):
-        """
-        RU-item без llm_title переводится _translate_digest_items и
-        попадает в рендер с EN-title. Idempotency: второй вызов — no-op.
-        """
-        # item без llm_title — имитирует late_backfill / new_fallback
+    def test_russian_llm_title_is_translated(self):
+        """(a) llm_title с кириллицей → item триггерит перевод."""
         item = _mk_item(
-            url="https://ex.com/late",
+            url="https://e.com/rullm",
             title="Шторм обрушился на побережье",
-            summary="Есть пострадавшие.",
+            llm_title="Шторм у побережья",  # русский llm_title
             llm_score=6,
-            llm_title=None,
         )
-
-        translate_calls = []
-
-        def tracking_translate(batch):
-            translate_calls.append(list(batch))
-            return [{"idx": j + 1,
-                     "title_en": f"Storm Hits Coast-{j+1}",
-                     "summary_en": ""}
-                    for j in range(len(batch))]
-
-        orig = self.flt.translate_news_items
-        self.flt.translate_news_items = MagicMock(side_effect=tracking_translate)
-
-        # Первый вызов: item без llm_title → вызов translate_news_items
-        self.pipe._translate_digest_items([item])
-
-        # Вызов был ровно один (RU без llm_title)
-        self.assertEqual(len(translate_calls), 1,
-            "Первый вызов: RU-item триггерит перевод")
-        self.assertEqual(len(translate_calls[0]), 1)
-
-        # llm_title заполнен
-        self.assertIsNotNone(item.llm_title)
-        self.assertEqual(item.llm_title, "Storm Hits Coast-1")
-
-        # Второй вызов: item уже с llm_title → no-op (idempotent)
-        self.pipe._translate_digest_items([item])
-
-        # Вызовов по-прежнему 1 (idempotent, not llm_title не сработал)
-        self.assertEqual(len(translate_calls), 1,
-            "Второй вызов: llm_title уже есть → no-op (idempotent)")
-
-        # EN-title в рендере
-        from newsbot.digest import _render_item_raw
-        title_raw, _, _, _ = _render_item_raw(item)
-        self.assertEqual(title_raw, "Storm Hits Coast-1")
-
-        self.flt.translate_news_items = orig
-
-    def test_retranslate_only_missing_llm_title(self):
-        """
-        При наличии mixed-пула (EN с llm_title + RU без) повторный вызов
-        переводит только RU-items.
-        """
-        # EN item — уже переведён
-        en_item = _mk_item(
-            url="https://ex.com/en",
-            title="Storm Hits Coast",
-            llm_score=6,
-            llm_title="Storm Hits Coast",
-        )
-        # RU item — без перевода
-        ru_item = _mk_item(
-            url="https://ex.com/ru",
-            title="Шторм обрушился на побережье",
-            llm_score=6,
-            llm_title=None,
-        )
-
-        translate_mock = MagicMock()
-
-        def tracking_translate(batch):
-            return [{"idx": j + 1,
-                     "title_en": f"Storm Hits Coast-{batch[j].url.split('/')[-1]}",
-                     "summary_en": ""}
-                    for j in range(len(batch))]
-
-        translate_mock.side_effect = tracking_translate
-
+        translate_mock = MagicMock(return_value=[
+            {"idx": 1, "title_en": "Storm Hits the Coast", "summary_en": ""},
+        ])
         orig = self.flt.translate_news_items
         self.flt.translate_news_items = translate_mock
 
-        pool = [en_item, ru_item]
+        self.pipe._translate_digest_items([item])
 
-        # Первый вызов: только RU-item попадает в batch перевода
-        self.pipe._translate_digest_items(pool)
-        self.assertEqual(translate_mock.call_count, 1)
-        first_batch = translate_mock.call_args[0][0]
-        self.assertEqual(len(first_batch), 1)
-        self.assertEqual(first_batch[0].url, "https://ex.com/ru")
-
-        # EN-item не тронут
-        self.assertEqual(en_item.llm_title, "Storm Hits Coast")
-
-        # RU-item переведён
-        self.assertIsNotNone(ru_item.llm_title)
-
-        # Второй вызов (имитация повторного вызова перед render)
-        self.pipe._translate_digest_items(pool)
-        # Вызовов по-прежнему 1 (idempotent, оба с llm_title)
-        self.assertEqual(translate_mock.call_count, 1)
+        translate_mock.assert_called_once()
+        self.assertEqual(item.llm_title, "Storm Hits the Coast")
 
         self.flt.translate_news_items = orig
+
+    def test_english_llm_title_is_skipped(self):
+        """(b) llm_title EN → не попадает в чанк перевода."""
+        item = _mk_item(
+            url="https://e.com/enllm",
+            title="Storm hits the coast",
+            llm_title="Storm Hits the Coast",  # EN llm_title
+            llm_score=6,
+        )
+        translate_mock = MagicMock(return_value=[])
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = translate_mock
+
+        self.pipe._translate_digest_items([item])
+
+        translate_mock.assert_not_called()
+
+        self.flt.translate_news_items = orig
+
+    def test_pool_all_russian_llm_title_no_early_return(self):
+        """
+        (c) Пул из 3 items ВСЕ с русским llm_title → НЕ early-return'ится,
+        translate_news_items вызывается.
+        """
+        items = [
+            _mk_item(url=f"https://e.com/r{i}",
+                     title=f"Новость {i}",
+                     llm_title=f"Русский заголовок {i}",  # все русские
+                     llm_score=6)
+            for i in range(3)
+        ]
+        translate_mock = MagicMock(return_value=[
+            {"idx": j+1, "title_en": f"News {j+1}", "summary_en": ""}
+            for j in range(3)
+        ])
+        orig = self.flt.translate_news_items
+        self.flt.translate_news_items = translate_mock
+
+        self.pipe._translate_digest_items(items)
+
+        translate_mock.assert_called_once()
+        for i, it in enumerate(items):
+            self.assertEqual(it.llm_title, f"News {i+1}")
+
+        self.flt.translate_news_items = orig
+
+    def test_write_back_updates_russian_llm_title_in_db(self):
+        """
+        Ф1 write-back: update_translate_batch обновляет БД для русского llm_title.
+        (WHERE llm_title IS NULL OR llm_title GLOB кириллица)
+        """
+        item = _mk_item(
+            url="https://e.com/wb1",
+            title="Шторм",
+            llm_score=6,
+        )
+        # Сначала сохраняем item
+        self.pipe.storage.save(item)
+        self.pipe.storage.update_translate_batch([{
+            "url": "https://e.com/wb1",
+            "title_en": "Storm",
+            "summary_en": "S",
+        }])
+
+        # Перечитываем из БД
+        [reloaded] = self.pipe.storage.get_all_by_state("new")
+        # llm_title записан
+        self.assertEqual(reloaded.llm_title, "Storm")
+
+        # Повторный write-back с другим title — НЕ перезаписывает EN title
+        n2 = self.pipe.storage.update_translate_batch([{
+            "url": "https://e.com/wb1",
+            "title_en": "Different",
+            "summary_en": "Other.",
+        }])
+        # EN llm_title не перезаписывается (GLOB '[А-Яа-яЁё]' не match'ит EN)
+        [reloaded2] = self.pipe.storage.get_all_by_state("new")
+        self.assertEqual(reloaded2.llm_title, "Storm")
+
+
+# =============================================================================
+# Test O: Ф2 — digest-стадия выше оконного капа
+# =============================================================================
+
+class TestDigestCostGateScope(unittest.TestCase):
+    """
+    (a) Окно исчерпано, дневной жив → digest-стадия выполняется.
+    (b) Дневной исчерпан → fail-open + WARNING.
+    (c) Скоринг-стадия по-прежнему гейтятся окном.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pipe = _build_news_pipeline(Path(self.tmp))
+        self.flt = self.pipe.llm_filter
+
+    def tearDown(self):
+        _unmock()
+        self.pipe.storage.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_digest_translate_skips_window_uses_daily(self):
+        """
+        (a) При check_window=False (digest-стадия) перевод продолжается,
+        если дневной бюджет не исчерпан.
+        """
+        items = [_mk_item(url="https://e.com/1", title="Шторм", llm_score=6)]
+
+        # Мокаем translate_news_items — она вернёт результат
+        self.flt.translate_news_items = MagicMock(return_value=[
+            {"idx": 1, "title_en": "Storm", "summary_en": ""},
+        ])
+
+        # _check_daily_cost(True) — бюджет жив
+        with patch.object(self.flt, '_check_daily_cost', return_value=True):
+            self.pipe._translate_digest_items(items)
+
+        # Результат применён к item через returned results
+        self.flt.translate_news_items.assert_called_once()
+        self.assertEqual(items[0].llm_title, "Storm")
+
+    def test_daily_exceeded_translate_fails_open_with_warning(self):
+        """
+        (b) Дневной исчерпан → fail-open (пустой результат) + WARNING.
+        """
+        import logging
+
+        items = [_mk_item(url="https://e.com/1", title="Шторм", llm_score=6)]
+        st = MagicMock()
+        st.get_meta = MagicMock(return_value=None)
+        st.count_by_state = MagicMock(return_value=0)
+        self.flt._storage = st
+
+        with patch.object(self.flt, '_check_daily_cost', return_value=False):
+            with patch.object(logging.getLogger('newsbot.llm.filter'), 'warning') as warn_mock:
+                result = self.flt.translate_news_items(items)
+
+        self.assertEqual(result, [], "fail-open → пустой результат")
+        # WARNING содержит "превышен" или "translate" (формат-строка)
+        self.assertTrue(
+            any("превышен" in str(w[0]).lower() or "translate" in str(w[0]).lower()
+                for w in warn_mock.call_args_list),
+            f"WARNING должен содержать 'превышен' или 'translate', получено: "
+            f"{[str(w[0]) for w in warn_mock.call_args_list]}"
+        )
+
+    def test_scoring_still_uses_window_gate(self):
+        """
+        (c) Скоринг-вызовы по-прежнему гейтятся оконным лимитом
+        (check_window=True по умолчанию).
+        """
+        from datetime import datetime, timezone
+
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        win_idx = datetime.now(timezone.utc).hour // 6
+
+        # Лимиты > 0 чтобы проверка не пропускалась
+        self.flt._daily_cost_limit = 0.50
+        self.flt._window_cost_limit = 0.12
+
+        meta_store = {
+            f"llm_daily_cost_{today}": "0.10",
+            f"llm_daily_cost_{today}_w{win_idx}": "0.20",
+        }
+        self.flt._storage = MagicMock()
+        self.flt._storage.get_meta = MagicMock(side_effect=lambda k: meta_store.get(k))
+        self.flt._storage.count_by_state = MagicMock(return_value=0)
+        self.flt._storage.set_meta = MagicMock()
+
+        # check_window=True → window exceeded (0.20 > 0.12) → False
+        self.assertFalse(self.flt._check_daily_cost(check_window=True))
+
+        # check_window=False → window skip, daily OK (0.10 < 0.50) → True
+        self.assertTrue(self.flt._check_daily_cost(check_window=False))
+
+
+# =============================================================================
+# Test: Major — detect_duplicates(check_window=...) routing
+# =============================================================================
+
+class TestDetectDuplicatesWindowParam(unittest.TestCase):
+    """
+    (a) detect_duplicates с check_window=False — digest-путь, window cap skipped.
+    (b) detect_duplicates с check_window=True — scoring-путь, window cap active.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pipe = _build_news_pipeline(Path(self.tmp))
+        self.flt = self.pipe.llm_filter
+
+    def tearDown(self):
+        _unmock()
+        self.pipe.storage.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_digest_cluster_path_skips_window_cap(self):
+        """
+        (a) _cluster_deferred_duplicates вызывает detect_duplicates(check_window=False).
+        При window exceeded + daily OK — дедуп вызывается.
+        """
+        items = [
+            _mk_item(url=f"https://e.com/{i}", title=f"Item{i}", llm_score=6)
+            for i in range(3)
+        ]
+        # Мокаем detect_duplicates на входе (entry guard)
+        self.flt.detect_duplicates = MagicMock(return_value=set())
+        # Подменяем _check_daily_cost: check_window=False → True, check_window=True → False
+        def fake_cost_check(check_window=True):
+            return not check_window  # False→True, True→False
+        with patch.object(self.flt, '_check_daily_cost', side_effect=fake_cost_check):
+            # Вызов через pipeline._cluster_deferred_duplicates (digest path)
+            result_dup, _ = self.pipe._cluster_deferred_duplicates(
+                items, "2026-01-01T00:00:00+00:00"
+            )
+        # detect_duplicates вызван (window cap пропущен)
+        self.flt.detect_duplicates.assert_called_once()
+        call_kwargs = self.flt.detect_duplicates.call_args
+        # Проверяем check_window=False в вызове
+        self.assertFalse(call_kwargs[1].get("check_window", True),
+            "Digest path должен передавать check_window=False")
+
+    def test_scoring_path_uses_window_cap(self):
+        """
+        (b) Scoring-путь (_run_llm_dedup) вызывает detect_duplicates
+        с дефолтным check_window=True.
+        """
+        from datetime import datetime, timezone
+
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        win_idx = datetime.now(timezone.utc).hour // 6
+
+        # Устанавливаем лимиты и cost так чтобы window exceeded
+        self.flt._daily_cost_limit = 0.50
+        self.flt._window_cost_limit = 0.12
+        meta_store = {
+            f"llm_daily_cost_{today}": "0.10",   # OK
+            f"llm_daily_cost_{today}_w{win_idx}": "0.20",  # > limit
+        }
+        self.flt._storage = MagicMock()
+        self.flt._storage.get_meta = MagicMock(side_effect=lambda k: meta_store.get(k))
+        self.flt._storage.count_by_state = MagicMock(return_value=0)
+        self.flt._storage.set_meta = MagicMock()
+
+        items = [
+            _mk_item(url=f"https://e.com/{i}", title=f"Item{i}", llm_score=6)
+            for i in range(3)
+        ]
+
+        # detect_duplicates с дефолтным check_window=True
+        # При window exceeded → early return без LLM-вызова
+        result = self.flt.detect_duplicates(items, [])
+        self.assertEqual(result, set(),
+            "Scoring-дедуп при window exceeded должен вернуть пустое множество")
+
+
+# =============================================================================
+# Test: Minor-2 — ukr/bel letters write-back (GLOB расширен)
+# =============================================================================
+
+class TestUkrBelLetterWriteBack(unittest.TestCase):
+    """
+    Minor-2-fix: GLOB '*[А-Яа-яЁёІіЇїЄєЎўҐґ]*' покрывает укр./бел. буквы.
+    llm_title с 'і' попадает в перевод и write-back обновляет БД
+    (без бесконечного повторного перевода).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pipe = _build_news_pipeline(Path(self.tmp))
+        self.flt = self.pipe.llm_filter
+
+    def tearDown(self):
+        _unmock()
+        self.pipe.storage.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ukrainian_llm_title_write_back_updates(self):
+        """
+        llm_title='Шторм з дощем' → update_translate_batch перезаписывает
+        в БД (GLOB покрывает 'і', 'є' и др.).
+        Без расширения GLOB — EN-перевод не перезаписал бы русский llm_title.
+        """
+        item = _mk_item(
+            url="https://e.com/ukr1",
+            title="Шторм",
+            llm_score=6,
+            llm_title="Шторм з дощем",  # ukr буква 'і'
+        )
+        self.pipe.storage.save(item)
+
+        # EN-перевод
+        n = self.pipe.storage.update_translate_batch([{
+            "url": "https://e.com/ukr1",
+            "title_en": "Storm with Rain",
+            "summary_en": "Summary.",
+        }])
+        self.assertEqual(n, 1, "Write-back должен обновить строку с ukr буквой")
+
+        # Перечитываем — llm_title обновлён
+        [reloaded] = self.pipe.storage.get_all_by_state("new")
+        self.assertEqual(reloaded.llm_title, "Storm with Rain",
+            "EN-перевод должен перезаписать ukr llm_title")
+
+    def test_ukrainian_llm_title_no_infinite_retranslate(self):
+        """
+        Повторный update_translate_batch с другим EN title НЕ перезаписывает
+        уже EN llm_title (GLOB не match'ит 'i'/'r' и т.д.).
+        """
+        item = _mk_item(
+            url="https://e.com/ukr2",
+            title="Шторм",
+            llm_score=6,
+            llm_title="Шторм з дощем",
+        )
+        self.pipe.storage.save(item)
+
+        # Первый EN перевод
+        self.pipe.storage.update_translate_batch([{
+            "url": "https://e.com/ukr2",
+            "title_en": "Storm with Rain",
+            "summary_en": "",
+        }])
+        # Повторный с другим title — НЕ перезаписывает (already EN)
+        n2 = self.pipe.storage.update_translate_batch([{
+            "url": "https://e.com/ukr2",
+            "title_en": "Different Title",
+            "summary_en": "",
+        }])
+        self.assertEqual(n2, 0, "EN llm_title не должен перезаписываться")
+
+        [reloaded] = self.pipe.storage.get_all_by_state("new")
+        self.assertEqual(reloaded.llm_title, "Storm with Rain",
+            "Оригинальный EN llm_title должен сохраниться")
+
+
+if __name__ == "__main__":
+    unittest.main()

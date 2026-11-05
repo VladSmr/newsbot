@@ -1285,7 +1285,7 @@ class TestDupOnMaxItemsBoundary(unittest.TestCase):
 
             # Внутренний dedup top-N: EventDup — дубль EventHead (освобождает слот).
             fake_filter = MagicMock()
-            def detect_dup_idx(candidates, recent_shown=None):
+            def detect_dup_idx(candidates, recent_shown=None, check_window=True):
                 return {i for i, it in enumerate(candidates) if it.title == "EventDup"}
             fake_filter.detect_duplicates.side_effect = detect_dup_idx
             p.llm_filter = fake_filter
@@ -1400,7 +1400,7 @@ class TestDupOnMaxItemsBoundary(unittest.TestCase):
                 },
             )
 
-            def fake_detect(candidates, recent_shown):
+            def fake_detect(candidates, recent_shown, check_window=True):
                 # CinematicEvent_rewrite дубль CinematicEvent из top-N
                 for sh in recent_shown:
                     if sh.get("title") == "CinematicEvent":
@@ -1489,7 +1489,7 @@ class TestLateBackfillNoReclaimedDuplicates(unittest.TestCase):
 
             # Внутренний dedup top-N освобождает слот (EventDup — дубль Charlie).
             fake_filter = MagicMock()
-            def detect_dup_idx(candidates, recent_shown=None):
+            def detect_dup_idx(candidates, recent_shown=None, check_window=True):
                 return {i for i, it in enumerate(candidates) if it.title == 'EventDup'}
             fake_filter.detect_duplicates.side_effect = detect_dup_idx
             p.llm_filter = fake_filter

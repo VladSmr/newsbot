@@ -1286,7 +1286,23 @@ class LLMFilter:
         # Daily cost gate: перевод — luxury, а не critical path.
         # При исчерпанном бюджете пропускаем полностью; pipeline отдаст
         # сырые заголовки (fail-open уже в pipeline._translate_digest_items).
-        if not self._check_daily_cost():
+        if not self._check_daily_cost(check_window=False):
+            # Read spent values for informative log (guard: _storage may be None in tests).
+            _sd = _sw = 0.0
+            if self._storage is not None:
+                now = datetime.now(timezone.utc)
+                today = now.strftime("%Y%m%d")
+                spent_day = self._storage.get_meta(f"llm_daily_cost_{today}")
+                spent_window = self._storage.get_meta(
+                    f"llm_daily_cost_{today}_w{now.hour // 6}"
+                )
+                _sd = float(spent_day) if spent_day else 0.0
+                _sw = float(spent_window) if spent_window else 0.0
+            logger.warning(
+                "LLM-translate: расходы исчерпаны (daily=$%.2f/$%.2f, window=$%.2f/$%.2f) "
+                "— перевод пропущен",
+                _sd, self._daily_cost_limit, _sw, self._window_cost_limit,
+            )
             return []
 
         results: List[dict] = []
@@ -1318,9 +1334,17 @@ class LLMFilter:
 
     # ── Task 3: daily cost guard ────────────────────────────────────────────
 
-    def _check_daily_cost(self) -> bool:
+    def _check_daily_cost(self, check_window: bool = True) -> bool:
         """
-        Проверяет дневной лимит расходов.
+        Проверяет дневной и опционально оконный лимит расходов.
+
+        Parameters
+        ----------
+        check_window : bool
+            Если True (default) — проверяются оба лимита (дневной + оконный).
+            Если False — только дневной; оконный игнорируется
+            (digest-стадия: перевод и финальный дедуп проходят по дневному капу,
+            оконный гейт остаётся для скоринга).
 
         Returns:
             True — можно вызывать LLM; False — лимит превышен.
@@ -1371,7 +1395,10 @@ class LLMFilter:
         spent_window = _read_cost(window_key) if self._window_cost_limit > 0 else None
 
         # Проверка: отказ если ЛЮБОЙ активный лимит превышен
-        window_exceeded = spent_window is not None and spent_window >= self._window_cost_limit
+        # check_window=False → digest-стадия не гейтится оконным лимитом
+        window_exceeded = (
+            spent_window is not None and spent_window >= self._window_cost_limit
+        ) if check_window else False
         daily_exceeded = spent_day is not None and spent_day >= self._daily_cost_limit
 
         if not window_exceeded and not daily_exceeded:
@@ -1940,6 +1967,7 @@ class LLMFilter:
         self,
         items: List["NewsItem"],
         recent: List[dict],
+        check_window: bool = True,
     ) -> Set[int]:
         """
         Группирует семантические дубликаты среди кандидатов и relative to recent.
@@ -1988,10 +2016,22 @@ class LLMFilter:
         # дневном лимите скоринг блокируется, а дедуп продолжал тратить деньги
         # каждый цикл (вызывается из pipeline до скоринга и в cluster-deferred).
         # Fail-open: пустое множество = «дублей не найдено», ничего не теряется.
-        if not self._check_daily_cost():
-            logger.info(
-                "LLM-дедуп: дневной лимит расходов исчерпан — пропускаем "
-                "(безопасно: дублей не найдено)"
+        if not self._check_daily_cost(check_window=check_window):
+            # Read spent values for informative log (guard: _storage may be None).
+            _sd = _sw = 0.0
+            if self._storage is not None:
+                now = datetime.now(timezone.utc)
+                today = now.strftime("%Y%m%d")
+                spent_day = self._storage.get_meta(f"llm_daily_cost_{today}")
+                spent_window = self._storage.get_meta(
+                    f"llm_daily_cost_{today}_w{now.hour // 6}"
+                )
+                _sd = float(spent_day) if spent_day else 0.0
+                _sw = float(spent_window) if spent_window else 0.0
+            logger.warning(
+                "LLM-дедуп: расходы исчерпаны (daily=$%.2f/$%.2f, window=$%.2f/$%.2f) "
+                "— пропускаем (безопасно: дублей не найдено)",
+                _sd, self._daily_cost_limit, _sw, self._window_cost_limit,
             )
             self._log_cost_blocked_pending()
             return set()
@@ -2013,13 +2053,24 @@ class LLMFilter:
             # Guard на каждой итерации: лимит мог исчерпаться ПОСЛЕ предыдущего
             # чанка (usage предыдущего вызова уже записан). Fail-open: прерываем
             # цикл, сохраняя уже найденные дубли предыдущих чанков.
-            if not self._check_daily_cost():
-                logger.info(
-                    "LLM-дедуп: дневной лимит исчерпан на чанке [%d:%d] из %d "
-                    "items — прерываем, сохраняем уже найденные дубли (%d шт.)",
-                    chunk_start,
-                    chunk_start + len(chunk),
-                    len(items),
+            if not self._check_daily_cost(check_window=check_window):
+                # Read spent values for informative log (guard: _storage may be None).
+                _sd = _sw = 0.0
+                if self._storage is not None:
+                    now = datetime.now(timezone.utc)
+                    today = now.strftime("%Y%m%d")
+                    spent_day = self._storage.get_meta(f"llm_daily_cost_{today}")
+                    spent_window = self._storage.get_meta(
+                        f"llm_daily_cost_{today}_w{now.hour // 6}"
+                    )
+                    _sd = float(spent_day) if spent_day else 0.0
+                    _sw = float(spent_window) if spent_window else 0.0
+                logger.warning(
+                    "LLM-дедуп: расходы исчерпаны на чанке [%d:%d] из %d items "
+                    "(daily=$%.2f/$%.2f, window=$%.2f/$%.2f) — "
+                    "прерываем, сохраняем уже найденные дубли (%d шт.)",
+                    chunk_start, chunk_start + len(chunk), len(items),
+                    _sd, self._daily_cost_limit, _sw, self._window_cost_limit,
                     len(all_dup_indices),
                 )
                 # Minor-фикс: если лимит исчерпался уже ПОСЛЕ предыдущего чанка,
@@ -2084,13 +2135,13 @@ class LLMFilter:
                                 if abs_idx in retry_parsed:
                                     all_ctx.dup.append({
                                         "id": abs_idx,
-                                        "title": item.title,
+                                        "title": getattr(item, 'llm_title', None) or item.title,
                                         "source": getattr(item, "source", ""),
                                     })
                                 else:
                                     all_ctx.kept.append({
                                         "id": abs_idx,
-                                        "title": item.title,
+                                        "title": getattr(item, 'llm_title', None) or item.title,
                                         "source": getattr(item, "source", ""),
                                     })
                             _processed_chunks += 1
@@ -2228,7 +2279,7 @@ class LLMFilter:
                             item = items[abs_idx]
                             all_ctx.kept.append({
                                 "id": abs_idx,
-                                "title": item.title,
+                                "title": getattr(item, 'llm_title', None) or item.title,
                                 "source": getattr(item, "source", ""),
                             })
                     logger.warning(
@@ -2450,7 +2501,7 @@ class LLMFilter:
                     # «duplicate of Cx» контекст остаётся корректным).
                     all_ctx.dup.append({
                         "id": abs_idx,
-                        "title": item.title,
+                        "title": getattr(item, 'llm_title', None) or item.title,
                         "source": getattr(item, "source", ""),
                         # MAJOR 3-фикс: summary/url не выводятся в промпт
                         # (build_dedup_context_message использует только title+source),
@@ -2462,7 +2513,7 @@ class LLMFilter:
                     # Kept item — лидер для будущих чанков
                     all_ctx.kept.append({
                         "id": abs_idx,
-                        "title": item.title,
+                        "title": getattr(item, 'llm_title', None) or item.title,
                         "source": getattr(item, "source", ""),
                         # MAJOR 3-фикс: summary/url не выводятся в промпт.
                     })

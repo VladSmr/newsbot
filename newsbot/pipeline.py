@@ -878,6 +878,32 @@ def _loc_day_key(item) -> Optional[tuple]:
     return (location, pub_day)
 
 
+def _published_in_window(item: "NewsItem", ws_grace: "Optional[datetime]") -> bool:
+    """
+    Проверяет, что item.published в пределах дайджест-окна (>= ws_grace).
+
+    Семантика:
+      - ws_grace is None → фильтр отклющён, всегда True (fallback-пути, bootstrap).
+      - парсится и в окне (pub_dt > ws_grace) → True
+      - парсится вне окна (pub_dt <= ws_grace) → False
+      - НЕ парсится (pub_dt is None или пустой published) → True
+        (непарсящийся published сохраняется — не теряем новости).
+    """
+    if ws_grace is None:
+        return True  # фильтр отклющён
+    pub_str = str(item.published or "")
+    if not pub_str:
+        return True  # непарсящийся → сохраняем
+    pub_dt = _iso_dt(pub_str)
+    if pub_dt is None:
+        return True  # непарсящийся → сохраняем
+    if pub_dt.tzinfo is not None:
+        pub_dt_norm = pub_dt.astimezone(tz.utc).replace(tzinfo=None)
+    else:
+        pub_dt_norm = pub_dt
+    return pub_dt_norm > ws_grace
+
+
 def _parse_tags(tags_str: Optional[str]) -> List[str]:
     """Парсит JSON-массив тегов из БД."""
     if not tags_str:
@@ -1848,8 +1874,10 @@ class NewsPipeline:
             return set()
         # MAJOR-фикс (4c): один батчевый вызов на весь пул (backfill, skipped).
         # detect_duplicates снят len<2 guard при непустом RECENT.
+        # Major-fix (digest-стадия): skip window cap so digest continues
+        # when daily budget is alive but window exhausted.
         try:
-            dup_idx = llm_filter.detect_duplicates(candidates, recent_shown)
+            dup_idx = llm_filter.detect_duplicates(candidates, recent_shown, check_window=False)
         except Exception as e:
             logger.warning(
                 "Дайджест: RECENT-дедуп пула (%d кандидатов) упал: %s — "
@@ -1942,8 +1970,10 @@ class NewsPipeline:
         if llm_filter is None:
             return (set(), recent_shown)
 
+        # Major-fix (digest-стадия): window cap skipped for cluster-deferred
+        # (same semantics as _check_against_shown / detect_duplicates entry guard).
         try:
-            dup_idx = llm_filter.detect_duplicates(list(items), recent_shown)
+            dup_idx = llm_filter.detect_duplicates(list(items), recent_shown, check_window=False)
         except Exception as e:
             logger.warning("Дайджест: кластеризация дублей упала: %s", e)
             return (set(), recent_shown)
@@ -2975,7 +3005,8 @@ class NewsPipeline:
         """
         ru_items: List[NewsItem] = [
             it for it in items
-            if not it.llm_title and self._CYRILLIC_RE.search(it.title or "")
+            if (not it.llm_title or self._CYRILLIC_RE.search(it.llm_title or ""))
+            and self._CYRILLIC_RE.search(it.title or "")
         ]
         if not ru_items:
             return
@@ -3275,31 +3306,26 @@ class NewsPipeline:
         # отключён, чтобы items с непарсящимся published не терялись.
         published_filter_active = anchor_mode or (raw_boundary is not None)
         ws_dt = _iso_dt(window_start_iso)
+        # Critical-fix: вычисляем ws_grace_naive при ws_dt is not None
+        # НЕЗАВИСИМО от published_filter_active — нужен для fallback-путей
+        # (skipped, new_fallback), где при ws_dt=None фильтр отклющён (True).
+        if ws_dt is not None:
+            ws_naive = ws_dt if ws_dt.tzinfo is None else ws_dt.astimezone(tz.utc).replace(tzinfo=None)
+            ws_grace_naive = ws_naive - grace_delta
+        else:
+            ws_grace_naive = None
         if published_filter_active and ws_dt is not None:
             # M2-фикс: правильная нормализация aware→naive через astimezone,
             # а не .replace(tzinfo=None) (последнее давало ошибку ±offset часов).
             # Minor 1: если ws_dt naive (legacy-meta без offset), astimezone
             # трактовала бы его как локальное время → граница съезжает на offset.
             # Лечим: naive оставляем как есть, aware нормализуем.
-            ws_naive = ws_dt if ws_dt.tzinfo is None else ws_dt.astimezone(tz.utc).replace(tzinfo=None)
             # M2: граница с учётом грейса (published может быть чуть раньше window_start)
-            ws_grace_naive = ws_naive - grace_delta
-            filtered = []
-            for it in deferrable_post_published:
-                pub_str = str(it.published or "")
-                pub_dt = _iso_dt(pub_str) if pub_str else None
-                # Непарсящийся published сохраняем (не теряем новости).
-                # M2: aware → UTC → naive; naive уже без тайзоны.
-                if pub_dt is None:
-                    filtered.append(it)
-                else:
-                    if pub_dt.tzinfo is not None:
-                        pub_dt_norm = pub_dt.astimezone(tz.utc).replace(tzinfo=None)
-                    else:
-                        pub_dt_norm = pub_dt
-                    if pub_dt_norm > ws_grace_naive:
-                        filtered.append(it)
-            deferrable_post_published = filtered
+            # Ф4: применяем helper _published_in_window ко всем кандидатам.
+            deferrable_post_published = [
+                it for it in deferrable_post_published
+                if _published_in_window(it, ws_grace_naive)
+            ]
         n_published = len(deferrable_post_published)
 
         # Minor 2 (NIT 1): обрезаем СРАЗУ после published-фильтра, ДО кластеризации.
@@ -3429,7 +3455,7 @@ class NewsPipeline:
         # dedup (set) уже отфильтровал лидеров — берём текущий deferred_items
         # (post-dedup лидеры, самые приоритетные).
         _digest_topn_shown: List[dict] = [
-            {"title": it.title, "source": it.source}
+            {"title": getattr(it, 'llm_title', None) or it.title, "source": it.source}
             for it in deferred_items
         ]
         _seen_keys: Set[tuple] = set()
@@ -3479,6 +3505,10 @@ class NewsPipeline:
                 )
         n_backfill = len(deferred_items)
 
+        # Ф3: отслеживаем URL-состав ДО доборов, чтобы после re-translate
+        # понять, изменился ли список (если изменился — повторный дедуп).
+        _pre_guarantee_urls: Set[str] = {it.url for it in deferred_items}
+
         # ── Задача B: гарантия по категориям с возможностью ПДТЯГИВАНИЯ ──────
         # Pool для гарантии: deferrable_post_published минус всё, что уже в
         # deferred_items по url (id не используем — cap теперь после гарантии).
@@ -3527,8 +3557,13 @@ class NewsPipeline:
                 min_score=guarantee_min_score,
                 limit=200,
             )
-            _skipped_dup_urls = self._check_against_shown(skipped_candidates, _recent_shown)
-            for it in skipped_candidates:
+            # Ф4: отсекаем skipped items с published ВНЕ окна.
+            skipped_in_window = [
+                it for it in skipped_candidates
+                if _published_in_window(it, ws_grace_naive)
+            ]
+            _skipped_dup_urls = self._check_against_shown(skipped_in_window, _recent_shown)
+            for it in skipped_in_window:
                 if it.url not in _all_excluded and it.url not in _skipped_dup_urls:
                     category_pool.append(it)
             # Fallback: нескоренные (state='new') из того же окна — последний резерв.
@@ -3537,12 +3572,16 @@ class NewsPipeline:
             # (score=NULL → 0). _check_against_shown: новые items не были
             # в digested/delivered → не в _recent_shown → не фильтруются.
             # Major-фикс: new-кандидаты проходят префильтр — мусор/реклама
-            # (напр. off-peak-пауза без LLM в цикле) не попадает в гарантию.
+            # (напр. off-peak-пауза без LLM в цикле) не попадают в гарантию.
             _raw_new = self.storage.get_new_items_for_fallback(
                 since_iso=window_start_iso,
                 limit=max(200, max_items * 4),
             )
-            _new_candidates = [it for it in _raw_new if not _prefilter_item(it)]
+            # Ф4: отсекаем new items с published ВНЕ окна.
+            _new_in_window = [
+                it for it in _raw_new if _published_in_window(it, ws_grace_naive)
+            ]
+            _new_candidates = [it for it in _new_in_window if not _prefilter_item(it)]
         # Minor 1-фикс: max_per_location вычисляется ДО блока гарантии —
         # от него зависит квота защиты (Minor 2-фикс). Невалидное значение
         # → documented default (2), а не отключение cap'а.
@@ -3788,6 +3827,52 @@ class NewsPipeline:
         # уже переведённые пропускаются. llm_filter может быть None.
         if self.llm_filter is not None:
             self._translate_digest_items(deferred_items)
+
+        # Ф3: повторный дедуп на финальном списке. Guarantee/backfill/new_fallback
+        # добавляют items, которые НЕ прошли дедуп-проверку с переведёнными
+        # заголовками. Переводим список в EN, затем перезапускаем LLM+F6.
+        # Idempotent: если список не изменился — пропускаем (0 лишних вызовов).
+        _post_retranslate_urls = {it.url for it in deferred_items}
+        _final_dup_urls: Set[str] = set()
+        if _post_retranslate_urls != _pre_guarantee_urls and deferred_items:
+            _final_dup_urls, _ = self._cluster_deferred_duplicates(
+                deferred_items, window_start_iso,
+            )
+            if _final_dup_urls:
+                deferred_items = [it for it in deferred_items if it.url not in _final_dup_urls]
+                logger.info(
+                    "Дайджест: финальный дедуп после доборов — удалено %d дублей, "
+                    "осталось %d items",
+                    len(_final_dup_urls), len(deferred_items),
+                )
+            # F6: страховка после повторного LLM-дедупа.
+            if len(deferred_items) >= 2:
+                _final_containment_dup: Set[str] = set()
+                for i in range(len(deferred_items)):
+                    if deferred_items[i].url in _final_containment_dup:
+                        continue
+                    for j in range(i + 1, len(deferred_items)):
+                        if deferred_items[j].url in _final_containment_dup:
+                            continue
+                        a_title = normalize_title_text(
+                            getattr(deferred_items[i], 'llm_title', None) or deferred_items[i].title or "")
+                        b_title = normalize_title_text(
+                            getattr(deferred_items[j], 'llm_title', None) or deferred_items[j].title or "")
+                        if not a_title or not b_title:
+                            continue
+                        icd = is_containment_duplicate(a_title, b_title)
+                        if icd:
+                            _final_containment_dup.add(deferred_items[j].url)
+                if _final_containment_dup:
+                    deferred_items = [it for it in deferred_items if it.url not in _final_containment_dup]
+                    logger.info(
+                        "Дайджест: финальный F6-дедуп — удалено %d containment-дублей, "
+                        "осталось %d items",
+                        len(_final_containment_dup), len(deferred_items),
+                    )
+        # Minor-1-fix: _final_dup_urls из re-dedup-блока попадают в set_digested
+        # (close-path использует _dup_urls); иначе они deferred → повторная кластеризация.
+        _dup_urls |= _final_dup_urls
 
         # ── Feedback targets + передача готовых groups в digest ──
         # F2: только при TelegramDelivery + feedback.enabled + digest_enabled.
