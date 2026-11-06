@@ -390,6 +390,11 @@ DO NOT apply this cap if:
   • A direct quote from a named official or government body is provided;
   • A second independent source confirms the same event in this batch.
 
+SUMMARY RULES:
+• Do NOT repeat the publication date or time in the summary — the date is shown separately and is redundant. Exception: only if the date itself is the news (e.g. historical reference).
+• Score LOW (≤3) items that contain no concrete facts: no named locations, no figures, no named actors — only vague statements like "details remain unclear".
+• Expand non-obvious abbreviations on first mention: write the full name in parentheses, e.g. "LPR (Luhansk People's Republic)". Use standard company spellings (e.g. "JTI", not "J.T.I.").
+
 urgent=true — ONLY for events of world/national scale with immediate catastrophic consequences:
   • beginning of war / major invasion;
   • announced mobilization (Russia);
@@ -469,6 +474,11 @@ DO NOT apply this cap if:
   • The source personally observed the event;
   • A direct quote from a named official or government body is provided;
   • A second independent source confirms the same event in this batch.
+
+SUMMARY RULES:
+• Do NOT repeat the publication date or time in the summary — the date is shown separately and is redundant. Exception: only if the date itself is the news (e.g. historical reference).
+• Score LOW (≤3) items that contain no concrete facts: no named locations, no figures, no named actors — only vague statements like "details remain unclear".
+• Expand non-obvious abbreviations on first mention: write the full name in parentheses, e.g. "LPR (Luhansk People's Republic)". Use standard company spellings (e.g. "JTI", not "J.T.I.").
 
 RESPONSE FORMAT — STRICT JSON OBJECT (no markdown):
 {{"results": [{{"id": 1, "score": <0-10>, "urgent": <true|false>, "summary": "<factual summary — ALWAYS in English, max {summary_max_chars} characters>", "reason": "<optional>", "location": "<STRICTLY CANONICAL location name — see LOCATION RULE>", "title_en": "<title translated to English; copy if already English, max ~140 chars>"}}, {{"id": 2, ...}}, ...]}}

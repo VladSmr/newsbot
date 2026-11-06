@@ -34,12 +34,14 @@ TRACKING_PARAMS: frozenset = frozenset({
     "utm_source_platform", "utm_creative_format", "utm_marketing_tactic",
     # Новостные/фид-трекеры
     "traffic_source",
+    "from",              # generic param; RSS-инжест only, saved URLs not rewritten (see review note)
     # Рекламные платформы
     "fbclid",        # Facebook
     "gclid",         # Google Ads
     "gclsrc",        # Google Ads (alternative)
     "dclid",         # DoubleClick
     "msclkid",       # Microsoft/Bing Ads
+    "yclid",         # Yandex Direct
     "mc_eid",        # Mailchimp
     "mc_cid",        # Mailchimp
     # Партнёрские / аналитика

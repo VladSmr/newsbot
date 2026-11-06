@@ -342,3 +342,66 @@ class TestF5NoFactRule:
 
         assert "NO VERIFIABLE FACTS" in SYSTEM_PROMPT
         assert "score MUST be ≤ 3" in SYSTEM_PROMPT
+
+
+# ─────────────────────────────────────────────────────────────────
+# B: SUMMARY RULES — 3 новых правила в обоих промптах
+# ─────────────────────────────────────────────────────────────────
+
+
+class TestSummaryRules:
+    """B-fix: 3 правила SUMMARY RULES присутствуют в обоих промптах,
+    JSON-схема не тронута."""
+
+    def test_both_prompts_have_summary_rules_section(self):
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+
+        for name, prompt in [("SYSTEM_PROMPT", SYSTEM_PROMPT),
+                              ("BATCH_SYSTEM_PROMPT", BATCH_SYSTEM_PROMPT)]:
+            assert "SUMMARY RULES:" in prompt, f"{name} missing SUMMARY RULES block"
+
+    def test_no_date_repeat_rule(self):
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        for name, prompt in [("SYSTEM_PROMPT", SYSTEM_PROMPT),
+                              ("BATCH_SYSTEM_PROMPT", BATCH_SYSTEM_PROMPT)]:
+            assert "Do NOT repeat the publication date" in prompt, \
+                f"{name} missing no-date-repeat rule"
+            assert "the date is shown separately" in prompt, \
+                f"{name} missing date-is-shown note"
+
+    def test_low_score_vague_facts_rule(self):
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        for name, prompt in [("SYSTEM_PROMPT", SYSTEM_PROMPT),
+                              ("BATCH_SYSTEM_PROMPT", BATCH_SYSTEM_PROMPT)]:
+            assert "Score LOW" in prompt, f"{name} missing low-score rule"
+            assert "details remain unclear" in prompt.lower(), \
+                f"{name} missing 'details remain unclear' in low-score rule"
+
+    def test_expand_abbreviations_rule(self):
+        from newsbot.llm.prompts import SYSTEM_PROMPT, BATCH_SYSTEM_PROMPT
+        for name, prompt in [("SYSTEM_PROMPT", SYSTEM_PROMPT),
+                              ("BATCH_SYSTEM_PROMPT", BATCH_SYSTEM_PROMPT)]:
+            assert "Expand non-obvious abbreviations" in prompt, \
+                f"{name} missing expand-abbreviations rule"
+            assert "LPR (Luhansk" in prompt, \
+                f"{name} missing LPR example"
+            assert "JTI" in prompt, \
+                f"{name} missing JTI vs J.T.I. example"
+
+    def test_json_schema_untouched_system(self):
+        """JSON-схема SYSTEM_PROMPT не тронута."""
+        from newsbot.llm.prompts import SYSTEM_PROMPT
+        assert '"score": <integer 0-10>' in SYSTEM_PROMPT
+        assert '"summary":' in SYSTEM_PROMPT
+        assert '"urgent": <true|false>' in SYSTEM_PROMPT
+        assert '"location":' in SYSTEM_PROMPT
+        assert '"title_en":' in SYSTEM_PROMPT
+
+    def test_json_schema_untouched_batch(self):
+        """JSON-схема BATCH_SYSTEM_PROMPT не тронута."""
+        from newsbot.llm.prompts import BATCH_SYSTEM_PROMPT
+        assert '"id": 1, "score":' in BATCH_SYSTEM_PROMPT
+        assert '"summary":' in BATCH_SYSTEM_PROMPT
+        assert '"urgent": <true|false>' in BATCH_SYSTEM_PROMPT
+        assert '"location":' in BATCH_SYSTEM_PROMPT
+        assert '"title_en":' in BATCH_SYSTEM_PROMPT

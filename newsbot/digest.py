@@ -282,18 +282,40 @@ def infer_category(item: NewsItem) -> str:
 
 def _truncate_raw_summary(raw: str, max_chars: int) -> str:
     """
-    Обрезает raw-текст до max_chars по границе слова.
-    Вызывается ДО html.escape().
+    Обрезает raw-текст до max_chars по границе предложения (приоритет)
+    или слова. Вызывается ДО html.escape().
+
+    A4-fix: приоритет — последняя точка с пробелом (конец предложения)
+    перед лимитом, затем — последний пробел (граница слова).
+    Не обрезает слово посередине. Защита от "U.S."/e.g.-аббревиатур:
+    точка считается концом предложения только если перед ней ≥4 букв.
     """
     if len(raw) <= max_chars:
         return raw
-    truncated = raw[:max_chars]
-    m = re.search(r'\s+\S*$', truncated)
+    before_limit = raw[:max_chars]
+
+    # Приоритет 1: ищем ". " перед лимитом (range [0, max_chars]).
+    # rfind(". ", 0, max_chars) ищет в позициях 0..max_chars-1 (stop exclusive).
+    # Находит самую правую ". " в пределах лимита; валидация prefix:
+    #   (a) ≥4 букв в последнем слове перед точкой
+    #   (b) слово не аббревиатурный паттерн (две+ точки подряд: U.S., e.g.)
+    # Защищает от "U.S. economy is growing." и "Dr. Smith said..." и "e.g. this happened."
+    _ABBREV_TRAILING = re.compile(r"(?:\b\w\.){2,}$")
+    last_period_pos = before_limit.rfind(". ", 0, max_chars)
+    while last_period_pos > 0:
+        prefix = before_limit[:last_period_pos]
+        # (a) ≥4 букв в последнем слове prefix
+        if re.search(r"[A-Za-zА-Яа-яЁё]{4,}\s*$", prefix):
+            # (b) слово НЕ аббревиатурный паттерн (U.S., e.g., Dr., etc.)
+            if not _ABBREV_TRAILING.search(prefix):
+                return before_limit[:last_period_pos + 1].rstrip() + "…"
+        # Аббревиатура или короткое слово — ищем предыдущую точку
+        last_period_pos = before_limit.rfind(". ", 0, last_period_pos)
+    # Приоритет 2: граница слова
+    m = re.search(r'\s+\S*$', before_limit)
     if m:
-        truncated = truncated[:m.start()].rstrip()
-    else:
-        truncated = truncated.rstrip()
-    return truncated + "…"
+        return before_limit[:m.start()].rstrip() + "…"
+    return before_limit.rstrip() + "…"
 
 
 def _render_item_raw(item: NewsItem) -> Tuple[str, str, str, str]:

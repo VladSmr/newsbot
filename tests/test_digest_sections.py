@@ -88,8 +88,7 @@ def test_sections_order_and_titles():
     msg, msg_items = groups[0]
     assert failed == []
 
-    # порядок секций — как в SECTION_TITLES (general, science, space, tech,
-    # cinema, games)
+    # порядок секций — как в SECTION_TITLES (general, science, space, tech, cinema, games)
     assert _section_order(msg) == list(range(len(SECTION_TITLES)))
     assert _section_titles_in(msg) == [t for _, t in SECTION_TITLES]
 

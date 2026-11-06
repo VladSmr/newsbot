@@ -79,6 +79,88 @@ _SOURCE_PREFIXES: List[Tuple[Pattern[str], str]] = [
 _NON_WORD_CHARS = re.compile(r"[^\w\s]")
 _MULTI_SPACE = re.compile(r"\s+")
 
+# ─── A1: editorial-tag strip patterns (начало/конец, белый список) ─────────────
+# Цель: убрать служебные теги из заголовков, сохранённых из RSS.
+# Только начало или конец строки; только точные совпадения.
+# НЕ трогают содержательные скобки: годы фильмов (2026), подзаголовки,
+# названия с точками (J.T.I. LLCs) — всё, что не совпадает с белым списком.
+_EDITORIAL_TAGS_PREFIX: list = [
+    re.compile(r"^\s*EXCLUSIVE:\s+", re.IGNORECASE),
+    re.compile(r"^\s*STAT\+\s*:?\s*", re.IGNORECASE),
+    re.compile(r"^\s*UPDATE\s+\d+:\s*", re.IGNORECASE),
+    re.compile(r"^\s*ANALYSIS:\s*", re.IGNORECASE),
+    re.compile(r"^\s*OPINION:\s*", re.IGNORECASE),
+]
+_EDITORIAL_TAGS_SUFFIX: list = [
+    re.compile(r"\s*\(EXCLUSIVE\)\s*$", re.IGNORECASE),
+    re.compile(r"\s*UPDATE\s+\d+\s*$", re.IGNORECASE),
+    re.compile(r"\s*\(UPDATE\s+\d+\)\s*$", re.IGNORECASE),
+    re.compile(r"\s*\(ANALYSIS\)\s*$", re.IGNORECASE),
+    re.compile(r"\s*\(OPINION\)\s*$", re.IGNORECASE),
+]
+_TRAILING_SEP_RE = re.compile(r"\s+[-–—|\s]+$")
+
+
+def _strip_editorial_tags(title: str) -> str:
+    """
+    Срезает известные редакционные теги-суффиксы/префиксы из заголовка.
+    Применяется ТОЛЬКО в начале или конце строки; белый список — точные
+    совпадения. Не трогает содержательные скобки (годы, подзаголовки).
+    """
+    t = title
+    changed = True
+    while changed:
+        changed = False
+        for pat in _EDITORIAL_TAGS_PREFIX:
+            if pat.search(t):
+                t = pat.sub("", t)
+                changed = True
+        for pat in _EDITORIAL_TAGS_SUFFIX:
+            if pat.search(t):
+                t = pat.sub("", t)
+                changed = True
+    # collapse пробелов и strip
+    t = _MULTI_SPACE.sub(" ", t).strip()
+    # убрать хвостовые разделители (" -", " |", " —")
+    t = _TRAILING_SEP_RE.sub("", t)
+    return t
+
+
+# ─── A2: RSS-description trailing garbage ─────────────────────────────────────
+# Хвосты, которые feedburner и другие RSS-платформы дописывают в <description>:
+# "The post ... appeared first on Source."
+# "Read more at ..."
+# "[ Read more ]" / "[…]" / "Click here to read more"
+_DESC_FEEDBURNER_TRAIL = re.compile(
+    r"(?i)( appeared first on\b.{1,150}\.)[\s.]*$",
+)
+_DESC_READ_MORE = re.compile(
+    r"(?i)\s*(?:Click here to read(?: more| full article)?|Continue reading|Read more)\s*\.?\s*$",
+)
+_DESC_BRACKET_TRAIL = re.compile(
+    r"\s*\[[^\]]*more[^\]]*\]\s*$",
+    re.IGNORECASE,
+)
+_DESC_ELLIPSIS_TRAIL = re.compile(r"\s*\[\.\.\.\]\s*$")
+_MULTI_SPACE_DOT = re.compile(r"\s{2,}")
+
+
+def _strip_description_trails(text: str) -> str:
+    """
+    Убирает хвостовые примеси из RSS-description (feedburner-хвосты,
+    'Read more', финальные '[...]' и т.п.). Применяется ДО скоринга —
+    чтобы LLM получал чистый текст, и в fallback-пути (без llm_summary).
+    Не режет содержательный текст — только явные хвосты по паттернам.
+    """
+    t = text
+    t = _DESC_FEEDBURNER_TRAIL.sub("", t)
+    t = _DESC_READ_MORE.sub("", t)
+    t = _DESC_BRACKET_TRAIL.sub("", t)
+    t = _DESC_ELLIPSIS_TRAIL.sub("", t)
+    # collapse множественных пробелов
+    t = _MULTI_SPACE_DOT.sub(" ", t).strip()
+    return t
+
 
 def normalize_title_text(text: str) -> str:
     """
@@ -660,7 +742,11 @@ def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Opt
     # Разэкранируем сразу — title идёт в дедуп, cluster_key и в БД,
     # а digest затем сам html.escape'ит при отправке. Без unescape
     # пользователь видел двойное экранирование (AT&amp;amp;T).
-    title = _html.unescape(title)[:MAX_TITLE_CHARS]
+    # A1-fix: strip editorial tags (EXCLUSIVE, STAT+, UPDATE N, ANALYSIS,
+    # OPINION) — делаем ДО cap, чтобы легитимные символы не вытеснялись.
+    title = _html.unescape(title)
+    title = _strip_editorial_tags(title)
+    title = title[:MAX_TITLE_CHARS]
 
     # summary: основной → fallback на content[0].value (<20 символов)
     summary_raw = getattr(entry, "summary", "") or ""
@@ -671,6 +757,10 @@ def _entry_to_news_item(entry, name: str, link: str, lang: Optional[str]) -> Opt
         if content and hasattr(content[0], "value"):
             value = content[0].value or ""
             summary_raw = value if isinstance(value, str) else str(value)
+    # A2-fix: strip RSS-description trailing garbage (feedburner-хвосты,
+    # "Read more", "[...]" и т.п.) — ДО html-strip и скоринга,
+    # чтобы LLM и digest-fallback получали чистый текст.
+    summary_raw = _strip_description_trails(summary_raw)
     summary = _strip_html(summary_raw)
 
     published_str = _format_pubdate(entry)
